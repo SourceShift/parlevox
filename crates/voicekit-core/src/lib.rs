@@ -12,7 +12,7 @@ pub mod clock;
 pub mod error;
 pub mod turn;
 
-pub use audio::{AudioFrame, AudioRing, OverflowPolicy};
-pub use clock::{DurationMs, MonoClock};
+pub use audio::{AudioFrame, AudioRing, OverflowPolicy, PushOutcome, RingStats};
+pub use clock::{DurationMs, MonoClock, Timestamp};
 pub use error::{ErrorClass, VoicekitError};
 pub use turn::{TurnEvent, TurnMachine, TurnState};

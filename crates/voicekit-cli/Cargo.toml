@@ -1,0 +1,17 @@
+[package]
+name = "voicekit-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "voicekit-cli"
+path = "src/main.rs"
+
+[dependencies]
+voicekit-core = { path = "../voicekit-core" }
+voicekit-providers = { path = "../voicekit-providers" }
+voicekit-runtime = { path = "../voicekit-runtime" }
+voicekit-sidecar = { path = "../voicekit-sidecar" }
+tokio.workspace = true

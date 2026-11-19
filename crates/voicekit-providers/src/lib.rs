@@ -1,0 +1,27 @@
+//! Streaming provider traits and deterministic in-process fakes.
+//!
+//! Every modality returns a stream, never a whole-utterance future. A provider
+//! that can only produce a final answer wraps it in a one-item stream; the
+//! trait does not change shape. Every in-flight call receives a
+//! [`CancellationToken`] so barge-in can stop work deterministically instead of
+//! racing timers.
+//!
+//! The fakes here are the hot-path default: they make `demo --fake` and the
+//! runtime tests deterministic and Python-free.
+
+pub mod fakes;
+pub mod manifest;
+pub mod stream;
+pub mod traits;
+
+pub use fakes::{
+    FakeLlm, FakeStt, FakeTts, FakeVad, FAKE_CHANNELS, FAKE_FRAME_MS, FAKE_FRAME_SAMPLES,
+    FAKE_LLM_DELTAS, FAKE_PARTIAL_TRANSCRIPT, FAKE_REPLY, FAKE_SAMPLE_RATE, FAKE_TRANSCRIPT,
+    FAKE_TTS_FRAMES,
+};
+pub use manifest::{Modality, ProviderManifest};
+pub use stream::cancelable_stream;
+pub use traits::{
+    AudioChunk, GenerateRequest, LlmProvider, ProviderStream, SttProvider, SynthesizeRequest,
+    TranscriptChunk, TtsProvider, VadEvent, VadProvider,
+};

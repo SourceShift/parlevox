@@ -11,5 +11,8 @@
 pub mod frame;
 pub mod message;
 
-pub use frame::{read_frame, write_frame, Frame, FrameError, AudioHeader, MAX_FRAME_BYTES};
-pub use message::{PluginEvent, PluginRequest, ErrorClassWire, PROTOCOL_VERSION};
+pub use frame::{read_frame, write_frame, AudioHeader, Frame, FrameError, MAX_FRAME_BYTES};
+pub use message::{
+    ErrorClassWire, ModalityWire, PluginEvent, PluginRequest, VadEventWire, PROTOCOL_VERSION,
+    SIDECAR_ABI,
+};
