@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
+description = "One-turn command-line demo for the voicekit workspace."
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [[bin]]
 name = "voicekit-cli"
@@ -24,3 +28,6 @@ futures-util.workspace = true
 serde_json.workspace = true
 tokio-util.workspace = true
 voicekit-ipc = { path = "../voicekit-ipc" }
+
+[lints]
+workspace = true

@@ -20,6 +20,12 @@ use voicekit_sidecar::{
 };
 
 /// Parse process arguments and run the matching demo.
+///
+/// # Errors
+///
+/// Returns a protocol-class error for unrecognised arguments and propagates
+/// whatever the selected demo returns (provider, transport, or protocol
+/// errors).
 pub async fn run_args() -> Result<(), VoicekitError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
@@ -45,6 +51,11 @@ pub fn usage() {
 }
 
 /// Run one turn with the in-process fakes and render it.
+///
+/// # Errors
+///
+/// Returns a protocol-class error if a fake manifest or the session
+/// configuration is rejected, and propagates any error from the turn.
 pub async fn demo_fake() -> Result<(), VoicekitError> {
     let registry = ProviderRegistry::fakes()?;
     let providers = registry.resolve(&ProviderNames::default())?;
@@ -54,6 +65,12 @@ pub async fn demo_fake() -> Result<(), VoicekitError> {
 }
 
 /// Run the same turn with STT, LLM and TTS served by the Python sidecar.
+///
+/// # Errors
+///
+/// Returns a transport-class error when the bundled SDK is unavailable or the
+/// plugin cannot be spawned or reaped, a protocol-class error for an invalid
+/// manifest or session configuration, and any error raised by the turn.
 pub async fn demo_sidecar() -> Result<(), VoicekitError> {
     if !sdk_is_available() {
         return Err(VoicekitError::Transport(
@@ -95,6 +112,11 @@ pub async fn demo_sidecar() -> Result<(), VoicekitError> {
 ///
 /// This is the event-producing entry point the parity test compares across the
 /// fake and sidecar-adapted provider sets.
+///
+/// # Errors
+///
+/// Propagates the classified provider, protocol, transport, or closed-session
+/// error from the turn.
 pub async fn run_turn_events(
     mut session: Session,
 ) -> Result<(TurnReport, Vec<SessionEvent>), VoicekitError> {

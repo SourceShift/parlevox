@@ -8,7 +8,15 @@ use std::collections::VecDeque;
 
 use voicekit_core::{AudioFrame, ErrorClass, OverflowPolicy, VoicekitError};
 
-#[derive(Debug, Clone, PartialEq)]
+/// Smallest event capacity a session can operate with.
+///
+/// Two slots are the minimum contract: one for the terminal `TurnDone` reserve
+/// and one for a streaming or control event ahead of it. A smaller queue can
+/// hold the terminal event but has no room to carry the turn that led to it,
+/// so [`crate::session::Session::new`] rejects it.
+pub const MIN_EVENT_CAPACITY: usize = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEvent {
     /// A transcript was committed and a turn index opened.
     TurnStarted { turn: u64 },
@@ -121,6 +129,15 @@ pub struct EventQueue {
 }
 
 impl EventQueue {
+    /// Create a bounded queue.
+    ///
+    /// `capacity` is the total slot count shared by both lanes. Capacities of
+    /// zero and one are accepted here because the raw queue is still
+    /// well-defined: capacity `0` refuses every event, including the terminal
+    /// one, and capacity `1` reserves the single slot for `TurnDone` so no
+    /// non-terminal event is ever admitted. Callers that drive a real session
+    /// should use at least [`MIN_EVENT_CAPACITY`], which
+    /// [`crate::session::Session::new`] enforces.
     pub fn new(capacity: usize, policy: OverflowPolicy) -> Self {
         EventQueue {
             capacity,
@@ -137,6 +154,12 @@ impl EventQueue {
     /// The producer can branch on the returned [`EventPushOutcome`]: droppable
     /// overflow is counted and reported as `Ok(Replaced | Dropped)`; control
     /// overflow is counted and reported as a protocol error.
+    ///
+    /// # Errors
+    ///
+    /// Returns a protocol-class [`VoicekitError`] when a control event cannot
+    /// be admitted, so the turn fails loudly instead of silently losing turn
+    /// structure.
     pub fn push(&mut self, event: SessionEvent) -> Result<EventPushOutcome, VoicekitError> {
         let reserve = if event.is_terminal() { 0 } else { 1 };
         let limit = self.capacity.saturating_sub(reserve);
@@ -301,6 +324,18 @@ mod tests {
         let err = queue.push(done()).unwrap_err();
         assert!(matches!(err, VoicekitError::Protocol(_)));
         assert_eq!(queue.stats().control_overflow, 1);
+    }
+
+    #[test]
+    fn capacity_one_reserves_the_terminal_slot() {
+        let mut queue = EventQueue::new(1, OverflowPolicy::DropOldest);
+        let err = queue.push(started()).unwrap_err();
+        assert!(matches!(err, VoicekitError::Protocol(_)));
+        assert_eq!(queue.stats().control_overflow, 1);
+        assert!(queue.is_empty());
+
+        assert_eq!(queue.push(done()).unwrap(), EventPushOutcome::Accepted);
+        assert_eq!(kinds(&mut queue), vec!["TurnDone"]);
     }
 
     #[test]

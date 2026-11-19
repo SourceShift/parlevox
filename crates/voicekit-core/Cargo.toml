@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
+description = "Core types, errors, turn state machine, clock, and bounded audio ring for voicekit."
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 serde.workspace = true
@@ -15,3 +19,6 @@ tracing.workspace = true
 [dev-dependencies]
 serde_json.workspace = true
 proptest.workspace = true
+
+[lints]
+workspace = true

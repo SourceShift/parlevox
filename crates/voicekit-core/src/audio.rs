@@ -50,7 +50,11 @@ impl AudioFrame {
         if self.sample_rate == 0 {
             return DurationMs::ZERO;
         }
-        DurationMs::from_secs_f64(self.samples_per_channel() as f64 / self.sample_rate as f64)
+        // Whole-millisecond accounting: integer division truncates any
+        // sub-millisecond remainder, and `saturating_mul` keeps a
+        // pathological sample count from wrapping.
+        let samples = u64::try_from(self.samples_per_channel()).unwrap_or(u64::MAX);
+        DurationMs::from_millis(samples.saturating_mul(1000) / u64::from(self.sample_rate))
     }
 
     pub fn is_empty(&self) -> bool {

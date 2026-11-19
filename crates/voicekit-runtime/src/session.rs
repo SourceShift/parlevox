@@ -22,7 +22,9 @@ use voicekit_providers::{
     AudioChunk, GenerateRequest, ProviderManifest, SynthesizeRequest, VadEvent,
 };
 
-use crate::events::{EventPushOutcome, EventQueue, EventQueueStats, SessionEvent};
+use crate::events::{
+    EventPushOutcome, EventQueue, EventQueueStats, SessionEvent, MIN_EVENT_CAPACITY,
+};
 use crate::registry::Providers;
 
 /// Tunables for one session.
@@ -57,7 +59,7 @@ impl Default for SessionConfig {
 }
 
 /// What one turn produced, independent of how it was rendered.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnReport {
     pub turn: u64,
     pub transcript: String,
@@ -96,6 +98,13 @@ pub struct Session {
 }
 
 impl Session {
+    /// Build a session from a validated provider set.
+    ///
+    /// # Errors
+    ///
+    /// Returns a protocol-class error when a provider manifest is invalid or
+    /// when `event_capacity` is below [`MIN_EVENT_CAPACITY`], which is the
+    /// minimum needed to reserve the terminal slot plus streaming headroom.
     pub fn new(config: SessionConfig, providers: Providers) -> Result<Self, VoicekitError> {
         for manifest in [
             providers.stt.manifest(),
@@ -105,10 +114,13 @@ impl Session {
         ] {
             manifest.validate()?;
         }
-        if config.event_capacity == 0 {
-            return Err(VoicekitError::Protocol(
-                "event_capacity must be at least 1 to reserve the terminal slot".into(),
-            ));
+        if config.event_capacity < MIN_EVENT_CAPACITY {
+            return Err(VoicekitError::Protocol(format!(
+                "event_capacity {} is below MIN_EVENT_CAPACITY ({MIN_EVENT_CAPACITY}): \
+                 one slot reserves the terminal event and one carries streaming \
+                 or control events",
+                config.event_capacity
+            )));
         }
         // Every audio and event path is bounded and uses an explicit policy.
         let input = AudioRing::new(config.input_ring_capacity, OverflowPolicy::DropOldest);
@@ -158,6 +170,11 @@ impl Session {
 
     /// Apply a turn-state event directly. Illegal events surface as
     /// [`VoicekitError::Protocol`]; they are never swallowed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a protocol-class error for an illegal transition and a
+    /// closed-class error once the session is terminal.
     pub fn apply(
         &mut self,
         event: TurnEvent,
@@ -166,6 +183,11 @@ impl Session {
     }
 
     /// Open the session (Idle → Listening).
+    ///
+    /// # Errors
+    ///
+    /// Returns a closed-class error when the session has already terminated,
+    /// or a protocol-class error if the state machine rejects `Start`.
     pub fn start(&mut self) -> Result<(), VoicekitError> {
         if self.machine.state() == TurnState::Idle {
             self.machine.apply(TurnEvent::Start)?;
@@ -186,6 +208,12 @@ impl Session {
     ///
     /// The generation id advances and the token fires, so provider streams
     /// stop on their next poll rather than being killed from outside.
+    ///
+    /// # Errors
+    ///
+    /// Returns a protocol-class error if the state machine rejects the
+    /// barge-in transition; an idle or listening session simply returns
+    /// `Ok(false)`.
     pub fn request_barge_in(&mut self) -> Result<bool, VoicekitError> {
         let state = self.machine.state();
         if !matches!(state, TurnState::Thinking | TurnState::Speaking) {
@@ -199,6 +227,13 @@ impl Session {
     }
 
     /// Drive one complete turn: VAD, STT, LLM, TTS, playout.
+    ///
+    /// # Errors
+    ///
+    /// Returns a protocol-class error when a provider produces unusable output
+    /// or a turn transition is illegal, a closed-class error when the session
+    /// is terminal, and the classified provider or transport error when a
+    /// provider call fails. Control-event overflow is reported the same way.
     pub async fn run_turn(&mut self, utterance: AudioChunk) -> Result<TurnReport, VoicekitError> {
         self.start()?;
         if self.machine.state() == TurnState::Closed {
@@ -586,7 +621,10 @@ pub fn demo_utterance(sample_rate: u32, channels: u16, ms: u64) -> AudioChunk {
     let samples = (sample_rate as u64 * ms / 1000) as usize;
     let mut pcm = Vec::with_capacity(samples * channels as usize);
     for i in 0..samples {
-        let value = ((i as i32 * 31) % 1001 - 500) as i16;
+        // `(i * 31) % 1001` keeps the same phase if `i` is reduced modulo
+        // 1001 first, which keeps the product inside `i32` for any length.
+        let value = i32::try_from(i % 1001).unwrap_or(i32::MAX) * 31 % 1001 - 500;
+        let value = i16::try_from(value).unwrap_or(0);
         for _ in 0..channels {
             pcm.push(value);
         }
@@ -956,6 +994,24 @@ mod tests {
             Ok(_) => panic!("expected zero event capacity to be rejected"),
         };
         assert!(matches!(err, VoicekitError::Protocol(_)));
+    }
+
+    #[test]
+    fn event_capacity_below_minimum_is_rejected_at_construction() {
+        let providers = ProviderRegistry::fakes()
+            .unwrap()
+            .resolve(&Default::default())
+            .unwrap();
+        let config = SessionConfig {
+            event_capacity: MIN_EVENT_CAPACITY - 1,
+            ..SessionConfig::default()
+        };
+        let err = match Session::new(config, providers) {
+            Err(err) => err,
+            Ok(_) => panic!("expected capacity below MIN_EVENT_CAPACITY to be rejected"),
+        };
+        assert!(matches!(err, VoicekitError::Protocol(_)));
+        assert!(err.to_string().contains("MIN_EVENT_CAPACITY"));
     }
 
     #[tokio::test]

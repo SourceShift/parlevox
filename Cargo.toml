@@ -35,6 +35,14 @@ futures-util = "0.3"
 anyhow = "1"
 proptest = "1"
 
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+correctness = "deny"
+suspicious = "warn"
+perf = "warn"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

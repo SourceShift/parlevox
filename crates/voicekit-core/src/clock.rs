@@ -18,12 +18,27 @@ impl DurationMs {
         DurationMs(ms)
     }
 
+    /// Convert seconds to a whole millisecond duration, rounding to nearest.
+    ///
+    /// Returns `None` for `NaN` and negative values, which have no meaningful
+    /// monotonic-duration interpretation. Values too large for `u64`
+    /// milliseconds (about 584 million years) saturate to `u64::MAX`; infinity
+    /// saturates the same way.
+    pub fn try_from_secs_f64(secs: f64) -> Option<Self> {
+        if secs.is_nan() || secs < 0.0 {
+            return None;
+        }
+        // Rust saturates float-to-integer casts, so +inf and huge finite
+        // values both land on `u64::MAX` instead of wrapping.
+        Some(DurationMs((secs * 1000.0).round() as u64))
+    }
+
+    /// Convert seconds to a whole millisecond duration, rounding to nearest.
+    ///
+    /// `NaN` and negative inputs are clamped to [`DurationMs::ZERO`]; values
+    /// that overflow `u64` milliseconds saturate to `u64::MAX`.
     pub fn from_secs_f64(secs: f64) -> Self {
-        debug_assert!(
-            secs.is_finite() && secs >= 0.0,
-            "duration must be finite and non-negative"
-        );
-        DurationMs((secs.max(0.0) * 1000.0).round() as u64)
+        Self::try_from_secs_f64(secs).unwrap_or(DurationMs::ZERO)
     }
 
     pub fn as_millis(self) -> u64 {
@@ -34,6 +49,7 @@ impl DurationMs {
         self.0 as f64 / 1000.0
     }
 
+    #[must_use]
     pub fn saturating_sub(self, other: DurationMs) -> DurationMs {
         DurationMs(self.0.saturating_sub(other.0))
     }
@@ -73,9 +89,11 @@ impl MonoClock {
     }
 
     pub fn now(&self) -> Timestamp {
-        Timestamp(DurationMs::from_millis(
-            self.epoch.elapsed().as_millis() as u64
-        ))
+        // `Instant::elapsed` measures u128 milliseconds; a saturating
+        // conversion cannot lose a realistic duration (u64 ms is about
+        // 584 million years) and avoids an unchecked narrowing cast.
+        let ms = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        Timestamp(DurationMs::from_millis(ms))
     }
 
     /// Measure a block with this clock. Useful in traces and tests.
@@ -109,5 +127,27 @@ mod tests {
     fn secs_conversion_rounds() {
         assert_eq!(DurationMs::from_secs_f64(0.0205).as_millis(), 21);
         assert_eq!(DurationMs::from_secs_f64(0.0), DurationMs::ZERO);
+    }
+
+    #[test]
+    fn secs_conversion_rejects_nan_and_negative() {
+        assert_eq!(DurationMs::try_from_secs_f64(f64::NAN), None);
+        assert_eq!(DurationMs::try_from_secs_f64(-0.001), None);
+        assert_eq!(DurationMs::try_from_secs_f64(f64::NEG_INFINITY), None);
+        assert_eq!(DurationMs::from_secs_f64(f64::NAN), DurationMs::ZERO);
+        assert_eq!(DurationMs::from_secs_f64(-0.001), DurationMs::ZERO);
+    }
+
+    #[test]
+    fn secs_conversion_saturates_at_the_u64_ceiling() {
+        let saturated = DurationMs::from_millis(u64::MAX);
+        assert_eq!(
+            DurationMs::try_from_secs_f64(f64::INFINITY),
+            Some(saturated)
+        );
+        assert_eq!(DurationMs::try_from_secs_f64(f64::MAX), Some(saturated));
+        assert_eq!(DurationMs::try_from_secs_f64(1e17), Some(saturated));
+        assert_eq!(DurationMs::from_secs_f64(f64::INFINITY), saturated);
+        assert_eq!(DurationMs::from_secs_f64(1e17), saturated);
     }
 }

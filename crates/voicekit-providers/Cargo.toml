@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
+description = "Provider traits, manifests, and deterministic in-process fakes for voicekit."
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 voicekit-core = { path = "../voicekit-core" }
@@ -19,3 +23,6 @@ tracing.workspace = true
 [dev-dependencies]
 tokio.workspace = true
 futures-util.workspace = true
+
+[lints]
+workspace = true
