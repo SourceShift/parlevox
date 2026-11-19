@@ -1,7 +1,7 @@
-# voicekit
+# parlevox
 
-[![CI](https://github.com/SourceShift/voicekit/actions/workflows/ci.yml/badge.svg)](https://github.com/SourceShift/voicekit/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/SourceShift/voicekit?include_prereleases&sort=semver)](https://github.com/SourceShift/voicekit/releases)
+[![CI](https://github.com/SourceShift/parlevox/actions/workflows/ci.yml/badge.svg)](https://github.com/SourceShift/parlevox/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/SourceShift/parlevox?include_prereleases&sort=semver)](https://github.com/SourceShift/parlevox/releases)
 [![MSRV: 1.85](https://img.shields.io/badge/rust-1.85%2B-blue.svg)](Cargo.toml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
@@ -70,10 +70,10 @@ gaps, including the ones this README does not hide.
 
 ```bash
 # One full fake turn: no Python, no network, no API keys.
-cargo run -q -p voicekit-cli -- demo --fake
+cargo run -q -p parlevox-cli -- demo --fake
 
 # The same turn through the Python plugin over the framed sidecar protocol.
-PYTHONPATH=sdks/python cargo run -q -p voicekit-cli -- demo --sidecar
+PYTHONPATH=sdks/python cargo run -q -p parlevox-cli -- demo --sidecar
 ```
 
 Expected output: two `AudioOut` frames and a `TurnDone` line carrying
@@ -93,13 +93,13 @@ Tests are hermetic: no network, no API keys, no installed Python package.
 
 | Path | What |
 |---|---|
-| `crates/voicekit-core` | Audio frame, monotonic clock, bounded `AudioRing`, turn FSM, error classes |
-| `crates/voicekit-providers` | Streaming STT/LLM/TTS/VAD traits, manifests, deterministic in-process fakes |
-| `crates/voicekit-runtime` | One session: FSM owner, rings, bounded event handoff, provider selection, barge-in |
-| `crates/voicekit-ipc` | Length-prefixed binary framing used **only** by the sidecar |
-| `crates/voicekit-sidecar` | Process supervision and plugin→trait adapters |
-| `crates/voicekit-cli` | `demo --fake` / `demo --sidecar` |
-| `sdks/python/voicekit_sdk` | Reference Python plugin SDK and sidecar entry point |
+| `crates/parlevox-core` | Audio frame, monotonic clock, bounded `AudioRing`, turn FSM, error classes |
+| `crates/parlevox-providers` | Streaming STT/LLM/TTS/VAD traits, manifests, deterministic in-process fakes |
+| `crates/parlevox-runtime` | One session: FSM owner, rings, bounded event handoff, provider selection, barge-in |
+| `crates/parlevox-ipc` | Length-prefixed binary framing used **only** by the sidecar |
+| `crates/parlevox-sidecar` | Process supervision and plugin→trait adapters |
+| `crates/parlevox-cli` | `demo --fake` / `demo --sidecar` |
+| `sdks/python/parlevox_sdk` | Reference Python plugin SDK and sidecar entry point |
 
 ## Design docs
 
@@ -129,4 +129,4 @@ per-seat or per-installation fee, and no copyleft obligation on your code.
 A separate commercial edition — the managed/hosted service and the enterprise
 add-ons built on these crates — is a paid offering and does not live in this
 repository. If you need it, or want to sponsor development, open an issue on
-[GitHub](https://github.com/SourceShift/voicekit/issues).
+[GitHub](https://github.com/SourceShift/parlevox/issues).

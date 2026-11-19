@@ -1,0 +1,30 @@
+[package]
+name = "parlevox-sidecar"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Spawn, supervise, and adapt a Python parlevox plugin over the framed protocol."
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+parlevox-core = { version = "0.1.0", path = "../parlevox-core" }
+parlevox-providers = { version = "0.1.0", path = "../parlevox-providers" }
+parlevox-ipc = { version = "0.1.0", path = "../parlevox-ipc" }
+async-trait.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+
+[lints]
+workspace = true

@@ -22,8 +22,8 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 PYTHONPATH=sdks/python python3 -m pytest sdks/python/tests -q
-cargo run -q -p voicekit-cli -- demo --fake
-PYTHONPATH=sdks/python cargo run -q -p voicekit-cli -- demo --sidecar
+cargo run -q -p parlevox-cli -- demo --fake
+PYTHONPATH=sdks/python cargo run -q -p parlevox-cli -- demo --sidecar
 ```
 
 Both demos must print the same event sequence; the sidecar one also reports
@@ -37,7 +37,7 @@ Both demos must print the same event sequence; the sidecar one also reports
 - **No silent loss.** New buffers need a capacity and an `OverflowPolicy`;
   new drop paths need a counter.
 - **No new dependency without a reason** in the PR description.
-- **Wire compatibility.** `voicekit-ipc` frame layout changes are breaking;
+- **Wire compatibility.** `parlevox-ipc` frame layout changes are breaking;
   call them out explicitly.
 - **Tests that fail on the old code.** A bug fix without a regression test is
   not finished.

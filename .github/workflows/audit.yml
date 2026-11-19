@@ -28,9 +28,3 @@ jobs:
       - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          # RUSTSEC-2026-0486 (rustix xattr zero-length buffer) is reachable
-          # only through dev-dependencies: proptest -> rusty-fork -> tempfile
-          # -> rustix. No shipped crate links rustix, and the affected xattr
-          # path is never called by the test harness. Re-check whenever
-          # proptest's dependency tree changes.
-          ignore: RUSTSEC-2026-0486

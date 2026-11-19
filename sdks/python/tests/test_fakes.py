@@ -1,6 +1,6 @@
 """Deterministic fakes and manifest shape."""
 
-from voicekit_sdk.fakes import (
+from parlevox_sdk.fakes import (
     FAKE_FRAME_SAMPLES,
     FAKE_LLM_DELTAS,
     FAKE_REPLY,

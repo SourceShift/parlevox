@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/voicekit-core",
-    "crates/voicekit-ipc",
-    "crates/voicekit-providers",
-    "crates/voicekit-runtime",
-    "crates/voicekit-sidecar",
-    "crates/voicekit-cli",
+    "crates/parlevox-core",
+    "crates/parlevox-ipc",
+    "crates/parlevox-providers",
+    "crates/parlevox-runtime",
+    "crates/parlevox-sidecar",
+    "crates/parlevox-cli",
 ]
 
 [workspace.package]
@@ -14,8 +14,8 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.85"
-repository = "https://github.com/SourceShift/voicekit"
-homepage = "https://github.com/SourceShift/voicekit"
+repository = "https://github.com/SourceShift/parlevox"
+homepage = "https://github.com/SourceShift/parlevox"
 readme = "README.md"
 keywords = ["voice", "agents", "speech", "tts", "realtime"]
 categories = ["multimedia::audio", "asynchronous", "network-programming"]
