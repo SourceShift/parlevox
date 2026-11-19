@@ -19,7 +19,10 @@ impl DurationMs {
     }
 
     pub fn from_secs_f64(secs: f64) -> Self {
-        debug_assert!(secs.is_finite() && secs >= 0.0, "duration must be finite and non-negative");
+        debug_assert!(
+            secs.is_finite() && secs >= 0.0,
+            "duration must be finite and non-negative"
+        );
         DurationMs((secs.max(0.0) * 1000.0).round() as u64)
     }
 
@@ -64,12 +67,14 @@ impl Default for MonoClock {
 
 impl MonoClock {
     pub fn new() -> Self {
-        MonoClock { epoch: Instant::now() }
+        MonoClock {
+            epoch: Instant::now(),
+        }
     }
 
     pub fn now(&self) -> Timestamp {
         Timestamp(DurationMs::from_millis(
-            self.epoch.elapsed().as_millis() as u64,
+            self.epoch.elapsed().as_millis() as u64
         ))
     }
 
