@@ -112,13 +112,19 @@ Tests are hermetic: no network, no API keys, no installed Python package.
 
 ## Roadmap (v0.1+)
 
-Close the gaps listed in [`DESIGN.md` §8](docs/architecture/DESIGN.md): thread
-sidecar `dropped_frames` into `TurnDone`, bound the sidecar's cancellation
-tombstones, property-test the event queue, and add a differential fake-vs-plugin
-turn test. Beyond that: a Rust-owned `ChatContext` for multi-turn sessions, OTel
-turn spans, composable turn-taking strategies, warm plugin pools, and
+The remaining gaps are listed in [`DESIGN.md` §8](docs/architecture/DESIGN.md):
+producer credits (slow the producer instead of dropping), a full-duplex turn
+model, a warm plugin pool, and OTel turn spans. Beyond those: a Rust-owned
+`ChatContext` for multi-turn sessions, composable turn-taking strategies, and
 early-start/pipelined decoding.
 
 ## License
 
-Apache-2.0. See [`LICENSE`](LICENSE).
+Apache-2.0 — see [`LICENSE`](LICENSE). Everything in this repository is open
+source and free to use, including in commercial products; there is no
+per-seat or per-installation fee, and no copyleft obligation on your code.
+
+A separate commercial edition — the managed/hosted service and the enterprise
+add-ons built on these crates — is a paid offering and does not live in this
+repository. If you need it, or want to sponsor development, open an issue on
+[GitHub](https://github.com/SourceShift/voicekit/issues).
