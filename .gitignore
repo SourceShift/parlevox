@@ -1,5 +1,7 @@
 # mini-ork runtime state (never commit: state.db + secrets)
 .mini-ork/
+# skills mini-ork materializes into the target repo for a node's lifetime
+/.claude/skills/
 # reference framework clones (read-only comparison inputs)
 reference/
 
