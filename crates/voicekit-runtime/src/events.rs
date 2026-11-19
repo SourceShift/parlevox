@@ -26,6 +26,10 @@ pub enum SessionEvent {
         dropped_ms: u64,
         /// Events this turn's bounded queue had to drop.
         dropped_events: u64,
+        /// Frames the sidecar plugin reported dropping for this turn. Kept
+        /// separate from `dropped_frames` (Rust playout) so loss at the
+        /// process boundary is distinguishable from local backpressure.
+        sidecar_dropped_frames: u64,
         interrupted: bool,
     },
     /// The turn failed with a classified error.
@@ -67,6 +71,18 @@ impl SessionEvent {
     }
 }
 
+/// What happened to one [`EventQueue::push`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventPushOutcome {
+    /// The event was buffered without evicting anything.
+    Accepted,
+    /// The event was buffered and an older droppable event was evicted to
+    /// make room (counted once as a drop).
+    Replaced,
+    /// The event was rejected without being buffered (counted once as a drop).
+    Dropped,
+}
+
 /// Counters for the bounded session event queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventQueueStats {
@@ -89,12 +105,12 @@ pub struct EventQueueStats {
 /// * **Droppable** (`ReplyDelta`, `AudioOut`) may be dropped under
 ///   backpressure. `DropOldest` evicts the oldest droppable event; `DropNewest`
 ///   drops the incoming one. Control events are never evicted.
-/// * **Control** (`TurnStarted`, `TranscriptFinal`, `Failed`) is never dropped:
-///   when it cannot be admitted, [`EventQueue::push`] returns
+/// * **Control** (`TurnStarted`, `TranscriptFinal`, `Failed`, `TurnDone`) is
+///   never dropped: when it cannot be admitted, [`EventQueue::push`] returns
 ///   [`VoicekitError::Protocol`] so the turn fails loudly and the refusal is
 ///   counted.
-/// * **Terminal** (`TurnDone`) owns the otherwise-reserved last slot, so a turn
-///   always has room to report how it ended.
+/// * **Terminal** (`TurnDone`) is control *and* owns the otherwise-reserved
+///   last slot, so a turn always has room to report how it ended.
 pub struct EventQueue {
     capacity: usize,
     policy: OverflowPolicy,
@@ -118,15 +134,16 @@ impl EventQueue {
 
     /// Push one event, applying the overflow policy.
     ///
-    /// Droppable overflow is counted and reported as `Ok(())`; control overflow
-    /// is counted and reported as a protocol error.
-    pub fn push(&mut self, event: SessionEvent) -> Result<(), VoicekitError> {
+    /// The producer can branch on the returned [`EventPushOutcome`]: droppable
+    /// overflow is counted and reported as `Ok(Replaced | Dropped)`; control
+    /// overflow is counted and reported as a protocol error.
+    pub fn push(&mut self, event: SessionEvent) -> Result<EventPushOutcome, VoicekitError> {
         let reserve = if event.is_terminal() { 0 } else { 1 };
         let limit = self.capacity.saturating_sub(reserve);
         if self.queue.len() < limit {
             self.queue.push_back(event);
             self.accepted += 1;
-            return Ok(());
+            return Ok(EventPushOutcome::Accepted);
         }
 
         if event.is_droppable() {
@@ -137,13 +154,13 @@ impl EventQueue {
                         self.dropped += 1;
                         self.queue.push_back(event);
                         self.accepted += 1;
-                        return Ok(());
+                        return Ok(EventPushOutcome::Replaced);
                     }
                 }
                 OverflowPolicy::DropNewest => {}
             }
             self.dropped += 1;
-            return Ok(());
+            return Ok(EventPushOutcome::Dropped);
         }
 
         // Control lane cannot accept the event: fail the turn loudly rather
@@ -218,6 +235,7 @@ mod tests {
             dropped_frames: 0,
             dropped_ms: 0,
             dropped_events: 0,
+            sidecar_dropped_frames: 0,
             interrupted: false,
         }
     }
@@ -229,11 +247,14 @@ mod tests {
     #[test]
     fn capacity_bounds_the_queue_and_counts_every_drop() {
         let mut queue = EventQueue::new(2, OverflowPolicy::DropNewest);
-        queue.push(started()).unwrap();
+        assert_eq!(queue.push(started()).unwrap(), EventPushOutcome::Accepted);
         // The one non-terminal slot is occupied by a control event, so every
         // droppable is rejected and counted.
         for i in 0..5 {
-            queue.push(delta(&i.to_string())).unwrap();
+            assert_eq!(
+                queue.push(delta(&i.to_string())).unwrap(),
+                EventPushOutcome::Dropped
+            );
         }
         assert!(queue.len() <= 2);
         assert_eq!(queue.stats().dropped, 5);
@@ -244,10 +265,11 @@ mod tests {
     #[test]
     fn drop_oldest_evicts_only_droppable_events() {
         let mut queue = EventQueue::new(3, OverflowPolicy::DropOldest);
-        queue.push(started()).unwrap();
-        queue.push(delta("a")).unwrap();
-        queue.push(delta("b")).unwrap(); // evicts "a", the oldest droppable
-        queue.push(done()).unwrap();
+        assert_eq!(queue.push(started()).unwrap(), EventPushOutcome::Accepted);
+        assert_eq!(queue.push(delta("a")).unwrap(), EventPushOutcome::Accepted);
+        // Evicts "a", the oldest droppable, and reports the replacement.
+        assert_eq!(queue.push(delta("b")).unwrap(), EventPushOutcome::Replaced);
+        assert_eq!(queue.push(done()).unwrap(), EventPushOutcome::Accepted);
 
         assert_eq!(queue.stats().dropped, 1);
         let events = queue.take();

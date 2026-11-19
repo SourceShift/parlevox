@@ -5,14 +5,30 @@
 
 use std::sync::Arc;
 
+use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
-use voicekit_core::VoicekitError;
+use voicekit_core::{AudioFrame, Timestamp, VoicekitError};
 use voicekit_ipc::{PluginEvent, PluginRequest};
-use voicekit_providers::FAKE_LLM_DELTAS;
-use voicekit_sidecar::{Incoming, RestartPolicy, SidecarClient, SidecarConfig, SidecarSupervisor};
+use voicekit_providers::{AudioChunk, SttProvider, FAKE_LLM_DELTAS, FAKE_TRANSCRIPT};
+use voicekit_sidecar::{
+    sdk_is_available, Incoming, RestartPolicy, SidecarClient, SidecarConfig, SidecarStt,
+    SidecarSupervisor,
+};
+
+/// Mirrors `MAX_PENDING_AUDIO_FRAMES` in `sdks/python/voicekit_sdk/plugin.py`.
+const PY_MAX_PENDING_AUDIO_FRAMES: usize = 64;
 
 fn python() -> String {
     std::env::var("VOICEKIT_PYTHON").unwrap_or_else(|_| "python3".into())
+}
+
+fn python_ready() -> bool {
+    sdk_is_available()
+        && std::process::Command::new(python())
+            .args(["-c", "import sys"])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
 }
 
 #[tokio::test]
@@ -81,6 +97,107 @@ async fn cancel_ends_the_stream_without_killing_the_process() {
     }
     assert_eq!(deltas, FAKE_LLM_DELTAS.to_vec());
     assert!(client.is_alive().await);
+
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn transcribe_overflow_reports_dropped_frames_in_done() {
+    if !python_ready() {
+        eprintln!("skipping sidecar drop telemetry: Python SDK is not available");
+        return;
+    }
+
+    let client = Arc::new(
+        SidecarClient::spawn(SidecarConfig::python_sdk())
+            .await
+            .unwrap(),
+    );
+
+    let overflow = 7usize;
+    let total = PY_MAX_PENDING_AUDIO_FRAMES + overflow;
+    let frames: Vec<AudioFrame> = (0..total)
+        .map(|_| AudioFrame::new(Timestamp::from_millis(0), 16_000, 1, vec![0i16; 4]))
+        .collect();
+
+    let mut handle = client
+        .open_request(
+            PluginRequest::Transcribe {
+                request_id: client.new_request_id("stt"),
+                sample_rate: 16_000,
+                channels: 1,
+            },
+            frames,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let mut reported = None;
+    while let Some(item) = handle.recv().await {
+        match item {
+            Incoming::Event(PluginEvent::Done { dropped_frames, .. }) => {
+                reported = Some(dropped_frames);
+                break;
+            }
+            Incoming::Event(PluginEvent::Error { message, .. }) => {
+                panic!("plugin error: {message}")
+            }
+            _ => {}
+        }
+    }
+
+    let shutdown = client.shutdown().await;
+    assert_eq!(
+        reported,
+        Some(overflow as u64),
+        "the plugin must report exactly the frames its bounded buffer evicted"
+    );
+    shutdown.unwrap();
+}
+
+#[tokio::test]
+async fn sidecar_stt_captures_the_plugin_dropped_frames() {
+    if !python_ready() {
+        eprintln!("skipping SidecarStt drop telemetry: Python SDK is not available");
+        return;
+    }
+
+    let client = Arc::new(
+        SidecarClient::spawn(SidecarConfig::python_sdk())
+            .await
+            .unwrap(),
+    );
+    let stt = SidecarStt::new(Arc::clone(&client));
+
+    // The adapter streams the utterance in 10 ms frames; send enough to
+    // overflow the plugin's 64-frame per-request buffer by `overflow`.
+    let overflow = 6usize;
+    let total_frames = PY_MAX_PENDING_AUDIO_FRAMES + overflow;
+    let sample_rate = 16_000u32;
+    let samples = total_frames * (sample_rate as usize / 100);
+    let audio = AudioChunk::new(sample_rate, 1, vec![0i16; samples]);
+
+    let mut stream = stt
+        .transcribe(audio, CancellationToken::new())
+        .await
+        .unwrap();
+    let mut final_text = None;
+    while let Some(item) = stream.next().await {
+        let chunk = item.unwrap();
+        if chunk.is_final {
+            final_text = Some(chunk.text);
+        }
+    }
+
+    assert_eq!(final_text.as_deref(), Some(FAKE_TRANSCRIPT));
+    assert_eq!(
+        stt.take_sidecar_dropped_frames(),
+        overflow as u64,
+        "SidecarStt must surface the plugin's bounded-buffer evictions"
+    );
+    // Swap semantics: the same count is never reported twice.
+    assert_eq!(stt.take_sidecar_dropped_frames(), 0);
 
     client.shutdown().await.unwrap();
 }

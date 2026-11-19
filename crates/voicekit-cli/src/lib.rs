@@ -4,18 +4,20 @@
 //! drive the same code path the binary does. `main.rs` is a thin delegate.
 //!
 //! `demo --fake` uses only in-process fakes: no process, no Python import, no
-//! network. `demo --sidecar` runs the same turn with LLM and TTS served by the
-//! optional Python plugin over the framed protocol.
+//! network. `demo --sidecar` runs the same turn with STT, LLM and TTS served by
+//! the optional Python plugin over the framed protocol.
 
 use std::sync::Arc;
 
 use voicekit_core::VoicekitError;
-use voicekit_providers::{FakeStt, FakeVad, LlmProvider, TtsProvider};
+use voicekit_providers::{FakeVad, LlmProvider, SttProvider, TtsProvider};
 use voicekit_runtime::{
     demo_utterance, ProviderNames, ProviderRegistry, Session, SessionConfig, SessionEvent,
     TurnReport,
 };
-use voicekit_sidecar::{sdk_is_available, SidecarClient, SidecarConfig, SidecarLlm, SidecarTts};
+use voicekit_sidecar::{
+    sdk_is_available, SidecarClient, SidecarConfig, SidecarLlm, SidecarStt, SidecarTts,
+};
 
 /// Parse process arguments and run the matching demo.
 pub async fn run_args() -> Result<(), VoicekitError> {
@@ -51,7 +53,7 @@ pub async fn demo_fake() -> Result<(), VoicekitError> {
     run_and_render(session).await
 }
 
-/// Run the same turn with LLM and TTS served by the Python sidecar.
+/// Run the same turn with STT, LLM and TTS served by the Python sidecar.
 pub async fn demo_sidecar() -> Result<(), VoicekitError> {
     if !sdk_is_available() {
         return Err(VoicekitError::Transport(
@@ -60,16 +62,17 @@ pub async fn demo_sidecar() -> Result<(), VoicekitError> {
     }
     let client = Arc::new(SidecarClient::spawn(SidecarConfig::python_sdk()).await?);
 
+    let stt = Arc::new(SidecarStt::new(Arc::clone(&client)));
     let llm = Arc::new(SidecarLlm::new(Arc::clone(&client)));
     let tts = Arc::new(SidecarTts::new(Arc::clone(&client)));
     let mut registry = ProviderRegistry::new();
-    registry.register_stt(Arc::new(FakeStt::new()))?;
+    registry.register_stt(stt.clone())?;
     registry.register_llm(llm.clone())?;
     registry.register_tts(tts.clone())?;
     registry.register_vad(Arc::new(FakeVad::new()))?;
 
     let names = ProviderNames {
-        stt: "fake-stt".into(),
+        stt: stt.manifest().name.clone(),
         llm: llm.manifest().name.clone(),
         tts: tts.manifest().name.clone(),
         vad: "fake-vad".into(),
@@ -110,12 +113,17 @@ async fn run_and_render(mut session: Session) -> Result<(), VoicekitError> {
     match result {
         Ok(report) => {
             println!(
-                "summary turn={} transcript={:?} reply={:?} audio_frames={} dropped_events={} interrupted={}",
+                "summary turn={} transcript={:?} reply={:?} audio_frames={} \
+                 dropped_frames={} dropped_ms={} dropped_events={} \
+                 sidecar_dropped_frames={} interrupted={}",
                 report.turn,
                 report.transcript,
                 report.reply,
                 report.audio_frames,
+                report.dropped_frames,
+                report.dropped_ms,
                 report.dropped_events,
+                report.sidecar_dropped_frames,
                 report.interrupted
             );
             Ok(())
@@ -145,10 +153,12 @@ pub fn render(event: &SessionEvent) -> String {
             dropped_frames,
             dropped_ms,
             dropped_events,
+            sidecar_dropped_frames,
             interrupted,
         } => format!(
             "event TurnDone turn={turn} audio_frames={audio_frames} dropped_frames={dropped_frames} \
-             dropped_ms={dropped_ms} dropped_events={dropped_events} interrupted={interrupted}"
+             dropped_ms={dropped_ms} dropped_events={dropped_events} \
+             sidecar_dropped_frames={sidecar_dropped_frames} interrupted={interrupted}"
         ),
         SessionEvent::Failed { class, message } => {
             format!("event Failed class={class:?} message={message:?}")

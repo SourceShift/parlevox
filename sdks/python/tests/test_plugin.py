@@ -3,7 +3,12 @@
 import io
 from collections import deque
 
-from voicekit_sdk.plugin import MAX_PENDING_AUDIO_FRAMES, Plugin
+from voicekit_sdk.plugin import (
+    MAX_CANCELLED,
+    MAX_PENDING_AUDIO_FRAMES,
+    CancelledTombstones,
+    Plugin,
+)
 from voicekit_sdk.protocol import (
     KIND_AUDIO,
     KIND_JSON,
@@ -77,7 +82,11 @@ def test_cancel_is_acknowledged_and_plugin_keeps_serving():
     messages = [decode_json(p) for k, p in frames if k == KIND_JSON]
     audio = [p for k, p in frames if k == KIND_AUDIO]
     assert messages[0]["type"] == "audio_start"
-    assert messages[-1] == {"type": "done", "request_id": "r2"}
+    assert messages[-1] == {
+        "type": "done",
+        "request_id": "r2",
+        "dropped_frames": 0,
+    }
     assert len(audio) == 2
     for payload in audio:
         header, pcm = decode_audio(payload)
@@ -137,7 +146,7 @@ def test_cancel_purges_state_before_acking():
     pending_audio = {"r1": deque([b"\x00\x00"], maxlen=MAX_PENDING_AUDIO_FRAMES)}
     pending_requests = {"r1": {"type": "transcribe", "request_id": "r1"}}
     pending_dropped = {"r1": 0}
-    cancelled = set()
+    cancelled = CancelledTombstones()
 
     assert (
         plugin.handle(
@@ -183,7 +192,11 @@ def test_cancel_suppresses_pending_work_and_plugin_keeps_serving():
     assert messages[0] == {"type": "cancel_ack", "request_id": "r1"}
     assert not any(message.get("request_id") == "r1" and message["type"] != "cancel_ack" for message in messages)
     assert not any(message["type"] in ("partial", "final", "error") for message in messages)
-    assert messages[-1] == {"type": "done", "request_id": "r2"}
+    assert messages[-1] == {
+        "type": "done",
+        "request_id": "r2",
+        "dropped_frames": 0,
+    }
 
 
 def test_cancel_for_unknown_id_is_a_noop_ack():
@@ -192,7 +205,7 @@ def test_cancel_for_unknown_id_is_a_noop_ack():
     pending_audio = {}
     pending_requests = {}
     pending_dropped = {}
-    cancelled = set()
+    cancelled = CancelledTombstones()
 
     assert (
         plugin.handle(
@@ -205,10 +218,144 @@ def test_cancel_for_unknown_id_is_a_noop_ack():
         )
         is True
     )
-    assert cancelled == set()
+    assert len(cancelled) == 0
     assert json_messages(out.getvalue()) == [{"type": "cancel_ack", "request_id": "ghost"}]
 
     # Idempotent: a second cancel for the same unknown id behaves identically.
     out = io.BytesIO()
     plugin.handle({"type": "cancel", "request_id": "ghost"}, out)
     assert json_messages(out.getvalue()) == [{"type": "cancel_ack", "request_id": "ghost"}]
+
+
+def test_cancelled_tombstones_never_exceed_capacity():
+    tombstones = CancelledTombstones()
+    overflow = 5
+    for i in range(MAX_CANCELLED + overflow):
+        tombstones.remember(f"r{i}")
+    assert len(tombstones) == MAX_CANCELLED
+    assert tombstones.evicted == overflow
+
+
+def test_eviction_is_oldest_first_and_counted():
+    tombstones = CancelledTombstones(capacity=3)
+    for i in range(5):
+        tombstones.remember(f"r{i}")
+    assert list(tombstones) == ["r2", "r3", "r4"]
+    assert tombstones.evicted == 2
+    assert "r0" not in tombstones and "r1" not in tombstones
+
+    # Re-remembering a live id neither grows the ledger nor evicts anything.
+    tombstones.remember("r4")
+    assert len(tombstones) == 3
+    assert tombstones.evicted == 2
+
+
+def test_repeated_late_audio_end_for_live_tombstone_is_a_silent_noop():
+    plugin = Plugin()
+    frames = [json_frame({"type": "transcribe", "request_id": "r1", "sample_rate": 16000, "channels": 1})]
+    frames.extend(audio_frame("r1", seq=i) for i in range(3))
+    frames.append(json_frame({"type": "cancel", "request_id": "r1"}))
+    # Two late audio_end frames for the same tombstoned id: both stay silent.
+    frames.append(json_frame({"type": "audio_end", "request_id": "r1"}))
+    frames.append(json_frame({"type": "audio_end", "request_id": "r1"}))
+    frames.append(
+        json_frame(
+            {
+                "type": "synthesize",
+                "request_id": "r2",
+                "text": "hi",
+                "sample_rate": 16000,
+                "channels": 1,
+            }
+        )
+    )
+
+    messages = json_messages(run_frames(plugin, frames))
+    assert messages[0] == {"type": "cancel_ack", "request_id": "r1"}
+    assert not any(
+        message.get("request_id") == "r1" and message["type"] != "cancel_ack"
+        for message in messages
+    )
+    assert not any(message["type"] in ("partial", "final", "error") for message in messages)
+    assert messages[-1]["type"] == "done" and messages[-1]["request_id"] == "r2"
+
+
+def test_late_audio_end_for_evicted_tombstone_is_rejected_not_executed():
+    plugin = Plugin()
+    out = io.BytesIO()
+    pending_audio = {}
+    pending_requests = {}
+    pending_dropped = {}
+    cancelled = CancelledTombstones(capacity=2)
+
+    # Cancel three known requests; the oldest tombstone (r1) is evicted.
+    for request_id in ("r1", "r2", "r3"):
+        pending_requests[request_id] = {"type": "transcribe", "request_id": request_id}
+        plugin.handle(
+            {"type": "cancel", "request_id": request_id},
+            out,
+            pending_audio,
+            pending_requests,
+            pending_dropped,
+            cancelled,
+        )
+    assert cancelled.evicted == 1
+    assert "r1" not in cancelled
+
+    out = io.BytesIO()
+    assert (
+        plugin.handle(
+            {"type": "audio_end", "request_id": "r1"},
+            out,
+            pending_audio,
+            pending_requests,
+            pending_dropped,
+            cancelled,
+        )
+        is True
+    )
+    messages = json_messages(out.getvalue())
+    assert messages == [
+        {
+            "type": "error",
+            "request_id": "r1",
+            "class": "protocol",
+            "message": "audio_end for unknown request",
+        }
+    ]
+    assert not any(message["type"] in ("partial", "final") for message in messages)
+
+
+def test_post_cancel_audio_is_not_rebuffered():
+    plugin = Plugin()
+    out = io.BytesIO()
+    pending_audio = {}
+    pending_requests = {"r1": {"type": "transcribe", "request_id": "r1"}}
+    pending_dropped = {"r1": 0}
+    cancelled = CancelledTombstones()
+
+    plugin.handle(
+        {"type": "cancel", "request_id": "r1"},
+        out,
+        pending_audio,
+        pending_requests,
+        pending_dropped,
+        cancelled,
+    )
+    assert pending_audio == {} and pending_requests == {}
+
+    Plugin._buffer_audio(
+        "r1", b"\x00\x00", pending_audio, pending_requests, pending_dropped, cancelled
+    )
+    assert pending_audio == {}
+    assert pending_dropped == {}
+
+    # An evicted tombstone is not an open request either, so audio is ignored.
+    tombstones = CancelledTombstones(capacity=1)
+    tombstones.remember("old")
+    tombstones.remember("new")
+    assert "old" not in tombstones
+    Plugin._buffer_audio(
+        "old", b"\x00\x00", pending_audio, pending_requests, pending_dropped, tombstones
+    )
+    assert pending_audio == {}

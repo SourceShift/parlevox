@@ -8,6 +8,6 @@ pub mod events;
 pub mod registry;
 pub mod session;
 
-pub use events::{EventQueue, EventQueueStats, SessionEvent};
+pub use events::{EventPushOutcome, EventQueue, EventQueueStats, SessionEvent};
 pub use registry::{ProviderNames, ProviderRegistry, Providers};
 pub use session::{demo_utterance, Session, SessionConfig, TurnReport};

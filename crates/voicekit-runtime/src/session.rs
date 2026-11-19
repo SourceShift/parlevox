@@ -15,14 +15,14 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 use voicekit_core::{
-    AudioRing, MonoClock, OverflowPolicy, RingStats, TurnEvent, TurnMachine, TurnState,
-    VoicekitError,
+    AudioRing, MonoClock, OverflowPolicy, PushOutcome, RingStats, TurnEvent, TurnMachine,
+    TurnState, VoicekitError,
 };
 use voicekit_providers::{
     AudioChunk, GenerateRequest, ProviderManifest, SynthesizeRequest, VadEvent,
 };
 
-use crate::events::{EventQueue, EventQueueStats, SessionEvent};
+use crate::events::{EventPushOutcome, EventQueue, EventQueueStats, SessionEvent};
 use crate::registry::Providers;
 
 /// Tunables for one session.
@@ -67,6 +67,9 @@ pub struct TurnReport {
     pub dropped_ms: u64,
     /// Events dropped from the bounded handoff queue during this turn.
     pub dropped_events: u64,
+    /// Frames the sidecar plugin reported dropping. Distinct from
+    /// `dropped_frames`, which is the Rust playout ring.
+    pub sidecar_dropped_frames: u64,
     pub input_dropped_frames: u64,
     pub interrupted: bool,
 }
@@ -213,9 +216,18 @@ impl Session {
             events_dropped: self.events.dropped(),
         };
 
-        // Bounded input path: one frame carrying the utterance.
+        // Bounded input path: one frame carrying the utterance. The outcome is
+        // explicit so a zero-capacity ring reports loss instead of hiding it.
         let input_ts = self.clock.now();
-        let _ = self.input.push(utterance.to_frame(input_ts));
+        match self.input.push(utterance.to_frame(input_ts)) {
+            PushOutcome::Accepted | PushOutcome::Replaced => {}
+            PushOutcome::Dropped => {
+                tracing::trace!(
+                    target: "voicekit_runtime",
+                    "input ring rejected the utterance frame"
+                );
+            }
+        }
 
         // 1. Voice activity.
         let vad_provider = Arc::clone(&self.providers.vad);
@@ -368,7 +380,18 @@ impl Session {
                 None => break,
                 Some(Ok(chunk)) => {
                     let ts = self.clock.now();
-                    self.output.push(chunk.to_frame(ts));
+                    // Branch on the bounded playout ring's outcome: a frame the
+                    // ring rejects is counted inside the ring, but the producer
+                    // must still observe that the drop happened.
+                    match self.output.push(chunk.to_frame(ts)) {
+                        PushOutcome::Accepted | PushOutcome::Replaced => {}
+                        PushOutcome::Dropped => {
+                            tracing::trace!(
+                                target: "voicekit_runtime",
+                                "playout ring rejected an audio frame"
+                            );
+                        }
+                    }
                     while let Some(played) = self.output.pop() {
                         audio_frames += 1;
                         self.emit(SessionEvent::AudioOut {
@@ -407,6 +430,9 @@ impl Session {
             .events
             .dropped()
             .saturating_sub(baseline.events_dropped);
+        // The adapters accumulate per-request sidecar loss; taking it after the
+        // TTS stream ends keeps the value per-turn and never double counts.
+        let sidecar_dropped_frames = self.take_sidecar_dropped_frames();
 
         self.emit(SessionEvent::TurnDone {
             turn,
@@ -414,6 +440,7 @@ impl Session {
             dropped_frames,
             dropped_ms,
             dropped_events,
+            sidecar_dropped_frames,
             interrupted: false,
         })?;
 
@@ -425,6 +452,7 @@ impl Session {
             dropped_frames,
             dropped_ms,
             dropped_events,
+            sidecar_dropped_frames,
             input_dropped_frames,
             interrupted: false,
         })
@@ -433,10 +461,41 @@ impl Session {
     /// Enqueue one event under the bounded-queue policy. Droppable overflow is
     /// absorbed by the queue; control overflow surfaces as a protocol error.
     fn emit(&mut self, event: SessionEvent) -> Result<(), VoicekitError> {
-        self.events.push(event)
+        match self.events.push(event)? {
+            EventPushOutcome::Accepted => {}
+            EventPushOutcome::Replaced => {
+                tracing::trace!(
+                    target: "voicekit_runtime",
+                    "session event queue evicted the oldest droppable event"
+                );
+            }
+            EventPushOutcome::Dropped => {
+                tracing::trace!(
+                    target: "voicekit_runtime",
+                    "session event queue dropped an incoming event"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Take the sidecar adapters' per-request dropped-frame telemetry. The
+    /// transcribe path is the one that buffers audio, so STT is the only
+    /// adapter that can legitimately report non-zero; LLM and TTS are included
+    /// so a future/other plugin's count is never discarded. Swap semantics
+    /// mean the value belongs to exactly one turn.
+    fn take_sidecar_dropped_frames(&self) -> u64 {
+        self.providers
+            .stt
+            .take_sidecar_dropped_frames()
+            .saturating_add(self.providers.llm.take_sidecar_dropped_frames())
+            .saturating_add(self.providers.tts.take_sidecar_dropped_frames())
     }
 
     fn fail<T>(&mut self, err: VoicekitError) -> Result<T, VoicekitError> {
+        // A failed turn owns no telemetry: drain whatever the adapters recorded
+        // so a partial turn cannot bill its sidecar drops to the next one.
+        let _ = self.take_sidecar_dropped_frames();
         // If the control lane cannot even carry `Failed`, the queue error is
         // the louder and more accurate failure to report.
         self.emit(SessionEvent::Failed {
@@ -472,6 +531,10 @@ impl Session {
         baseline: TurnBaseline,
     ) -> Result<TurnReport, VoicekitError> {
         self.ensure_listening_after_interrupt()?;
+        // Drain any telemetry the adapters collected before the interruption
+        // so it cannot leak into a later turn. A turn that never saw a `Done`
+        // reports zero.
+        let sidecar_dropped_frames = self.take_sidecar_dropped_frames();
         let output_dropped = self.output.stats();
         let dropped_frames = output_dropped
             .dropped
@@ -497,6 +560,7 @@ impl Session {
                 dropped_frames,
                 dropped_ms,
                 dropped_events,
+                sidecar_dropped_frames,
                 interrupted: true,
             })?;
         }
@@ -509,6 +573,7 @@ impl Session {
             dropped_frames,
             dropped_ms,
             dropped_events,
+            sidecar_dropped_frames,
             input_dropped_frames,
             interrupted: true,
         })
@@ -532,10 +597,102 @@ pub fn demo_utterance(sample_rate: u32, channels: u16, ms: u64) -> AudioChunk {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use async_trait::async_trait;
+
     use crate::events::SessionEvent;
-    use crate::registry::ProviderRegistry;
+    use crate::registry::{ProviderNames, ProviderRegistry};
     use voicekit_core::ErrorClass;
-    use voicekit_providers::{FAKE_REPLY, FAKE_SAMPLE_RATE, FAKE_TRANSCRIPT, FAKE_TTS_FRAMES};
+    use voicekit_providers::{
+        cancelable_stream, AudioChunk, FakeLlm, FakeStt, FakeTts, FakeVad, Modality,
+        ProviderStream, SttProvider, SynthesizeRequest, TranscriptChunk, TtsProvider, FAKE_REPLY,
+        FAKE_SAMPLE_RATE, FAKE_TRANSCRIPT, FAKE_TTS_FRAMES,
+    };
+
+    /// TTS double that reports a fixed sidecar drop count exactly once, proving
+    /// the runtime aggregates adapter telemetry rather than inventing it.
+    struct ReportingTts {
+        manifest: ProviderManifest,
+        dropped: Arc<AtomicU64>,
+    }
+
+    impl ReportingTts {
+        fn new(reported: u64) -> Self {
+            ReportingTts {
+                manifest: ProviderManifest::new("reporting-tts", Modality::Tts),
+                dropped: Arc::new(AtomicU64::new(reported)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TtsProvider for ReportingTts {
+        fn manifest(&self) -> &ProviderManifest {
+            &self.manifest
+        }
+
+        fn take_sidecar_dropped_frames(&self) -> u64 {
+            self.dropped.swap(0, Ordering::SeqCst)
+        }
+
+        async fn synthesize(
+            &self,
+            request: SynthesizeRequest,
+            cancel: CancellationToken,
+        ) -> Result<ProviderStream<AudioChunk>, VoicekitError> {
+            let items = (0..FAKE_TTS_FRAMES)
+                .map(|_| {
+                    Ok(AudioChunk::new(
+                        request.sample_rate,
+                        request.channels,
+                        vec![1; 16],
+                    ))
+                })
+                .collect();
+            Ok(cancelable_stream(items, cancel))
+        }
+    }
+
+    /// STT double that reports a fixed sidecar drop count exactly once. This is
+    /// the path that actually buffers audio in the plugin, so STT telemetry is
+    /// the one that must never be dropped by the aggregation.
+    struct ReportingStt {
+        manifest: ProviderManifest,
+        dropped: Arc<AtomicU64>,
+    }
+
+    impl ReportingStt {
+        fn new(reported: u64) -> Self {
+            ReportingStt {
+                manifest: ProviderManifest::new("reporting-stt", Modality::Stt),
+                dropped: Arc::new(AtomicU64::new(reported)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SttProvider for ReportingStt {
+        fn manifest(&self) -> &ProviderManifest {
+            &self.manifest
+        }
+
+        fn take_sidecar_dropped_frames(&self) -> u64 {
+            self.dropped.swap(0, Ordering::SeqCst)
+        }
+
+        async fn transcribe(
+            &self,
+            _audio: AudioChunk,
+            cancel: CancellationToken,
+        ) -> Result<ProviderStream<TranscriptChunk>, VoicekitError> {
+            let items = vec![Ok(TranscriptChunk {
+                text: FAKE_TRANSCRIPT.into(),
+                is_final: true,
+            })];
+            Ok(cancelable_stream(items, cancel))
+        }
+    }
 
     fn fake_session(config: SessionConfig) -> Session {
         let providers = ProviderRegistry::fakes()
@@ -560,6 +717,7 @@ mod tests {
         assert_eq!(report.reply, FAKE_REPLY);
         assert_eq!(report.audio_frames as usize, FAKE_TTS_FRAMES);
         assert_eq!(report.dropped_events, 0);
+        assert_eq!(report.sidecar_dropped_frames, 0);
         assert!(!report.interrupted);
         assert_eq!(session.state(), TurnState::Listening);
         assert_eq!(session.turn_index(), 1);
@@ -602,6 +760,96 @@ mod tests {
             .collect();
         assert!(!kinds.contains(&"AudioOut"));
         assert!(kinds.contains(&"TurnDone"));
+    }
+
+    #[tokio::test]
+    async fn zero_capacity_input_ring_takes_the_explicit_dropped_branch() {
+        let config = SessionConfig {
+            input_ring_capacity: 0,
+            ..SessionConfig::default()
+        };
+        let (session, result) = run_fake(config).await;
+        let report = result.unwrap();
+        // The utterance frame was rejected by the bounded input ring and
+        // counted, but the turn itself still completes.
+        assert_eq!(report.input_dropped_frames, 1);
+        assert_eq!(session.input_stats().dropped, 1);
+        assert_eq!(report.sidecar_dropped_frames, 0);
+        assert_eq!(report.audio_frames as usize, FAKE_TTS_FRAMES);
+    }
+
+    #[tokio::test]
+    async fn sidecar_dropped_frames_is_reported_and_taken_per_turn() {
+        let tts = Arc::new(ReportingTts::new(5));
+        let mut registry = ProviderRegistry::new();
+        registry.register_stt(Arc::new(FakeStt::new())).unwrap();
+        registry.register_llm(Arc::new(FakeLlm::new())).unwrap();
+        registry.register_tts(tts).unwrap();
+        registry.register_vad(Arc::new(FakeVad::new())).unwrap();
+        let names = ProviderNames {
+            stt: "fake-stt".into(),
+            llm: "fake-llm".into(),
+            tts: "reporting-tts".into(),
+            vad: "fake-vad".into(),
+        };
+        let providers = registry.resolve(&names).unwrap();
+        let mut session = Session::new(SessionConfig::default(), providers).unwrap();
+
+        let first = session
+            .run_turn(demo_utterance(FAKE_SAMPLE_RATE, 1, 40))
+            .await
+            .unwrap();
+        assert_eq!(first.sidecar_dropped_frames, 5);
+        // Playout loss stays a separate, distinguishable counter.
+        assert_eq!(first.dropped_frames, 0);
+
+        let events = session.take_events();
+        match events.last() {
+            Some(SessionEvent::TurnDone {
+                sidecar_dropped_frames,
+                dropped_frames,
+                ..
+            }) => {
+                assert_eq!(*sidecar_dropped_frames, 5);
+                assert_eq!(*dropped_frames, 0);
+            }
+            other => panic!("expected TurnDone, got {other:?}"),
+        }
+
+        // Swap semantics: the same telemetry is never counted twice.
+        let second = session
+            .run_turn(demo_utterance(FAKE_SAMPLE_RATE, 1, 40))
+            .await
+            .unwrap();
+        assert_eq!(second.sidecar_dropped_frames, 0);
+    }
+
+    #[tokio::test]
+    async fn sidecar_dropped_frames_includes_the_stt_adapter() {
+        // The transcribe path is the only one that buffers audio in the plugin,
+        // so its telemetry must reach the turn report even when LLM and TTS
+        // report nothing.
+        let stt = Arc::new(ReportingStt::new(4));
+        let mut registry = ProviderRegistry::new();
+        registry.register_stt(stt).unwrap();
+        registry.register_llm(Arc::new(FakeLlm::new())).unwrap();
+        registry.register_tts(Arc::new(FakeTts::new())).unwrap();
+        registry.register_vad(Arc::new(FakeVad::new())).unwrap();
+        let names = ProviderNames {
+            stt: "reporting-stt".into(),
+            llm: "fake-llm".into(),
+            tts: "fake-tts".into(),
+            vad: "fake-vad".into(),
+        };
+        let providers = registry.resolve(&names).unwrap();
+        let mut session = Session::new(SessionConfig::default(), providers).unwrap();
+
+        let report = session
+            .run_turn(demo_utterance(FAKE_SAMPLE_RATE, 1, 40))
+            .await
+            .unwrap();
+        assert_eq!(report.sidecar_dropped_frames, 4);
+        assert_eq!(report.dropped_frames, 0);
     }
 
     #[tokio::test]
