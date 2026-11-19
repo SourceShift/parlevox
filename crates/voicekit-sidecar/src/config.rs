@@ -55,11 +55,13 @@ impl SidecarConfig {
         }
     }
 
+    #[must_use = "builder methods return a modified config; chain or assign the result"]
     pub fn with_handshake_timeout_ms(mut self, ms: u64) -> Self {
         self.handshake_timeout_ms = ms;
         self
     }
 
+    #[must_use = "builder methods return a modified config; chain or assign the result"]
     pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.push((key.into(), value.into()));
         self

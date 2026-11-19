@@ -54,11 +54,19 @@ fn require_pcm(pcm: &[i16]) -> Result<(), VoicekitError> {
 }
 
 /// Deterministic PCM: a bounded sawtooth, identical on every run.
+///
+/// `(base * 7) % 201` repeats every 201 samples, so the running index is
+/// reduced modulo the period before it is widened. That keeps the arithmetic
+/// in `i32` (and the result in `i16`) for any `frame_index`, including values
+/// large enough that `frame_index * FAKE_FRAME_SAMPLES` would overflow
+/// `usize`.
 fn fake_pcm(frame_index: usize) -> Vec<i16> {
     (0..FAKE_FRAME_SAMPLES)
         .map(|i| {
-            let base = (i + frame_index * FAKE_FRAME_SAMPLES) as i32;
-            ((base * 7) % 201 - 100) as i16
+            let phase = (frame_index % 201) * (FAKE_FRAME_SAMPLES % 201) % 201;
+            let base = i32::try_from((i + phase) % 201).unwrap_or(i32::MAX);
+            let value = (base * 7) % 201 - 100;
+            i16::try_from(value).unwrap_or(0)
         })
         .collect()
 }
@@ -307,6 +315,29 @@ mod tests {
         .await;
         assert_eq!(deltas, FAKE_LLM_DELTAS.to_vec());
         assert_eq!(deltas.concat(), FAKE_REPLY);
+    }
+
+    #[test]
+    fn fake_pcm_stays_in_range_for_large_frame_indices() {
+        for frame_index in [0, 1, 200, 201, usize::MAX / 2, usize::MAX] {
+            let pcm = fake_pcm(frame_index);
+            assert_eq!(pcm.len(), FAKE_FRAME_SAMPLES);
+            assert!(pcm.iter().all(|sample| (-100..=100).contains(sample)));
+        }
+        // The waveform is periodic with period 201 frames' worth of samples.
+        assert_eq!(fake_pcm(0), fake_pcm(201));
+    }
+
+    #[test]
+    fn fake_pcm_reduction_preserves_the_original_samples() {
+        for frame_index in 0..4 {
+            let pcm = fake_pcm(frame_index);
+            for (i, sample) in pcm.iter().enumerate() {
+                let base = i + frame_index * FAKE_FRAME_SAMPLES;
+                let expected = i32::try_from(base).unwrap() * 7 % 201 - 100;
+                assert_eq!(*sample, i16::try_from(expected).unwrap());
+            }
+        }
     }
 
     #[tokio::test]

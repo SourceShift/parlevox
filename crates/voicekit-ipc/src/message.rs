@@ -63,7 +63,7 @@ impl From<ErrorClassWire> for ErrorClass {
 }
 
 /// A request from the Rust core to a plugin.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PluginRequest {
     /// Opening handshake. Must be the first message on the stream.
@@ -127,7 +127,7 @@ impl PluginRequest {
 }
 
 /// An event from a plugin to the Rust core.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PluginEvent {
     /// Handshake acknowledgement; carries the plugin's manifest.

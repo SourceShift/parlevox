@@ -29,7 +29,7 @@ impl Modality {
 }
 
 /// Static description of a provider.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderManifest {
     /// Stable identifier used for selection, e.g. `"fake-tts"`.
     pub name: String,
@@ -50,6 +50,7 @@ impl ProviderManifest {
         }
     }
 
+    #[must_use = "builder methods return a modified manifest; chain or assign the result"]
     pub fn with_capability(mut self, capability: impl Into<String>) -> Self {
         self.capabilities.push(capability.into());
         self
@@ -60,6 +61,11 @@ impl ProviderManifest {
     }
 
     /// Reject manifests that cannot be selected unambiguously.
+    ///
+    /// # Errors
+    ///
+    /// Returns a protocol-class error when the name is empty or whitespace or
+    /// when `config_schema` is not a JSON object.
     pub fn validate(&self) -> Result<(), VoicekitError> {
         if self.name.trim().is_empty() {
             return Err(VoicekitError::Protocol("manifest name is empty".into()));

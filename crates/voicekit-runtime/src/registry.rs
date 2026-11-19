@@ -59,6 +59,11 @@ impl ProviderRegistry {
     }
 
     /// Registry pre-loaded with the four deterministic fakes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a protocol-class error if a built-in fake manifest fails
+    /// validation.
     pub fn fakes() -> Result<Self, VoicekitError> {
         let mut registry = Self::new();
         registry.register_stt(Arc::new(FakeStt::new()))?;
@@ -68,24 +73,40 @@ impl ProviderRegistry {
         Ok(registry)
     }
 
+    /// # Errors
+    ///
+    /// Returns a protocol-class error when the provider's manifest fails
+    /// validation.
     pub fn register_stt(&mut self, provider: Arc<dyn SttProvider>) -> Result<(), VoicekitError> {
         check(provider.manifest())?;
         self.stt.push(provider);
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns a protocol-class error when the provider's manifest fails
+    /// validation.
     pub fn register_llm(&mut self, provider: Arc<dyn LlmProvider>) -> Result<(), VoicekitError> {
         check(provider.manifest())?;
         self.llm.push(provider);
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns a protocol-class error when the provider's manifest fails
+    /// validation.
     pub fn register_tts(&mut self, provider: Arc<dyn TtsProvider>) -> Result<(), VoicekitError> {
         check(provider.manifest())?;
         self.tts.push(provider);
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns a protocol-class error when the provider's manifest fails
+    /// validation.
     pub fn register_vad(&mut self, provider: Arc<dyn VadProvider>) -> Result<(), VoicekitError> {
         check(provider.manifest())?;
         self.vad.push(provider);
@@ -105,6 +126,10 @@ impl ProviderRegistry {
         VoicekitError::Protocol(format!("no {modality} provider registered as '{name}'"))
     }
 
+    /// # Errors
+    ///
+    /// Returns a protocol-class error when no registered STT provider has
+    /// exactly this name.
     pub fn select_stt(&self, name: &str) -> Result<Arc<dyn SttProvider>, VoicekitError> {
         self.stt
             .iter()
@@ -113,6 +138,10 @@ impl ProviderRegistry {
             .ok_or_else(|| Self::missing("stt", name))
     }
 
+    /// # Errors
+    ///
+    /// Returns a protocol-class error when no registered LLM provider has
+    /// exactly this name.
     pub fn select_llm(&self, name: &str) -> Result<Arc<dyn LlmProvider>, VoicekitError> {
         self.llm
             .iter()
@@ -121,6 +150,10 @@ impl ProviderRegistry {
             .ok_or_else(|| Self::missing("llm", name))
     }
 
+    /// # Errors
+    ///
+    /// Returns a protocol-class error when no registered TTS provider has
+    /// exactly this name.
     pub fn select_tts(&self, name: &str) -> Result<Arc<dyn TtsProvider>, VoicekitError> {
         self.tts
             .iter()
@@ -129,6 +162,10 @@ impl ProviderRegistry {
             .ok_or_else(|| Self::missing("tts", name))
     }
 
+    /// # Errors
+    ///
+    /// Returns a protocol-class error when no registered VAD provider has
+    /// exactly this name.
     pub fn select_vad(&self, name: &str) -> Result<Arc<dyn VadProvider>, VoicekitError> {
         self.vad
             .iter()
@@ -138,6 +175,11 @@ impl ProviderRegistry {
     }
 
     /// Resolve all four roles at once.
+    ///
+    /// # Errors
+    ///
+    /// Returns a protocol-class error naming the first role that no registered
+    /// provider matches.
     pub fn resolve(&self, names: &ProviderNames) -> Result<Providers, VoicekitError> {
         Ok(Providers {
             stt: self.select_stt(&names.stt)?,

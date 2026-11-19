@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
+description = "Spawn, supervise, and adapt a Python voicekit plugin over the framed protocol."
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 voicekit-core = { path = "../voicekit-core" }
@@ -21,3 +25,6 @@ tokio-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+
+[lints]
+workspace = true

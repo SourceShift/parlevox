@@ -62,11 +62,16 @@ impl SidecarSupervisor {
         self.restarts
     }
 
-    pub async fn client(&self) -> Option<Arc<SidecarClient>> {
+    pub fn client(&self) -> Option<Arc<SidecarClient>> {
         self.client.clone()
     }
 
     /// Return a live client, restarting (with backoff) when needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport-class error from the final spawn attempt when the
+    /// restart budget is exhausted.
     pub async fn ensure(&mut self) -> Result<Arc<SidecarClient>, VoicekitError> {
         if let Some(client) = &self.client {
             if client.is_alive().await {
@@ -77,6 +82,12 @@ impl SidecarSupervisor {
     }
 
     /// Replace the current client, retrying at most `max_restarts` times.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport-class error from the last failed spawn, or a
+    /// protocol-class handshake error surfaced by the client, once the
+    /// restart budget is exhausted.
     pub async fn restart(&mut self) -> Result<Arc<SidecarClient>, VoicekitError> {
         if let Some(client) = self.client.take() {
             self.restarts += 1;

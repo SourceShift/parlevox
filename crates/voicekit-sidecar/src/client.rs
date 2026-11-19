@@ -54,6 +54,13 @@ enum RecvOutcome {
 
 impl SidecarClient {
     /// Spawn the process and complete the `hello`/`ready` handshake.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport-class error when the process cannot be spawned, its
+    /// pipes are unavailable, or the handshake times out; and a protocol-class
+    /// error when the plugin's `ready` frame is malformed or announces an
+    /// incompatible protocol version or ABI.
     pub async fn spawn(config: SidecarConfig) -> Result<Self, VoicekitError> {
         let mut command = Command::new(&config.program);
         command
@@ -220,6 +227,12 @@ impl SidecarClient {
     /// `cancel` is watched by a task that writes a `Cancel` frame; the process
     /// is never killed. The handle stops when the token fires or the plugin
     /// reports a terminal event.
+    ///
+    /// # Errors
+    ///
+    /// Returns a protocol-class error when the request carries no request id
+    /// or cannot be encoded, and a transport-class error when writing the
+    /// request or its audio frames fails.
     pub async fn open_request(
         &self,
         request: PluginRequest,
@@ -306,6 +319,11 @@ impl SidecarClient {
     }
 
     /// Politely stop the plugin and reap the child.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport-class error when the child cannot be waited on or
+    /// does not exit before the shutdown timeout.
     pub async fn shutdown(&self) -> Result<(), VoicekitError> {
         {
             let mut writer = self.inner.writer.lock().await;

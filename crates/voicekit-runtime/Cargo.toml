@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
+description = "Session runtime: provider registry, bounded event queue, and the turn loop for voicekit."
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 voicekit-core = { path = "../voicekit-core" }
@@ -20,3 +24,6 @@ tracing.workspace = true
 tokio.workspace = true
 proptest.workspace = true
 async-trait.workspace = true
+
+[lints]
+workspace = true

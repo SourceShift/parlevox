@@ -264,9 +264,13 @@ impl SttProvider for SidecarStt {
         }
         let request_id = self.client.new_request_id("stt");
         // Interleaved samples per 10 ms frame; fall back to one frame for a
-        // degenerate sample rate or channel count.
-        let samples_per_frame = (audio.sample_rate as u64 * STT_FRAME_MS / 1000) as usize
-            * audio.channels.max(1) as usize;
+        // degenerate sample rate or channel count. Conversion failures and
+        // multiplication overflow saturate rather than wrap.
+        let samples_per_channel =
+            usize::try_from(u64::from(audio.sample_rate) * STT_FRAME_MS / 1000)
+                .unwrap_or(usize::MAX);
+        let samples_per_frame =
+            samples_per_channel.saturating_mul(usize::from(audio.channels.max(1)));
         let frames: Vec<AudioFrame> = if samples_per_frame == 0 {
             vec![AudioFrame::new(
                 Timestamp::from_millis(0),
@@ -280,8 +284,11 @@ impl SttProvider for SidecarStt {
                 .chunks(samples_per_frame)
                 .enumerate()
                 .map(|(index, pcm)| {
+                    let timestamp_ms = u64::try_from(index)
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(STT_FRAME_MS);
                     AudioFrame::new(
-                        Timestamp::from_millis(index as u64 * STT_FRAME_MS),
+                        Timestamp::from_millis(timestamp_ms),
                         audio.sample_rate,
                         audio.channels,
                         pcm.to_vec(),

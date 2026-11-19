@@ -88,6 +88,11 @@ impl TurnMachine {
 
     /// Apply an event. Returns the transition, or an error for an illegal one.
     /// `Close` is legal from every non-closed state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a protocol-class error when the event is not legal from the
+    /// current state, and a closed-class error once the machine is terminal.
     pub fn apply(&mut self, event: TurnEvent) -> Result<Transition, VoicekitError> {
         use TurnState as S;
 
