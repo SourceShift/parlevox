@@ -1,0 +1,19 @@
+# mini-ork runtime state (never commit: state.db + secrets)
+.mini-ork/
+# reference framework clones (read-only comparison inputs)
+reference/
+
+# Rust
+/target/
+**/target/
+Cargo.lock.bak
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# local
+.DS_Store
+*.log
