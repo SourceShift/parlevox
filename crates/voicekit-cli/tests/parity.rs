@@ -1,260 +1,174 @@
-//! Fake-vs-sidecar parity for one scripted turn.
+//! Differential parity for one scripted turn.
 //!
-//! The sidecar side is an in-process test double: it reproduces the plugin's
-//! provider behaviour by round-tripping every delta and audio frame through the
-//! same framed protocol the real plugin uses. Nothing here spawns Python,
-//! imports the SDK, or touches the network.
+//! The fake side runs entirely in process. The sidecar side runs the same
+//! utterance through the **real** Python plugin — `SidecarStt`, `SidecarLlm`
+//! and `SidecarTts` over the framed protocol, with in-process `FakeVad` — so a
+//! divergence in the Python plugin fails the test instead of hiding behind a
+//! second set of Rust fakes.
+//!
+//! The comparison uses a canonical projection: kind, turn, text, PCM samples,
+//! sample rate, channels, and every drop counter. Audio timestamps are
+//! session-epoch-relative and therefore normalized away.
+//!
+//! When the SDK is absent or the configured interpreter cannot be probed, the
+//! differential test prints an explicit skip and returns. It does not fail and
+//! is not `#[ignore]`d, so a plain `cargo test` stays green on a Python-free
+//! checkout.
 
-use std::io::Cursor;
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use futures_util::StreamExt;
-use tokio_util::sync::CancellationToken;
 use voicekit_core::VoicekitError;
-use voicekit_ipc::{read_frame, write_frame, AudioHeader, Frame, PluginEvent};
 use voicekit_providers::{
-    cancelable_stream, AudioChunk, FakeStt, FakeTts, FakeVad, GenerateRequest, LlmProvider,
-    Modality, ProviderManifest, ProviderStream, SynthesizeRequest, TtsProvider, FAKE_LLM_DELTAS,
-    FAKE_REPLY, FAKE_TRANSCRIPT, FAKE_TTS_FRAMES,
+    FakeVad, LlmProvider, SttProvider, TtsProvider, FAKE_REPLY, FAKE_TRANSCRIPT, FAKE_TTS_FRAMES,
 };
-use voicekit_runtime::{ProviderNames, ProviderRegistry, Session, SessionConfig, SessionEvent};
+use voicekit_runtime::{
+    ProviderNames, ProviderRegistry, Session, SessionConfig, SessionEvent, TurnReport,
+};
+use voicekit_sidecar::{
+    sdk_is_available, SidecarClient, SidecarConfig, SidecarLlm, SidecarStt, SidecarTts,
+};
 
-const DOUBLE_LLM_NAME: &str = "sidecar-double-llm";
-const DOUBLE_TTS_NAME: &str = "sidecar-double-tts";
-
-/// LLM double: the plugin's deltas, carried through the JSON framing layer.
-struct SidecarDoubleLlm {
-    manifest: ProviderManifest,
+fn python_probe() -> bool {
+    let python = std::env::var("VOICEKIT_PYTHON").unwrap_or_else(|_| "python3".into());
+    std::process::Command::new(python)
+        .args(["-c", "import sys"])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
-impl SidecarDoubleLlm {
-    fn new() -> Self {
-        SidecarDoubleLlm {
-            manifest: ProviderManifest::new(DOUBLE_LLM_NAME, Modality::Llm)
-                .with_capability("streaming")
-                .with_capability("cancel"),
-        }
-    }
-}
-
-#[async_trait]
-impl LlmProvider for SidecarDoubleLlm {
-    fn manifest(&self) -> &ProviderManifest {
-        &self.manifest
-    }
-
-    async fn generate(
-        &self,
-        request: GenerateRequest,
-        cancel: CancellationToken,
-    ) -> Result<ProviderStream<String>, VoicekitError> {
-        if request.prompt.trim().is_empty() {
-            return Err(VoicekitError::Protocol("prompt must not be empty".into()));
-        }
-        let mut items = Vec::new();
-        for delta in FAKE_LLM_DELTAS {
-            let event = PluginEvent::Delta {
-                request_id: "llm-0".into(),
-                text: delta.to_string(),
-            };
-            let mut bytes = Vec::new();
-            write_frame(
-                &mut bytes,
-                &Frame::Json(serde_json::to_value(event).unwrap()),
-            )
-            .await
-            .map_err(|err| VoicekitError::Protocol(err.to_string()))?;
-            let mut cursor = Cursor::new(bytes);
-            let Frame::Json(value) = read_frame(&mut cursor)
-                .await
-                .map_err(|err| VoicekitError::Protocol(err.to_string()))?
-            else {
-                return Err(VoicekitError::Protocol("expected JSON frame".into()));
-            };
-            match serde_json::from_value::<PluginEvent>(value) {
-                Ok(PluginEvent::Delta { text, .. }) => items.push(Ok(text)),
-                other => {
-                    return Err(VoicekitError::Protocol(format!(
-                        "expected delta, got {other:?}"
-                    )))
-                }
-            }
-        }
-        Ok(cancelable_stream(items, cancel))
-    }
-}
-
-/// TTS double: the plugin's audio chunks, carried through the binary framing
-/// layer exactly as the sidecar adapter receives them.
-struct SidecarDoubleTts {
-    manifest: ProviderManifest,
-    inner: FakeTts,
-}
-
-impl SidecarDoubleTts {
-    fn new() -> Self {
-        SidecarDoubleTts {
-            manifest: ProviderManifest::new(DOUBLE_TTS_NAME, Modality::Tts)
-                .with_capability("streaming")
-                .with_capability("binary_pcm")
-                .with_capability("cancel"),
-            inner: FakeTts::new(),
-        }
-    }
-}
-
-#[async_trait]
-impl TtsProvider for SidecarDoubleTts {
-    fn manifest(&self) -> &ProviderManifest {
-        &self.manifest
-    }
-
-    async fn synthesize(
-        &self,
-        request: SynthesizeRequest,
-        cancel: CancellationToken,
-    ) -> Result<ProviderStream<AudioChunk>, VoicekitError> {
-        if request.text.trim().is_empty() {
-            return Err(VoicekitError::Protocol("text must not be empty".into()));
-        }
-        if request.sample_rate == 0 || request.channels == 0 {
-            return Err(VoicekitError::Protocol(
-                "sample_rate and channels must be non-zero".into(),
-            ));
-        }
-
-        let mut source = self
-            .inner
-            .synthesize(request, CancellationToken::new())
-            .await?;
-        let mut items = Vec::new();
-        while let Some(item) = source.next().await {
-            let chunk = item?;
-            let frame = Frame::Audio {
-                header: AudioHeader {
-                    request_id: "tts-0".into(),
-                    seq: items.len() as u64,
-                    sample_rate: chunk.sample_rate,
-                    channels: chunk.channels,
-                },
-                pcm: chunk.pcm,
-            };
-            let mut bytes = Vec::new();
-            write_frame(&mut bytes, &frame)
-                .await
-                .map_err(|err| VoicekitError::Protocol(err.to_string()))?;
-            let mut cursor = Cursor::new(bytes);
-            let Frame::Audio { header, pcm } = read_frame(&mut cursor)
-                .await
-                .map_err(|err| VoicekitError::Protocol(err.to_string()))?
-            else {
-                return Err(VoicekitError::Protocol("expected audio frame".into()));
-            };
-            items.push(Ok(AudioChunk::new(
-                header.sample_rate,
-                header.channels,
-                pcm,
-            )));
-        }
-        Ok(cancelable_stream(items, cancel))
-    }
-}
-
-async fn run_fake() -> (voicekit_runtime::TurnReport, Vec<SessionEvent>) {
+async fn run_fake() -> (TurnReport, Vec<SessionEvent>) {
     let registry = ProviderRegistry::fakes().unwrap();
     let providers = registry.resolve(&ProviderNames::default()).unwrap();
     let session = Session::new(SessionConfig::default(), providers).unwrap();
     voicekit_cli::run_turn_events(session).await.unwrap()
 }
 
-async fn run_sidecar_double() -> (voicekit_runtime::TurnReport, Vec<SessionEvent>) {
-    let llm = Arc::new(SidecarDoubleLlm::new());
-    let tts = Arc::new(SidecarDoubleTts::new());
+async fn run_sidecar(
+    client: Arc<SidecarClient>,
+) -> Result<(TurnReport, Vec<SessionEvent>), VoicekitError> {
+    let stt = Arc::new(SidecarStt::new(Arc::clone(&client)));
+    let llm = Arc::new(SidecarLlm::new(Arc::clone(&client)));
+    let tts = Arc::new(SidecarTts::new(Arc::clone(&client)));
     let mut registry = ProviderRegistry::new();
-    registry.register_stt(Arc::new(FakeStt::new())).unwrap();
-    registry.register_llm(llm.clone()).unwrap();
-    registry.register_tts(tts.clone()).unwrap();
-    registry.register_vad(Arc::new(FakeVad::new())).unwrap();
+    registry.register_stt(stt.clone())?;
+    registry.register_llm(llm.clone())?;
+    registry.register_tts(tts.clone())?;
+    registry.register_vad(Arc::new(FakeVad::new()))?;
 
     let names = ProviderNames {
-        stt: "fake-stt".into(),
+        stt: stt.manifest().name.clone(),
         llm: llm.manifest().name.clone(),
         tts: tts.manifest().name.clone(),
         vad: "fake-vad".into(),
     };
-    let providers = registry.resolve(&names).unwrap();
-    let session = Session::new(SessionConfig::default(), providers).unwrap();
-    voicekit_cli::run_turn_events(session).await.unwrap()
+    let providers = registry.resolve(&names)?;
+    let session = Session::new(SessionConfig::default(), providers)?;
+    voicekit_cli::run_turn_events(session).await
 }
 
-type DoneFields = (u64, u64, u64, u64, u64, bool);
+/// Canonical, timestamp-free projection of an event trace.
+fn project(events: &[SessionEvent]) -> Vec<String> {
+    events
+        .iter()
+        .map(|event| match event {
+            SessionEvent::TurnStarted { turn } => format!("TurnStarted turn={turn}"),
+            SessionEvent::TranscriptFinal { turn, text } => {
+                format!("TranscriptFinal turn={turn} text={text:?}")
+            }
+            SessionEvent::ReplyDelta { turn, text } => {
+                format!("ReplyDelta turn={turn} text={text:?}")
+            }
+            SessionEvent::AudioOut { turn, frame } => format!(
+                "AudioOut turn={turn} rate={} channels={} pcm={:?}",
+                frame.sample_rate, frame.channels, frame.pcm
+            ),
+            SessionEvent::TurnDone {
+                turn,
+                audio_frames,
+                dropped_frames,
+                dropped_ms,
+                dropped_events,
+                sidecar_dropped_frames,
+                interrupted,
+            } => format!(
+                "TurnDone turn={turn} audio_frames={audio_frames} \
+                 dropped_frames={dropped_frames} dropped_ms={dropped_ms} \
+                 dropped_events={dropped_events} \
+                 sidecar_dropped_frames={sidecar_dropped_frames} \
+                 interrupted={interrupted}"
+            ),
+            SessionEvent::Failed { class, message } => {
+                format!("Failed class={class:?} message={message:?}")
+            }
+        })
+        .collect()
+}
 
-fn done_fields(events: &[SessionEvent]) -> DoneFields {
-    match events.last() {
-        Some(SessionEvent::TurnDone {
-            turn,
-            audio_frames,
-            dropped_frames,
-            dropped_ms,
-            dropped_events,
-            interrupted,
-        }) => (
-            *turn,
-            *audio_frames,
-            *dropped_frames,
-            *dropped_ms,
-            *dropped_events,
-            *interrupted,
-        ),
-        other => panic!("expected a terminal TurnDone, got {other:?}"),
+#[tokio::test]
+async fn fake_turn_is_deterministic() {
+    let (first_report, first_events) = run_fake().await;
+    let (second_report, second_events) = run_fake().await;
+
+    assert_eq!(first_report, second_report);
+    assert_eq!(project(&first_events), project(&second_events));
+    assert_eq!(first_report.transcript, FAKE_TRANSCRIPT);
+    assert_eq!(first_report.reply, FAKE_REPLY);
+    assert_eq!(first_report.audio_frames as usize, FAKE_TTS_FRAMES);
+    assert_eq!(first_report.sidecar_dropped_frames, 0);
+}
+
+#[tokio::test]
+async fn real_sidecar_matches_the_in_process_turn() {
+    if !sdk_is_available() {
+        eprintln!("skipping differential parity: sdks/python is not available");
+        return;
     }
-}
+    if !python_probe() {
+        eprintln!("skipping differential parity: configured Python interpreter cannot be probed");
+        return;
+    }
 
-#[tokio::test]
-async fn fake_and_sidecar_double_produce_identical_event_traces() {
     let (fake_report, fake_events) = run_fake().await;
-    let (double_report, double_events) = run_sidecar_double().await;
 
-    let fake_kinds: Vec<&str> = fake_events.iter().map(SessionEvent::kind).collect();
-    let double_kinds: Vec<&str> = double_events.iter().map(SessionEvent::kind).collect();
-    assert_eq!(fake_kinds, double_kinds, "event kind sequences diverged");
-    assert_eq!(fake_kinds.first(), Some(&"TurnStarted"));
-    assert_eq!(fake_kinds.last(), Some(&"TurnDone"));
+    let client = Arc::new(
+        SidecarClient::spawn(SidecarConfig::python_sdk())
+            .await
+            .expect("spawn the Python sidecar"),
+    );
+    // Capture the turn first, then reap the child unconditionally: a failed
+    // comparison must never leak a process.
+    let result = run_sidecar(Arc::clone(&client)).await;
+    let shutdown = client.shutdown().await;
+    let (sidecar_report, sidecar_events) = result.expect("sidecar turn completes");
+    shutdown.expect("sidecar child is reaped");
 
-    assert_eq!(fake_report, double_report, "turn reports diverged");
-    assert_eq!(fake_report.transcript, FAKE_TRANSCRIPT);
-    assert_eq!(fake_report.reply, FAKE_REPLY);
-    assert_eq!(fake_report.audio_frames as usize, FAKE_TTS_FRAMES);
-
-    let fake_done = done_fields(&fake_events);
-    let double_done = done_fields(&double_events);
-    assert_eq!(fake_done, double_done);
-    // (turn, audio_frames, dropped_frames, dropped_ms, dropped_events, interrupted)
-    assert_eq!(fake_done.1 as usize, FAKE_TTS_FRAMES);
-    assert_eq!(fake_done.3, 0, "no playout drops at the default capacity");
-    assert_eq!(fake_done.4, 0, "no event drops at the default capacity");
-    assert!(!fake_done.5);
-}
-
-#[tokio::test]
-async fn both_paths_render_the_same_trace() {
-    let (_, fake_events) = run_fake().await;
-    let (_, double_events) = run_sidecar_double().await;
-    let fake_lines: Vec<String> = fake_events.iter().map(voicekit_cli::render).collect();
-    let double_lines: Vec<String> = double_events.iter().map(voicekit_cli::render).collect();
-    assert_eq!(fake_lines, double_lines);
+    assert_eq!(
+        project(&sidecar_events),
+        project(&fake_events),
+        "the real plugin's event trace diverged from the in-process fakes"
+    );
+    assert_eq!(
+        sidecar_report, fake_report,
+        "the real plugin's turn report diverged from the in-process fakes"
+    );
+    assert_eq!(sidecar_report.transcript, FAKE_TRANSCRIPT);
+    assert_eq!(sidecar_report.reply, FAKE_REPLY);
+    assert_eq!(sidecar_report.audio_frames as usize, FAKE_TTS_FRAMES);
+    assert_eq!(sidecar_report.sidecar_dropped_frames, 0);
 }
 
 #[test]
-fn renderer_surfaces_dropped_events() {
+fn renderer_surfaces_dropped_events_and_sidecar_drops() {
     let line = voicekit_cli::render(&SessionEvent::TurnDone {
         turn: 1,
         audio_frames: 2,
         dropped_frames: 0,
         dropped_ms: 0,
         dropped_events: 3,
+        sidecar_dropped_frames: 4,
         interrupted: false,
     });
     assert!(line.contains("dropped_events=3"));
+    assert!(line.contains("sidecar_dropped_frames=4"));
 }

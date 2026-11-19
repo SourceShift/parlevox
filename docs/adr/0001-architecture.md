@@ -40,6 +40,49 @@ requirement for the default turn.
    overflow policy and dropped-frame/dropped-ms counters; duration measurement
    uses one monotonic clock per session.
 
+## Backpressure and loss accounting
+
+v0.1 is **drop-not-throttle** by design. Credit-based or adaptive backpressure
+— a producer blocking until a consumer grants capacity — is explicitly out of
+scope for this version. A realtime voice turn cannot wait on a slow consumer,
+so every lossy path sheds load and counts it instead.
+
+The contract is uniform across paths:
+
+1. **Every audio and event queue has a capacity, an explicit policy, and a
+   counter.** The input and playout audio rings, the session event queue, and
+   the sidecar's per-request pending-audio buffer each have a fixed bound, a
+   declared overflow policy (`DropOldest` or `DropNewest`), and a monotonic
+   dropped counter. No audio or event buffer grows without bound. The plugin's
+   `pending_requests`/`pending_dropped` maps are lifecycle-scoped rather than
+   capacity-bounded: an entry exists only while its request is open and is
+   removed on `audio_end` or `cancel`. The one ledger that outlives requests —
+   cancelled request ids — is explicitly bounded (point 4), so a client that
+   cancels and walks away cannot grow it forever.
+2. **Push returns a typed outcome the producer branches on.** `AudioRing::push`
+   and `EventQueue::push` report `Accepted`, `Replaced` (an older entry was
+   evicted), or `Dropped` (the incoming entry was rejected). A producer either
+   observes a drop and keeps going, or receives a loud `Protocol` error for a
+   control-lane refusal that must fail the turn. Silent truncation is not an
+   option.
+3. **Loss is observable end to end, on the path that can actually lose.**
+   Only the plugin's `transcribe`/`analyze` paths buffer audio, so only they can
+   evict frames; `generate` and `synthesize` stream eagerly and report
+   `dropped_frames: 0`. `SidecarStt` sends an utterance as bounded 10 ms frames,
+   making the plugin's 64-frame buffer reachable, and captures the terminal
+   `done` count alongside `SidecarLlm` and `SidecarTts`. The runtime aggregates
+   all three adapters into `TurnReport` and `SessionEvent::TurnDone` as
+   `sidecar_dropped_frames`, distinct from the Rust playout `dropped_frames`.
+   An operator can therefore tell local backpressure from loss at the process
+   boundary; zero means no loss was measured on that turn, not that the counter
+   is unplumbed.
+4. **Cancellation tombstones are bounded too.** The Python plugin remembers
+   cancelled request ids so a late `audio_end` cannot resurrect suppressed
+   work, but that ledger is an explicit-capacity, insertion-ordered set. When
+   full, the oldest id is evicted deterministically and the eviction is
+   counted. A late frame for a live tombstone stays a silent no-op; one for an
+   evicted id is rejected as an unknown request rather than executed.
+
 ## Alternatives considered
 
 ### Python core

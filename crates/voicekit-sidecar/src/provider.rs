@@ -4,6 +4,7 @@
 //! The runtime holds `Arc<dyn TtsProvider>` etc., so the turn path does not
 //! know whether a provider lives in this process or behind a pipe.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -57,12 +58,18 @@ fn adapter_manifest(
 pub struct SidecarLlm {
     client: Arc<SidecarClient>,
     manifest: ProviderManifest,
+    /// Frames the plugin reported dropping on the last terminal `done`.
+    dropped_frames: Arc<AtomicU64>,
 }
 
 impl SidecarLlm {
     pub fn new(client: Arc<SidecarClient>) -> Self {
         let manifest = adapter_manifest(&client, Modality::Llm, "sidecar-llm");
-        SidecarLlm { client, manifest }
+        SidecarLlm {
+            client,
+            manifest,
+            dropped_frames: Arc::new(AtomicU64::new(0)),
+        }
     }
 }
 
@@ -70,6 +77,10 @@ impl SidecarLlm {
 impl LlmProvider for SidecarLlm {
     fn manifest(&self) -> &ProviderManifest {
         &self.manifest
+    }
+
+    fn take_sidecar_dropped_frames(&self) -> u64 {
+        self.dropped_frames.swap(0, Ordering::SeqCst)
     }
 
     async fn generate(
@@ -92,24 +103,31 @@ impl LlmProvider for SidecarLlm {
                 Some(cancel),
             )
             .await?;
-        let stream = stream::unfold(Some(handle), |state| async move {
-            let mut handle = state?;
-            loop {
-                match handle.recv().await {
-                    None => {
-                        if handle.is_cancelled() {
-                            return Some((Err(VoicekitError::Cancelled), None));
+        let dropped = Arc::clone(&self.dropped_frames);
+        let stream = stream::unfold(Some(handle), move |state| {
+            let dropped = Arc::clone(&dropped);
+            async move {
+                let mut handle = state?;
+                loop {
+                    match handle.recv().await {
+                        None => {
+                            if handle.is_cancelled() {
+                                return Some((Err(VoicekitError::Cancelled), None));
+                            }
+                            return None;
                         }
-                        return None;
+                        Some(Incoming::Event(PluginEvent::Delta { text, .. })) => {
+                            return Some((Ok(text), Some(handle)));
+                        }
+                        Some(Incoming::Event(PluginEvent::Done { dropped_frames, .. })) => {
+                            dropped.store(dropped_frames, Ordering::SeqCst);
+                            return None;
+                        }
+                        Some(Incoming::Event(PluginEvent::Error { class, message, .. })) => {
+                            return Some((Err(classify(class, message)), None))
+                        }
+                        Some(Incoming::Event(_)) | Some(Incoming::Audio(_)) => continue,
                     }
-                    Some(Incoming::Event(PluginEvent::Delta { text, .. })) => {
-                        return Some((Ok(text), Some(handle)));
-                    }
-                    Some(Incoming::Event(PluginEvent::Done { .. })) => return None,
-                    Some(Incoming::Event(PluginEvent::Error { class, message, .. })) => {
-                        return Some((Err(classify(class, message)), None))
-                    }
-                    Some(Incoming::Event(_)) | Some(Incoming::Audio(_)) => continue,
                 }
             }
         });
@@ -122,12 +140,18 @@ impl LlmProvider for SidecarLlm {
 pub struct SidecarTts {
     client: Arc<SidecarClient>,
     manifest: ProviderManifest,
+    /// Frames the plugin reported dropping on the last terminal `done`.
+    dropped_frames: Arc<AtomicU64>,
 }
 
 impl SidecarTts {
     pub fn new(client: Arc<SidecarClient>) -> Self {
         let manifest = adapter_manifest(&client, Modality::Tts, "sidecar-tts");
-        SidecarTts { client, manifest }
+        SidecarTts {
+            client,
+            manifest,
+            dropped_frames: Arc::new(AtomicU64::new(0)),
+        }
     }
 }
 
@@ -135,6 +159,10 @@ impl SidecarTts {
 impl TtsProvider for SidecarTts {
     fn manifest(&self) -> &ProviderManifest {
         &self.manifest
+    }
+
+    fn take_sidecar_dropped_frames(&self) -> u64 {
+        self.dropped_frames.swap(0, Ordering::SeqCst)
     }
 
     async fn synthesize(
@@ -159,24 +187,31 @@ impl TtsProvider for SidecarTts {
                 Some(cancel),
             )
             .await?;
-        let stream = stream::unfold(Some(handle), |state| async move {
-            let mut handle = state?;
-            loop {
-                match handle.recv().await {
-                    None => {
-                        if handle.is_cancelled() {
-                            return Some((Err(VoicekitError::Cancelled), None));
+        let dropped = Arc::clone(&self.dropped_frames);
+        let stream = stream::unfold(Some(handle), move |state| {
+            let dropped = Arc::clone(&dropped);
+            async move {
+                let mut handle = state?;
+                loop {
+                    match handle.recv().await {
+                        None => {
+                            if handle.is_cancelled() {
+                                return Some((Err(VoicekitError::Cancelled), None));
+                            }
+                            return None;
                         }
-                        return None;
+                        Some(Incoming::Audio(frame)) => {
+                            return Some((Ok(AudioChunk::from_frame(&frame)), Some(handle)));
+                        }
+                        Some(Incoming::Event(PluginEvent::Done { dropped_frames, .. })) => {
+                            dropped.store(dropped_frames, Ordering::SeqCst);
+                            return None;
+                        }
+                        Some(Incoming::Event(PluginEvent::Error { class, message, .. })) => {
+                            return Some((Err(classify(class, message)), None))
+                        }
+                        Some(Incoming::Event(_)) => continue,
                     }
-                    Some(Incoming::Audio(frame)) => {
-                        return Some((Ok(AudioChunk::from_frame(&frame)), Some(handle)));
-                    }
-                    Some(Incoming::Event(PluginEvent::Done { .. })) => return None,
-                    Some(Incoming::Event(PluginEvent::Error { class, message, .. })) => {
-                        return Some((Err(classify(class, message)), None))
-                    }
-                    Some(Incoming::Event(_)) => continue,
                 }
             }
         });
@@ -184,16 +219,28 @@ impl TtsProvider for SidecarTts {
     }
 }
 
+/// Duration of each audio frame the STT adapter streams to the plugin. The
+/// plugin's per-request buffer is bounded to `MAX_PENDING_AUDIO_FRAMES`; sending
+/// the utterance in frames (rather than one giant frame) makes that bound
+/// reachable and its drop telemetry meaningful.
+const STT_FRAME_MS: u64 = 10;
+
 /// STT provider backed by a plugin `transcribe` request.
 pub struct SidecarStt {
     client: Arc<SidecarClient>,
     manifest: ProviderManifest,
+    /// Frames the plugin reported dropping on the last terminal `done`.
+    dropped_frames: Arc<AtomicU64>,
 }
 
 impl SidecarStt {
     pub fn new(client: Arc<SidecarClient>) -> Self {
         let manifest = adapter_manifest(&client, Modality::Stt, "sidecar-stt");
-        SidecarStt { client, manifest }
+        SidecarStt {
+            client,
+            manifest,
+            dropped_frames: Arc::new(AtomicU64::new(0)),
+        }
     }
 }
 
@@ -201,6 +248,10 @@ impl SidecarStt {
 impl SttProvider for SidecarStt {
     fn manifest(&self) -> &ProviderManifest {
         &self.manifest
+    }
+
+    fn take_sidecar_dropped_frames(&self) -> u64 {
+        self.dropped_frames.swap(0, Ordering::SeqCst)
     }
 
     async fn transcribe(
@@ -212,57 +263,84 @@ impl SttProvider for SidecarStt {
             return Err(VoicekitError::Protocol("audio must not be empty".into()));
         }
         let request_id = self.client.new_request_id("stt");
-        let frames = vec![AudioFrame::new(
-            Timestamp::from_millis(0),
-            audio.sample_rate,
-            audio.channels,
-            audio.pcm,
-        )];
+        // Interleaved samples per 10 ms frame; fall back to one frame for a
+        // degenerate sample rate or channel count.
+        let samples_per_frame = (audio.sample_rate as u64 * STT_FRAME_MS / 1000) as usize
+            * audio.channels.max(1) as usize;
+        let frames: Vec<AudioFrame> = if samples_per_frame == 0 {
+            vec![AudioFrame::new(
+                Timestamp::from_millis(0),
+                audio.sample_rate,
+                audio.channels,
+                audio.pcm,
+            )]
+        } else {
+            audio
+                .pcm
+                .chunks(samples_per_frame)
+                .enumerate()
+                .map(|(index, pcm)| {
+                    AudioFrame::new(
+                        Timestamp::from_millis(index as u64 * STT_FRAME_MS),
+                        audio.sample_rate,
+                        audio.channels,
+                        pcm.to_vec(),
+                    )
+                })
+                .collect()
+        };
         let handle = self
             .client
             .open_request(
                 PluginRequest::Transcribe {
                     request_id,
-                    sample_rate: frames[0].sample_rate,
-                    channels: frames[0].channels,
+                    sample_rate: audio.sample_rate,
+                    channels: audio.channels,
                 },
                 frames,
                 Some(cancel),
             )
             .await?;
-        let stream = stream::unfold(Some(handle), |state| async move {
-            let mut handle = state?;
-            loop {
-                match handle.recv().await {
-                    None => {
-                        if handle.is_cancelled() {
-                            return Some((Err(VoicekitError::Cancelled), None));
+        let dropped = Arc::clone(&self.dropped_frames);
+        let stream = stream::unfold(Some(handle), move |state| {
+            let dropped = Arc::clone(&dropped);
+            async move {
+                let mut handle = state?;
+                loop {
+                    match handle.recv().await {
+                        None => {
+                            if handle.is_cancelled() {
+                                return Some((Err(VoicekitError::Cancelled), None));
+                            }
+                            return None;
                         }
-                        return None;
+                        Some(Incoming::Event(PluginEvent::Partial { text, .. })) => {
+                            return Some((
+                                Ok(TranscriptChunk {
+                                    text,
+                                    is_final: false,
+                                }),
+                                Some(handle),
+                            ));
+                        }
+                        Some(Incoming::Event(PluginEvent::Final { text, .. })) => {
+                            return Some((
+                                Ok(TranscriptChunk {
+                                    text,
+                                    is_final: true,
+                                }),
+                                Some(handle),
+                            ));
+                        }
+                        Some(Incoming::Event(PluginEvent::Done { dropped_frames, .. })) => {
+                            dropped.store(dropped_frames, Ordering::SeqCst);
+                            return None;
+                        }
+                        Some(Incoming::Event(PluginEvent::Error { class, message, .. })) => {
+                            return Some((Err(classify(class, message)), None))
+                        }
+                        Some(Incoming::Event(_)) | Some(Incoming::Audio(_)) => continue,
                     }
-                    Some(Incoming::Event(PluginEvent::Partial { text, .. })) => {
-                        return Some((
-                            Ok(TranscriptChunk {
-                                text,
-                                is_final: false,
-                            }),
-                            Some(handle),
-                        ));
-                    }
-                    Some(Incoming::Event(PluginEvent::Final { text, .. })) => {
-                        return Some((
-                            Ok(TranscriptChunk {
-                                text,
-                                is_final: true,
-                            }),
-                            Some(handle),
-                        ));
-                    }
-                    Some(Incoming::Event(PluginEvent::Done { .. })) => return None,
-                    Some(Incoming::Event(PluginEvent::Error { class, message, .. })) => {
-                        return Some((Err(classify(class, message)), None))
-                    }
-                    Some(Incoming::Event(_)) | Some(Incoming::Audio(_)) => continue,
                 }
             }
         });

@@ -157,7 +157,14 @@ pub enum PluginEvent {
         timestamp_ms: u64,
     },
     /// Successful end of a request's stream.
-    Done { request_id: String },
+    ///
+    /// `dropped_frames` is additive: plugins that predate it omit the field and
+    /// decode as zero, so an older sidecar still works.
+    Done {
+        request_id: String,
+        #[serde(default)]
+        dropped_frames: u64,
+    },
     /// Acknowledgement that a `Cancel` was observed.
     CancelAck { request_id: String },
     /// A classified failure. `request_id` is empty for session-level errors.
@@ -186,7 +193,7 @@ impl PluginEvent {
             | PluginEvent::Delta { request_id, .. }
             | PluginEvent::AudioStart { request_id, .. }
             | PluginEvent::Vad { request_id, .. }
-            | PluginEvent::Done { request_id }
+            | PluginEvent::Done { request_id, .. }
             | PluginEvent::CancelAck { request_id }
             | PluginEvent::Error { request_id, .. } => Some(request_id),
         }
@@ -245,6 +252,7 @@ mod tests {
     fn terminal_events_are_classified() {
         let done = PluginEvent::Done {
             request_id: "r1".into(),
+            dropped_frames: 0,
         };
         assert!(done.is_terminal());
         assert_eq!(done.request_id(), Some("r1"));
@@ -254,6 +262,28 @@ mod tests {
             text: "a".into(),
         };
         assert!(!delta.is_terminal());
+    }
+
+    #[test]
+    fn done_carries_dropped_frames_additively() {
+        let done = PluginEvent::Done {
+            request_id: "r1".into(),
+            dropped_frames: 7,
+        };
+        let json = serde_json::to_string(&done).unwrap();
+        assert!(json.contains("\"dropped_frames\":7"));
+        assert_eq!(serde_json::from_str::<PluginEvent>(&json).unwrap(), done);
+
+        // An older plugin that omits the field still decodes, as zero.
+        let legacy: PluginEvent =
+            serde_json::from_str(r#"{"type":"done","request_id":"r1"}"#).unwrap();
+        assert_eq!(
+            legacy,
+            PluginEvent::Done {
+                request_id: "r1".into(),
+                dropped_frames: 0,
+            }
+        );
     }
 
     #[test]

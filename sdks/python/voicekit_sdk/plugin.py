@@ -9,9 +9,17 @@ queue: the capacity is :data:`MAX_PENDING_AUDIO_FRAMES` frames and the explicit
 counted on a monotonic per-request counter and reported as ``dropped_frames`` in
 the terminal ``done`` message, the same way the Rust ``AudioRing`` accounts for
 drops. No request can grow its buffer without bound.
+
+Cancelled request ids are kept as tombstones so a late ``audio_end`` cannot
+resurrect suppressed work. That ledger is itself bounded: at most
+:data:`MAX_CANCELLED` ids are retained in insertion order, the oldest is evicted
+when full, and every eviction is counted (:class:`CancelledTombstones`). A late
+``audio_end`` for a tombstoned id is a silent no-op; one for an evicted id is
+rejected as an unknown request rather than executed.
 """
 
-from collections import deque
+import sys
+from collections import OrderedDict, deque
 
 from .fakes import FakeLlm, FakeStt, FakeTts, FakeVad
 from .protocol import (
@@ -34,6 +42,52 @@ MAX_PENDING_AUDIO_FRAMES = 64
 #: Explicit OverflowPolicy for the pending-audio buffer: evict the oldest frame
 #: to admit the new one (``DropOldest``). Mirrors ``voicekit_core::OverflowPolicy``.
 PENDING_AUDIO_OVERFLOW_POLICY = "drop_oldest"
+
+#: Capacity of the cancelled-request tombstone ledger, in ids. Oldest entries
+#: are evicted first once the ledger is full; evictions are counted.
+MAX_CANCELLED = 256
+
+
+class CancelledTombstones:
+    """Bounded, insertion-ordered set of cancelled request ids.
+
+    Inserts go through :meth:`remember`, removals through :meth:`discard`.
+    Keeping insertion order makes eviction deterministic and oldest-first; the
+    :attr:`evicted` counter is monotonic for the life of the plugin.
+    """
+
+    def __init__(self, capacity=MAX_CANCELLED):
+        self.capacity = capacity
+        self._ids = OrderedDict()
+        self.evicted = 0
+
+    def __len__(self):
+        return len(self._ids)
+
+    def __contains__(self, request_id):
+        return request_id in self._ids
+
+    def __iter__(self):
+        return iter(self._ids)
+
+    def remember(self, request_id):
+        """Record `request_id`, evicting the oldest id if the ledger is full."""
+        if request_id in self._ids:
+            return
+        if self.capacity <= 0:
+            return
+        while len(self._ids) >= self.capacity:
+            oldest, _ = self._ids.popitem(last=False)
+            self.evicted += 1
+            print(
+                "voicekit sidecar: evicted cancelled tombstone "
+                f"{oldest!r} (total evicted={self.evicted})",
+                file=sys.stderr,
+            )
+        self._ids[request_id] = True
+
+    def discard(self, request_id):
+        self._ids.pop(request_id, None)
 
 
 class Plugin:
@@ -84,15 +138,23 @@ class Plugin:
 
     # -- bounded pending audio ----------------------------------------
     @staticmethod
-    def _buffer_audio(request_id, pcm, pending_audio, pending_dropped, cancelled):
+    def _buffer_audio(
+        request_id, pcm, pending_audio, pending_requests, pending_dropped, cancelled
+    ):
         """Append one audio frame under the explicit capacity and policy.
 
         ``pending_audio`` maps a request id to a ``deque`` with
         ``maxlen=MAX_PENDING_AUDIO_FRAMES``; appending to a full deque evicts the
         oldest frame, which is counted on the request's monotonic
-        ``pending_dropped`` counter. Frames for a cancelled request are ignored.
+        ``pending_dropped`` counter.
+
+        Frames are only buffered for a request that is currently open. Frames
+        for a cancelled (tombstoned or evicted) or unknown request are ignored,
+        so post-cancel audio can never rebuild state.
         """
         if request_id in cancelled:
+            return
+        if request_id not in pending_requests:
             return
         buffer = pending_audio.get(request_id)
         if buffer is None:
@@ -109,7 +171,7 @@ class Plugin:
         pending_audio = {}
         pending_requests = {}
         pending_dropped = {}
-        cancelled = set()
+        cancelled = CancelledTombstones()
         while True:
             try:
                 kind, payload = read_frame(stdin)
@@ -120,7 +182,12 @@ class Plugin:
             if kind == KIND_AUDIO:
                 header, pcm = decode_audio(payload)
                 self._buffer_audio(
-                    header["request_id"], pcm, pending_audio, pending_dropped, cancelled
+                    header["request_id"],
+                    pcm,
+                    pending_audio,
+                    pending_requests,
+                    pending_dropped,
+                    cancelled,
                 )
                 continue
             if kind != KIND_JSON:
@@ -149,7 +216,7 @@ class Plugin:
         pending_audio = pending_audio if pending_audio is not None else {}
         pending_requests = pending_requests if pending_requests is not None else {}
         pending_dropped = pending_dropped if pending_dropped is not None else {}
-        cancelled = cancelled if cancelled is not None else set()
+        cancelled = cancelled if cancelled is not None else CancelledTombstones()
         kind = message.get("type")
 
         if kind == "hello":
@@ -204,7 +271,7 @@ class Plugin:
             pending_requests.pop(request_id, None)
             pending_dropped.pop(request_id, None)
             if known:
-                cancelled.add(request_id)
+                cancelled.remember(request_id)
             self._send(
                 out,
                 {"type": "cancel_ack", "request_id": request_id},
@@ -239,7 +306,10 @@ class Plugin:
         )
         for seq, pcm in enumerate(chunks):
             self._send_audio(out, request_id, seq, sample_rate, channels, pcm)
-        self._send(out, {"type": "done", "request_id": request_id})
+        self._send(
+            out,
+            {"type": "done", "request_id": request_id, "dropped_frames": 0},
+        )
         return True
 
     def _generate(self, message, out):
@@ -254,7 +324,10 @@ class Plugin:
             return True
         for delta in deltas:
             self._send(out, {"type": "delta", "request_id": request_id, "text": delta})
-        self._send(out, {"type": "done", "request_id": request_id})
+        self._send(
+            out,
+            {"type": "done", "request_id": request_id, "dropped_frames": 0},
+        )
         return True
 
     def _finish_audio_request(
@@ -268,8 +341,10 @@ class Plugin:
     ):
         if request_id in cancelled:
             # The request was cancelled after its audio arrived: its work is
-            # suppressed, so a late audio_end must not resurrect it.
-            cancelled.discard(request_id)
+            # suppressed, so a late audio_end must not resurrect it. The
+            # tombstone is intentionally kept so repeated late audio_end frames
+            # stay silent no-ops. An evicted id is no longer tombstoned and
+            # falls through to the unknown-request rejection below.
             pending_audio.pop(request_id, None)
             pending_requests.pop(request_id, None)
             pending_dropped.pop(request_id, None)

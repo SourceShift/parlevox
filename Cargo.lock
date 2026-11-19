@@ -667,8 +667,10 @@ dependencies = [
 name = "voicekit-runtime"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "futures-core",
  "futures-util",
+ "proptest",
  "serde",
  "tokio",
  "tokio-util",

@@ -94,6 +94,14 @@ pub trait SttProvider: Send + Sync {
         audio: AudioChunk,
         cancel: CancellationToken,
     ) -> Result<ProviderStream<TranscriptChunk>, VoicekitError>;
+
+    /// Take (and reset) the frames a sidecar-backed provider reported dropping
+    /// while serving the most recent transcription. The transcribe path is the
+    /// one that buffers audio, so it is the path that can report non-zero loss.
+    /// In-process providers lose nothing, so the default is zero.
+    fn take_sidecar_dropped_frames(&self) -> u64 {
+        0
+    }
 }
 
 #[async_trait]
@@ -106,6 +114,13 @@ pub trait LlmProvider: Send + Sync {
         request: GenerateRequest,
         cancel: CancellationToken,
     ) -> Result<ProviderStream<String>, VoicekitError>;
+
+    /// Take (and reset) the frames a sidecar-backed provider reported dropping
+    /// during its most recent request. In-process providers lose nothing, so
+    /// the default is zero.
+    fn take_sidecar_dropped_frames(&self) -> u64 {
+        0
+    }
 }
 
 #[async_trait]
@@ -119,6 +134,13 @@ pub trait TtsProvider: Send + Sync {
         request: SynthesizeRequest,
         cancel: CancellationToken,
     ) -> Result<ProviderStream<AudioChunk>, VoicekitError>;
+
+    /// Take (and reset) the frames the plugin reported dropping while serving
+    /// the most recent synthesis request. The default is zero for in-process
+    /// providers; sidecar adapters override it with per-turn telemetry.
+    fn take_sidecar_dropped_frames(&self) -> u64 {
+        0
+    }
 }
 
 #[async_trait]
