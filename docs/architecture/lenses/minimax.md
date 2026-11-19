@@ -7,10 +7,10 @@ egress) across every subsystem boundary and report where the wire is broken, mis
 
 | Framework | Path | Notes |
 |---|---|---|
-| LiveKit Agents | `path/to/livekit/agents/livekit-agents/livekit/agents` | Python core + `ipc/` process boundary |
-| Pipecat | `path/to/voicekit/reference/pipecat/src/pipecat` | frame pipeline + `bus/` distributed bus |
-| TEN Framework | `path/to/voicekit/reference/ten-framework` | Python runtime binding + `ai_agents/.../extension/` |
-| Vocode | `path/to/voicekit/reference/vocode-core/vocode/streaming` | **stale** — HEAD `2024-11-15`, design reference only |
+| LiveKit Agents | `path/to/livekit-agents/livekit-agents/livekit/agents` | Python core + `ipc/` process boundary |
+| Pipecat | `path/to/pipecat/src/pipecat` | frame pipeline + `bus/` distributed bus |
+| TEN Framework | `path/to/ten-framework` | Python runtime binding + `ai_agents/.../extension/` |
+| Vocode | `path/to/vocode-core/vocode/streaming` | **stale** — HEAD `2024-11-15`, design reference only |
 
 **Caveat carried into every Vocode finding:** the tree is ~2 years old and predates the current shape of all three
 other frameworks. Vocode findings describe *design choices to avoid*, not current behaviour to copy.

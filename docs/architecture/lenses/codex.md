@@ -8,10 +8,10 @@ This is a source-only audit of the local checkouts, not a benchmark or a claim a
 
 | Prefix | Absolute source root |
 |---|---|
-| LK | `path/to/livekit/agents` |
-| PC | `path/to/voicekit/reference/pipecat` |
-| TEN | `path/to/voicekit/reference/ten-framework` |
-| VC | `path/to/voicekit/reference/vocode-core` |
+| LK | `path/to/livekit-agents` |
+| PC | `path/to/pipecat` |
+| TEN | `path/to/ten-framework` |
+| VC | `path/to/vocode-core` |
 
 TEN inspection covers its Python binding, native graph startup, and selected shipping Python provider extensions. The imported `ten_ai_base` package is not present at the documented `ai_agents/agents/ten_packages/system/` location in this checkout. Consequently, adapter-local findings are not claims that unseen base classes lack safeguards. No generated assets, UI, examples, tests, or vendored code support the findings. Repository instructions were read for navigation; runtime source is the evidence.
 

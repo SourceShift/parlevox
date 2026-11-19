@@ -6,11 +6,11 @@ the tree is stale (see findings 4, 5).
 
 Path key (abbreviations used in `File:line` cells):
 
-- `LK` = path/to/livekit/agents/livekit-agents/livekit/agents
-- `PC` = path/to/voicekit/reference/pipecat/src/pipecat
-- `TENB` = path/to/voicekit/reference/ten-framework/core/src/ten_runtime/binding/python/interface/ten_runtime
-- `TENL` = path/to/voicekit/reference/ten-framework/packages/core_addon_loaders/python_addon_loader
-- `VC` = path/to/voicekit/reference/vocode-core/vocode
+- `LK` = path/to/livekit-agents/livekit-agents/livekit/agents
+- `PC` = path/to/pipecat/src/pipecat
+- `TENB` = path/to/ten-framework/core/src/ten_runtime/binding/python/interface/ten_runtime
+- `TENL` = path/to/ten-framework/packages/core_addon_loaders/python_addon_loader
+- `VC` = path/to/vocode-core/vocode
 
 ## Findings (ordered by severity)
 

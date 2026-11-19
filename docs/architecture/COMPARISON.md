@@ -281,10 +281,10 @@ This is Response A's question, and the rest of the panel supplies the evidence t
 The four checkouts must be present and readable at the paths the panel used:
 
 ```
-path/to/livekit/agents
-path/to/voicekit/reference/pipecat
-path/to/voicekit/reference/ten-framework
-path/to/voicekit/reference/vocode-core
+path/to/livekit-agents
+path/to/pipecat
+path/to/ten-framework
+path/to/vocode-core
 ```
 
 No framework is built, installed, or executed. Every lens is grep/glob-driven and read-only; Vocode is marked stale in the brief.
@@ -294,8 +294,7 @@ No framework is built, installed, or executed. Every lens is grep/glob-driven an
 The run is defined by the plan file, not by an ad-hoc command line:
 
 ```bash
-export MINI_ORK_RUN_DIR=path/to/voicekit/.mini-ork/runs/run-1795113179-69141
-cd path/to/voicekit
+export MINI_ORK_RUN_DIR="$PWD/.mini-ork/runs/run-1795113179-69141"
 
 # Replay the same plan: one planner, five parallel lenses, one synthesizer,
 # one completeness verifier, one publisher. The static anonymize_panel
@@ -314,7 +313,7 @@ mini-ork run --plan "$MINI_ORK_RUN_DIR/plan.json" --node synthesizer
 The verifier contract is the acceptance gate. Run it exactly:
 
 ```bash
-export MINI_ORK_RUN_DIR=path/to/voicekit/.mini-ork/runs/run-1795113179-69141
+export MINI_ORK_RUN_DIR=./.mini-ork/runs/run-1795113179-69141
 
 for f in lens-glm.md lens-kimi.md lens-codex.md lens-opus.md lens-minimax.md; do
   test -s "$MINI_ORK_RUN_DIR/$f" || { echo "MISSING $f"; exit 1; }
@@ -340,7 +339,7 @@ The published-doc checks (`docs/architecture/COMPARISON.md`, `docs/architecture/
 
 ### 7.4 Publish gate
 
-The publisher must abort on any failed check. It writes only the three documentation paths under `path/to/voicekit` and must not modify, create, or delete anything under `path/to/livekit/agents` or any `reference/` tree. The working tree is left uncommitted; the framework owns commit and push.
+The publisher must abort on any failed check. It writes only the three documentation paths under the repository root and must not modify, create, or delete anything under `path/to/livekit-agents` or any `reference/` tree. The working tree is left uncommitted; the framework owns commit and push.
 
 ### 7.5 The P1 that blocks self-dispatch
 
