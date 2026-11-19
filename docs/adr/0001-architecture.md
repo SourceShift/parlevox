@@ -93,5 +93,9 @@ read as providing them.
 ## Scope
 
 This ADR records the boundary decision only. It does not restate the provider
-comparison that motivated it, and it does not describe a design document that
-does not yet exist in this checkout.
+comparison that motivated it.
+
+See also: [`../architecture/DESIGN.md`](../architecture/DESIGN.md) for the
+shipped skeleton and the dimension-by-dimension status, and
+[`../architecture/COMPARISON.md`](../architecture/COMPARISON.md) for the
+four-framework audit that motivated this boundary.
