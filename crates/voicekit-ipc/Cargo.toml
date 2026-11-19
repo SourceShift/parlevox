@@ -6,8 +6,12 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+voicekit-core = { path = "../voicekit-core" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

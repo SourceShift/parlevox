@@ -1,0 +1,18 @@
+[package]
+name = "voicekit-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+voicekit-core = { path = "../voicekit-core" }
+voicekit-providers = { path = "../voicekit-providers" }
+futures-core.workspace = true
+futures-util.workspace = true
+tokio-util.workspace = true
+serde.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

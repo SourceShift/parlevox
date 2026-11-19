@@ -80,7 +80,10 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Frame, FrameE
         return Err(FrameError::Empty);
     }
     if body_len > MAX_FRAME_BYTES {
-        return Err(FrameError::TooLarge { len: body_len, max: MAX_FRAME_BYTES });
+        return Err(FrameError::TooLarge {
+            len: body_len,
+            max: MAX_FRAME_BYTES,
+        });
     }
 
     let mut body = vec![0u8; body_len];
@@ -94,9 +97,7 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Frame, FrameE
             Ok(Frame::Json(serde_json::from_str(text)?))
         }
         KIND_AUDIO => {
-            let (header_len, rest) = payload
-                .split_first()
-                .ok_or(FrameError::BadHeaderLen(0))?;
+            let (header_len, rest) = payload.split_first().ok_or(FrameError::BadHeaderLen(0))?;
             let header_len = *header_len as usize;
             if header_len > rest.len() {
                 return Err(FrameError::BadHeaderLen(header_len as u8));
@@ -117,11 +118,17 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Frame, FrameE
     }
 }
 
-pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &Frame) -> Result<(), FrameError> {
+pub async fn write_frame<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    frame: &Frame,
+) -> Result<(), FrameError> {
     let body = encode_body(frame)?;
     let total = body.len() + 1;
     if total > MAX_FRAME_BYTES {
-        return Err(FrameError::TooLarge { len: total, max: MAX_FRAME_BYTES });
+        return Err(FrameError::TooLarge {
+            len: total,
+            max: MAX_FRAME_BYTES,
+        });
     }
     let mut out = Vec::with_capacity(4 + total);
     out.extend_from_slice(&(total as u32).to_be_bytes());
@@ -189,7 +196,11 @@ mod tests {
             sample_rate: 16_000,
             channels: 1,
         };
-        roundtrip(Frame::Audio { header, pcm: vec![1, -2, 3, i16::MIN] }).await;
+        roundtrip(Frame::Audio {
+            header,
+            pcm: vec![1, -2, 3, i16::MIN],
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -219,7 +230,7 @@ mod tests {
             channels: 1,
         })
         .unwrap();
-        let mut body = vec![2u8, header.len() as u8];
+        let mut body = vec![header.len() as u8];
         body.extend_from_slice(&header);
         body.push(0); // one stray byte
         let mut bytes = ((body.len() + 1) as u32).to_be_bytes().to_vec();
