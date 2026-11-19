@@ -11,7 +11,7 @@ the machine, the network, or a provider can't keep up.
 
 A `Session` owns one conversation:
 
-1. audio arrives on a **bounded ring** (16 kHz mono `i16` frames);
+1. audio arrives on a **bounded ring** (16 kHz mono `i16` frames by default);
 2. VAD marks the user as speaking and a transcript is produced;
 3. an LLM stream produces the reply;
 4. TTS streams audio back out on a second bounded ring;
