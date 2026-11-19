@@ -20,7 +20,12 @@ pub struct AudioFrame {
 
 impl AudioFrame {
     pub fn new(timestamp: Timestamp, sample_rate: u32, channels: u16, pcm: Vec<i16>) -> Self {
-        AudioFrame { timestamp, sample_rate, channels, pcm }
+        AudioFrame {
+            timestamp,
+            sample_rate,
+            channels,
+            pcm,
+        }
     }
 
     /// Frames of silence with the same format as `other`.
@@ -45,9 +50,7 @@ impl AudioFrame {
         if self.sample_rate == 0 {
             return DurationMs::ZERO;
         }
-        DurationMs::from_secs_f64(
-            self.samples_per_channel() as f64 / self.sample_rate as f64,
-        )
+        DurationMs::from_secs_f64(self.samples_per_channel() as f64 / self.sample_rate as f64)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -165,9 +168,7 @@ impl AudioRing {
 
     fn record_drop(&mut self, frame: &AudioFrame) {
         self.dropped += 1;
-        self.dropped_duration = self
-            .dropped_duration
-            .sat_dur_add(frame.duration());
+        self.dropped_duration = self.dropped_duration.sat_dur_add(frame.duration());
     }
 }
 

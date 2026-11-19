@@ -35,7 +35,9 @@ pub enum TurnEvent {
     UserStartedSpeaking,
     UserStoppedSpeaking,
     /// A final transcript was committed (either after VAD silence or manually).
-    FinalTranscript { text: String },
+    FinalTranscript {
+        text: String,
+    },
     /// The first agent audio frame was queued for playout.
     ReplyStarted,
     /// The last queued frame finished playing.
@@ -70,7 +72,10 @@ impl Default for TurnMachine {
 
 impl TurnMachine {
     pub fn new() -> Self {
-        TurnMachine { state: TurnState::Idle, turn: 0 }
+        TurnMachine {
+            state: TurnState::Idle,
+            turn: 0,
+        }
     }
 
     pub fn state(&self) -> TurnState {
@@ -159,8 +164,14 @@ mod tests {
         assert_eq!(t.to, TurnState::Thinking);
         assert_eq!(t.turn, 1);
 
-        assert_eq!(m.apply(TurnEvent::ReplyStarted).unwrap().to, TurnState::Speaking);
-        assert_eq!(m.apply(TurnEvent::ReplyFinished).unwrap().to, TurnState::Listening);
+        assert_eq!(
+            m.apply(TurnEvent::ReplyStarted).unwrap().to,
+            TurnState::Speaking
+        );
+        assert_eq!(
+            m.apply(TurnEvent::ReplyFinished).unwrap().to,
+            TurnState::Listening
+        );
     }
 
     #[test]
@@ -177,9 +188,13 @@ mod tests {
     fn barge_in_interrupts_speaking() {
         let mut m = TurnMachine::new();
         m.apply(TurnEvent::Start).unwrap();
-        m.apply(TurnEvent::FinalTranscript { text: "a".into() }).unwrap();
+        m.apply(TurnEvent::FinalTranscript { text: "a".into() })
+            .unwrap();
         m.apply(TurnEvent::ReplyStarted).unwrap();
-        assert_eq!(m.apply(TurnEvent::BargeIn).unwrap().to, TurnState::Interrupted);
+        assert_eq!(
+            m.apply(TurnEvent::BargeIn).unwrap().to,
+            TurnState::Interrupted
+        );
         assert_eq!(
             m.apply(TurnEvent::ResumeListening).unwrap().to,
             TurnState::Listening
@@ -190,7 +205,8 @@ mod tests {
     fn two_replies_in_flight_is_a_protocol_error() {
         let mut m = TurnMachine::new();
         m.apply(TurnEvent::Start).unwrap();
-        m.apply(TurnEvent::FinalTranscript { text: "a".into() }).unwrap();
+        m.apply(TurnEvent::FinalTranscript { text: "a".into() })
+            .unwrap();
         m.apply(TurnEvent::ReplyStarted).unwrap();
         let err = m.apply(TurnEvent::ReplyStarted).unwrap_err();
         assert!(matches!(err, VoicekitError::Protocol(_)));
@@ -211,7 +227,8 @@ mod tests {
     fn correction_while_thinking_keeps_one_turn() {
         let mut m = TurnMachine::new();
         m.apply(TurnEvent::Start).unwrap();
-        m.apply(TurnEvent::FinalTranscript { text: "a".into() }).unwrap();
+        m.apply(TurnEvent::FinalTranscript { text: "a".into() })
+            .unwrap();
         let t = m
             .apply(TurnEvent::FinalTranscript { text: "a b".into() })
             .unwrap();
