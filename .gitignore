@@ -17,3 +17,6 @@ __pycache__/
 # local
 .DS_Store
 *.log
+
+# internal build specs (local workflow, not part of the public repo)
+/kickoffs/
