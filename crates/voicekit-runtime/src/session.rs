@@ -22,7 +22,7 @@ use voicekit_providers::{
     AudioChunk, GenerateRequest, ProviderManifest, SynthesizeRequest, VadEvent,
 };
 
-use crate::events::SessionEvent;
+use crate::events::{EventQueue, EventQueueStats, SessionEvent};
 use crate::registry::Providers;
 
 /// Tunables for one session.
@@ -34,6 +34,10 @@ pub struct SessionConfig {
     pub input_ring_capacity: usize,
     /// Bounded frame capacity for the playout path.
     pub output_ring_capacity: usize,
+    /// Bounded event capacity for the session-to-transport handoff.
+    pub event_capacity: usize,
+    /// Explicit overflow policy for droppable events.
+    pub event_overflow_policy: OverflowPolicy,
     /// Test hook: trigger a barge-in after this many reply deltas.
     pub barge_in_after_deltas: Option<usize>,
 }
@@ -45,6 +49,8 @@ impl Default for SessionConfig {
             channels: 1,
             input_ring_capacity: 32,
             output_ring_capacity: 64,
+            event_capacity: 256,
+            event_overflow_policy: OverflowPolicy::DropOldest,
             barge_in_after_deltas: None,
         }
     }
@@ -59,8 +65,19 @@ pub struct TurnReport {
     pub audio_frames: u64,
     pub dropped_frames: u64,
     pub dropped_ms: u64,
+    /// Events dropped from the bounded handoff queue during this turn.
+    pub dropped_events: u64,
     pub input_dropped_frames: u64,
     pub interrupted: bool,
+}
+
+/// Counters captured when a turn starts, so per-turn drops are deltas from a
+/// cumulative baseline rather than session totals.
+#[derive(Debug, Clone, Copy)]
+struct TurnBaseline {
+    output: RingStats,
+    input_dropped: u64,
+    events_dropped: u64,
 }
 
 pub struct Session {
@@ -72,7 +89,7 @@ pub struct Session {
     providers: Providers,
     cancel: CancellationToken,
     generation: u64,
-    events: Vec<SessionEvent>,
+    events: EventQueue,
 }
 
 impl Session {
@@ -85,9 +102,15 @@ impl Session {
         ] {
             manifest.validate()?;
         }
-        // Every audio path is bounded and uses an explicit policy.
+        if config.event_capacity == 0 {
+            return Err(VoicekitError::Protocol(
+                "event_capacity must be at least 1 to reserve the terminal slot".into(),
+            ));
+        }
+        // Every audio and event path is bounded and uses an explicit policy.
         let input = AudioRing::new(config.input_ring_capacity, OverflowPolicy::DropOldest);
         let output = AudioRing::new(config.output_ring_capacity, OverflowPolicy::DropOldest);
+        let events = EventQueue::new(config.event_capacity, config.event_overflow_policy);
         Ok(Session {
             config,
             machine: TurnMachine::new(),
@@ -97,7 +120,7 @@ impl Session {
             providers,
             cancel: CancellationToken::new(),
             generation: 0,
-            events: Vec::new(),
+            events,
         })
     }
 
@@ -148,7 +171,12 @@ impl Session {
     }
 
     pub fn take_events(&mut self) -> Vec<SessionEvent> {
-        std::mem::take(&mut self.events)
+        self.events.take()
+    }
+
+    /// Counters for the bounded session-to-transport event handoff.
+    pub fn event_stats(&self) -> EventQueueStats {
+        self.events.stats()
     }
 
     /// Cancel the in-flight turn. Returns `true` when a turn was interrupted.
@@ -179,8 +207,11 @@ impl Session {
         self.generation += 1;
         let generation = self.generation;
 
-        let output_dropped_before = self.output.stats();
-        let input_dropped_before = self.input.stats().dropped;
+        let baseline = TurnBaseline {
+            output: self.output.stats(),
+            input_dropped: self.input.stats().dropped,
+            events_dropped: self.events.dropped(),
+        };
 
         // Bounded input path: one frame carrying the utterance.
         let input_ts = self.clock.now();
@@ -195,14 +226,7 @@ impl Session {
         let mut speech_started = false;
         while let Some(item) = vad.next().await {
             if token.is_cancelled() {
-                return self.finish_interrupted(
-                    0,
-                    0,
-                    "",
-                    "",
-                    output_dropped_before,
-                    input_dropped_before,
-                );
+                return self.finish_interrupted(0, 0, "", "", baseline);
             }
             match item {
                 Ok(transition) => match transition.event {
@@ -220,14 +244,7 @@ impl Session {
                     }
                 },
                 Err(VoicekitError::Cancelled) => {
-                    return self.finish_interrupted(
-                        0,
-                        0,
-                        "",
-                        "",
-                        output_dropped_before,
-                        input_dropped_before,
-                    );
+                    return self.finish_interrupted(0, 0, "", "", baseline);
                 }
                 Err(err) => return self.fail(err),
             }
@@ -253,14 +270,7 @@ impl Session {
                     }
                 }
                 Err(VoicekitError::Cancelled) => {
-                    return self.finish_interrupted(
-                        0,
-                        0,
-                        "",
-                        "",
-                        output_dropped_before,
-                        input_dropped_before,
-                    );
+                    return self.finish_interrupted(0, 0, "", "", baseline);
                 }
                 Err(err) => return self.fail(err),
             }
@@ -275,11 +285,11 @@ impl Session {
             text: transcript.clone(),
         })?;
         let turn = transition.turn;
-        self.emit(SessionEvent::TurnStarted { turn });
+        self.emit(SessionEvent::TurnStarted { turn })?;
         self.emit(SessionEvent::TranscriptFinal {
             turn,
             text: transcript.clone(),
-        });
+        })?;
 
         // 3. Streaming completion.
         let llm_provider = Arc::clone(&self.providers.llm);
@@ -313,7 +323,7 @@ impl Session {
                     }
                     reply.push_str(&delta);
                     delta_count += 1;
-                    self.emit(SessionEvent::ReplyDelta { turn, text: delta });
+                    self.emit(SessionEvent::ReplyDelta { turn, text: delta })?;
                     if self.config.barge_in_after_deltas == Some(delta_count) {
                         self.request_barge_in()?;
                         interrupted = true;
@@ -333,14 +343,7 @@ impl Session {
             ));
         }
         if interrupted {
-            return self.finish_interrupted(
-                turn,
-                0,
-                &transcript,
-                &reply,
-                output_dropped_before,
-                input_dropped_before,
-            );
+            return self.finish_interrupted(turn, 0, &transcript, &reply, baseline);
         }
 
         // 4. Streaming synthesis with bounded playout. Producing audio is a
@@ -371,7 +374,7 @@ impl Session {
                         self.emit(SessionEvent::AudioOut {
                             turn,
                             frame: played,
-                        });
+                        })?;
                     }
                 }
                 Some(Err(VoicekitError::Cancelled)) => {
@@ -382,14 +385,7 @@ impl Session {
             }
         }
         if interrupted {
-            return self.finish_interrupted(
-                turn,
-                audio_frames,
-                &transcript,
-                &reply,
-                output_dropped_before,
-                input_dropped_before,
-            );
+            return self.finish_interrupted(turn, audio_frames, &transcript, &reply, baseline);
         }
 
         // 5. Close the turn.
@@ -397,24 +393,29 @@ impl Session {
         let output_dropped = self.output.stats();
         let dropped_frames = output_dropped
             .dropped
-            .saturating_sub(output_dropped_before.dropped);
+            .saturating_sub(baseline.output.dropped);
         let dropped_ms = output_dropped
             .dropped_duration
             .as_millis()
-            .saturating_sub(output_dropped_before.dropped_duration.as_millis());
+            .saturating_sub(baseline.output.dropped_duration.as_millis());
         let input_dropped_frames = self
             .input
             .stats()
             .dropped
-            .saturating_sub(input_dropped_before);
+            .saturating_sub(baseline.input_dropped);
+        let dropped_events = self
+            .events
+            .dropped()
+            .saturating_sub(baseline.events_dropped);
 
         self.emit(SessionEvent::TurnDone {
             turn,
             audio_frames,
             dropped_frames,
             dropped_ms,
+            dropped_events,
             interrupted: false,
-        });
+        })?;
 
         Ok(TurnReport {
             turn,
@@ -423,20 +424,25 @@ impl Session {
             audio_frames,
             dropped_frames,
             dropped_ms,
+            dropped_events,
             input_dropped_frames,
             interrupted: false,
         })
     }
 
-    fn emit(&mut self, event: SessionEvent) {
-        self.events.push(event);
+    /// Enqueue one event under the bounded-queue policy. Droppable overflow is
+    /// absorbed by the queue; control overflow surfaces as a protocol error.
+    fn emit(&mut self, event: SessionEvent) -> Result<(), VoicekitError> {
+        self.events.push(event)
     }
 
     fn fail<T>(&mut self, err: VoicekitError) -> Result<T, VoicekitError> {
+        // If the control lane cannot even carry `Failed`, the queue error is
+        // the louder and more accurate failure to report.
         self.emit(SessionEvent::Failed {
             class: err.class(),
             message: err.to_string(),
-        });
+        })?;
         Err(err)
     }
 
@@ -463,21 +469,26 @@ impl Session {
         audio_frames: u64,
         transcript: &str,
         reply: &str,
-        output_before: RingStats,
-        input_dropped_before: u64,
+        baseline: TurnBaseline,
     ) -> Result<TurnReport, VoicekitError> {
         self.ensure_listening_after_interrupt()?;
         let output_dropped = self.output.stats();
-        let dropped_frames = output_dropped.dropped.saturating_sub(output_before.dropped);
+        let dropped_frames = output_dropped
+            .dropped
+            .saturating_sub(baseline.output.dropped);
         let dropped_ms = output_dropped
             .dropped_duration
             .as_millis()
-            .saturating_sub(output_before.dropped_duration.as_millis());
+            .saturating_sub(baseline.output.dropped_duration.as_millis());
         let input_dropped_frames = self
             .input
             .stats()
             .dropped
-            .saturating_sub(input_dropped_before);
+            .saturating_sub(baseline.input_dropped);
+        let dropped_events = self
+            .events
+            .dropped()
+            .saturating_sub(baseline.events_dropped);
 
         if turn != 0 {
             self.emit(SessionEvent::TurnDone {
@@ -485,8 +496,9 @@ impl Session {
                 audio_frames,
                 dropped_frames,
                 dropped_ms,
+                dropped_events,
                 interrupted: true,
-            });
+            })?;
         }
 
         Ok(TurnReport {
@@ -496,6 +508,7 @@ impl Session {
             audio_frames,
             dropped_frames,
             dropped_ms,
+            dropped_events,
             input_dropped_frames,
             interrupted: true,
         })
@@ -546,6 +559,7 @@ mod tests {
         assert_eq!(report.transcript, FAKE_TRANSCRIPT);
         assert_eq!(report.reply, FAKE_REPLY);
         assert_eq!(report.audio_frames as usize, FAKE_TTS_FRAMES);
+        assert_eq!(report.dropped_events, 0);
         assert!(!report.interrupted);
         assert_eq!(session.state(), TurnState::Listening);
         assert_eq!(session.turn_index(), 1);
@@ -625,6 +639,75 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn bounded_event_queue_drops_streaming_events_and_reports_the_count() {
+        let config = SessionConfig {
+            event_capacity: 4,
+            ..SessionConfig::default()
+        };
+        let (mut session, result) = run_fake(config).await;
+        let report = result.unwrap();
+
+        // The reply and audio still complete: backpressure only loses events.
+        assert_eq!(report.audio_frames as usize, FAKE_TTS_FRAMES);
+        assert!(report.dropped_events > 0);
+        let stats = session.event_stats();
+        assert_eq!(stats.dropped, report.dropped_events);
+        assert_eq!(stats.capacity, 4);
+        assert!(stats.depth <= stats.capacity);
+        assert_eq!(stats.control_overflow, 0);
+
+        let events = session.take_events();
+        let kinds: Vec<&str> = events.iter().map(SessionEvent::kind).collect();
+        // Control structure survives even when streaming events are dropped.
+        assert_eq!(kinds.first(), Some(&"TurnStarted"));
+        assert!(kinds.contains(&"TranscriptFinal"));
+        assert_eq!(kinds.last(), Some(&"TurnDone"));
+        match events.last() {
+            Some(SessionEvent::TurnDone {
+                dropped_events,
+                interrupted,
+                ..
+            }) => {
+                assert_eq!(*dropped_events, report.dropped_events);
+                assert!(!interrupted);
+            }
+            other => panic!("expected TurnDone, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn control_lane_overflow_fails_the_turn_loudly() {
+        let config = SessionConfig {
+            event_capacity: 2,
+            ..SessionConfig::default()
+        };
+        let (session, result) = run_fake(config).await;
+
+        let err = result.unwrap_err();
+        assert!(matches!(err, VoicekitError::Protocol(_)));
+        let stats = session.event_stats();
+        assert_eq!(stats.control_overflow, 1);
+        assert_eq!(stats.dropped, 1);
+    }
+
+    #[test]
+    fn zero_event_capacity_is_rejected_at_construction() {
+        let providers = ProviderRegistry::fakes()
+            .unwrap()
+            .resolve(&Default::default())
+            .unwrap();
+        let config = SessionConfig {
+            event_capacity: 0,
+            ..SessionConfig::default()
+        };
+        let err = match Session::new(config, providers) {
+            Err(err) => err,
+            Ok(_) => panic!("expected zero event capacity to be rejected"),
+        };
+        assert!(matches!(err, VoicekitError::Protocol(_)));
     }
 
     #[tokio::test]

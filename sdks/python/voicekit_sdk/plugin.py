@@ -2,7 +2,16 @@
 
 One process, one framed stream. Control is JSON, audio is binary. A ``cancel``
 is acknowledged and never terminates the process; only ``shutdown`` does.
+
+In-flight ``transcribe``/``analyze`` audio is buffered in a bounded per-request
+queue: the capacity is :data:`MAX_PENDING_AUDIO_FRAMES` frames and the explicit
+:data:`PENDING_AUDIO_OVERFLOW_POLICY` is ``DropOldest``. Every evicted frame is
+counted on a monotonic per-request counter and reported as ``dropped_frames`` in
+the terminal ``done`` message, the same way the Rust ``AudioRing`` accounts for
+drops. No request can grow its buffer without bound.
 """
+
+from collections import deque
 
 from .fakes import FakeLlm, FakeStt, FakeTts, FakeVad
 from .protocol import (
@@ -18,6 +27,13 @@ from .protocol import (
     read_frame,
     write_frame,
 )
+
+#: Capacity of one in-flight request's pending-audio buffer, in frames.
+MAX_PENDING_AUDIO_FRAMES = 64
+
+#: Explicit OverflowPolicy for the pending-audio buffer: evict the oldest frame
+#: to admit the new one (``DropOldest``). Mirrors ``voicekit_core::OverflowPolicy``.
+PENDING_AUDIO_OVERFLOW_POLICY = "drop_oldest"
 
 
 class Plugin:
@@ -66,11 +82,34 @@ class Plugin:
             ),
         )
 
+    # -- bounded pending audio ----------------------------------------
+    @staticmethod
+    def _buffer_audio(request_id, pcm, pending_audio, pending_dropped, cancelled):
+        """Append one audio frame under the explicit capacity and policy.
+
+        ``pending_audio`` maps a request id to a ``deque`` with
+        ``maxlen=MAX_PENDING_AUDIO_FRAMES``; appending to a full deque evicts the
+        oldest frame, which is counted on the request's monotonic
+        ``pending_dropped`` counter. Frames for a cancelled request are ignored.
+        """
+        if request_id in cancelled:
+            return
+        buffer = pending_audio.get(request_id)
+        if buffer is None:
+            buffer = deque(maxlen=MAX_PENDING_AUDIO_FRAMES)
+            pending_audio[request_id] = buffer
+            pending_dropped.setdefault(request_id, 0)
+        if buffer.maxlen is not None and len(buffer) >= buffer.maxlen:
+            pending_dropped[request_id] = pending_dropped.get(request_id, 0) + 1
+        buffer.append(bytes(pcm))
+
     # -- loop ---------------------------------------------------------
     def run(self, stdin, stdout):
         """Serve frames until EOF, close, or shutdown."""
         pending_audio = {}
         pending_requests = {}
+        pending_dropped = {}
+        cancelled = set()
         while True:
             try:
                 kind, payload = read_frame(stdin)
@@ -80,18 +119,37 @@ class Plugin:
                 return
             if kind == KIND_AUDIO:
                 header, pcm = decode_audio(payload)
-                pending_audio.setdefault(header["request_id"], bytearray()).extend(pcm)
+                self._buffer_audio(
+                    header["request_id"], pcm, pending_audio, pending_dropped, cancelled
+                )
                 continue
             if kind != KIND_JSON:
                 continue
             message = decode_json(payload)
-            if not self.handle(message, stdout, pending_audio, pending_requests):
+            if not self.handle(
+                message,
+                stdout,
+                pending_audio,
+                pending_requests,
+                pending_dropped,
+                cancelled,
+            ):
                 return
 
-    def handle(self, message, out, pending_audio=None, pending_requests=None):
+    def handle(
+        self,
+        message,
+        out,
+        pending_audio=None,
+        pending_requests=None,
+        pending_dropped=None,
+        cancelled=None,
+    ):
         """Handle one control message. Returns False to stop the loop."""
         pending_audio = pending_audio if pending_audio is not None else {}
         pending_requests = pending_requests if pending_requests is not None else {}
+        pending_dropped = pending_dropped if pending_dropped is not None else {}
+        cancelled = cancelled if cancelled is not None else set()
         kind = message.get("type")
 
         if kind == "hello":
@@ -120,14 +178,36 @@ class Plugin:
         if kind == "generate":
             return self._generate(message, out)
         if kind in ("transcribe", "analyze"):
-            pending_requests[message["request_id"]] = message
+            request_id = message["request_id"]
+            pending_requests[request_id] = message
+            pending_audio.pop(request_id, None)
+            pending_dropped[request_id] = 0
+            cancelled.discard(request_id)
             return True
         if kind == "audio_end":
-            return self._finish_audio_request(message["request_id"], out, pending_audio, pending_requests)
+            return self._finish_audio_request(
+                message["request_id"],
+                out,
+                pending_audio,
+                pending_requests,
+                pending_dropped,
+                cancelled,
+            )
         if kind == "cancel":
+            request_id = message.get("request_id", "")
+            # Teardown first: drop this request's buffered audio and queued
+            # request before acknowledging, so the ack means "nothing of yours
+            # is still buffered". An unknown id is a no-op (the pops miss) that
+            # still gets an ack, and cancel is idempotent.
+            known = request_id in pending_requests or request_id in pending_audio
+            pending_audio.pop(request_id, None)
+            pending_requests.pop(request_id, None)
+            pending_dropped.pop(request_id, None)
+            if known:
+                cancelled.add(request_id)
             self._send(
                 out,
-                {"type": "cancel_ack", "request_id": message.get("request_id", "")},
+                {"type": "cancel_ack", "request_id": request_id},
             )
             return True
         if kind == "shutdown":
@@ -177,9 +257,32 @@ class Plugin:
         self._send(out, {"type": "done", "request_id": request_id})
         return True
 
-    def _finish_audio_request(self, request_id, out, pending_audio, pending_requests):
+    def _finish_audio_request(
+        self,
+        request_id,
+        out,
+        pending_audio,
+        pending_requests,
+        pending_dropped,
+        cancelled,
+    ):
+        if request_id in cancelled:
+            # The request was cancelled after its audio arrived: its work is
+            # suppressed, so a late audio_end must not resurrect it.
+            cancelled.discard(request_id)
+            pending_audio.pop(request_id, None)
+            pending_requests.pop(request_id, None)
+            pending_dropped.pop(request_id, None)
+            return True
         request = pending_requests.pop(request_id, None)
-        pcm = bytes(pending_audio.pop(request_id, b""))
+        dropped_frames = pending_dropped.pop(request_id, 0)
+        buffer = pending_audio.pop(request_id, None)
+        if buffer is None:
+            pcm = b""
+        elif isinstance(buffer, (bytes, bytearray)):
+            pcm = bytes(buffer)
+        else:
+            pcm = b"".join(buffer)
         if request is None:
             self._send_error(out, request_id, "protocol", "audio_end for unknown request")
             return True
@@ -207,5 +310,12 @@ class Plugin:
         except Exception as err:  # pragma: no cover - defensive
             self._send_error(out, request_id, "transient", str(err))
             return True
-        self._send(out, {"type": "done", "request_id": request_id})
+        self._send(
+            out,
+            {
+                "type": "done",
+                "request_id": request_id,
+                "dropped_frames": dropped_frames,
+            },
+        )
         return True

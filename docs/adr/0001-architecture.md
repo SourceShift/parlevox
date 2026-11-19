@@ -63,6 +63,15 @@ and a single language for adapters, but it puts a process boundary — and a
 failure/restart domain — on the hot path even for providers that could run
 in-process. Rejected; the sidecar is an escape hatch, not the architecture.
 
+## Non-goals for v0
+
+The v0 turn model is **half-duplex**: one turn runs VAD → STT → LLM → TTS in
+sequence, and the next stage does not begin until the previous one finishes.
+Early-start and pipelined decoding — starting synthesis before the transcript is
+final, or overlapping LLM deltas with TTS — are a v0.1 item. They are explicitly
+**not implemented** in this version, and the sequential turn loop should not be
+read as providing them.
+
 ## Consequences
 
 - Two provider paths must be kept behaviourally identical: the in-process fakes
