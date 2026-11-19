@@ -6,8 +6,9 @@ single Rust process, with Python reachable only through an optional, framed
 sidecar for providers that need a Python SDK.
 
 This document describes **what exists in this repository today**. The
-best-of-four-frameworks comparison that produced it is
-[`COMPARISON.md`](COMPARISON.md); the decision record is
+prior-art study that preceded the code is [`COMPARISON.md`](COMPARISON.md)
+(it records choices made, not a ranking of other frameworks); the decision
+record is
 [`../adr/0001-architecture.md`](../adr/0001-architecture.md). Where the two
 disagree about scope, the ADR is authoritative.
 
