@@ -5,7 +5,7 @@ import struct
 
 import pytest
 
-from voicekit_sdk.protocol import (
+from parlevox_sdk.protocol import (
     KIND_AUDIO,
     KIND_CLOSE,
     KIND_JSON,

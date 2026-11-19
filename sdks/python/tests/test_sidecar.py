@@ -12,8 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from voicekit_sdk.fakes import FAKE_LLM_DELTAS, FAKE_TTS_FRAMES
-from voicekit_sdk.protocol import (
+from parlevox_sdk.fakes import FAKE_LLM_DELTAS, FAKE_TTS_FRAMES
+from parlevox_sdk.protocol import (
     KIND_AUDIO,
     KIND_JSON,
     PROTOCOL_VERSION,
@@ -38,7 +38,7 @@ def _env():
 @pytest.fixture
 def plugin_process():
     process = subprocess.Popen(
-        [sys.executable, "-u", "-m", "voicekit_sdk.sidecar_main"],
+        [sys.executable, "-u", "-m", "parlevox_sdk.sidecar_main"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

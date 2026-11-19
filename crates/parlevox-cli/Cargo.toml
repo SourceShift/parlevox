@@ -1,0 +1,33 @@
+[package]
+name = "parlevox-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "One-turn command-line demo for the parlevox workspace."
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "parlevox"
+path = "src/main.rs"
+
+[dependencies]
+parlevox-core = { version = "0.1.0", path = "../parlevox-core" }
+parlevox-providers = { version = "0.1.0", path = "../parlevox-providers" }
+parlevox-runtime = { version = "0.1.0", path = "../parlevox-runtime" }
+parlevox-sidecar = { version = "0.1.0", path = "../parlevox-sidecar" }
+tokio.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+futures-util.workspace = true
+serde_json.workspace = true
+tokio-util.workspace = true
+parlevox-ipc = { version = "0.1.0", path = "../parlevox-ipc" }
+
+[lints]
+workspace = true

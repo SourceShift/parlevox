@@ -1,6 +1,6 @@
-# Voicekit — design of the shipped skeleton (v0)
+# Parlevox — design of the shipped skeleton (v0)
 
-**One sentence:** voicekit is a voice-agent runtime whose hot path — audio
+**One sentence:** parlevox is a voice-agent runtime whose hot path — audio
 buffers, the turn state machine, provider calls, cancellation — lives in a
 single Rust process, with Python reachable only through an optional, framed
 sidecar for providers that need a Python SDK.
@@ -27,10 +27,10 @@ most recent verdict, copied from its run directory.
 ```mermaid
 flowchart LR
     subgraph host["one OS process (Rust)"]
-        cli["voicekit-cli<br/>demo --fake / --sidecar"]
-        rt["voicekit-runtime<br/>Session actor<br/>TurnMachine · MonoClock<br/>AudioRing · EventQueue"]
-        pr["voicekit-providers<br/>Stt / Llm / Tts / Vad traits<br/>manifests · in-process fakes"]
-        core["voicekit-core<br/>AudioFrame · OverflowPolicy<br/>TurnState table · ErrorClass"]
+        cli["parlevox-cli<br/>demo --fake / --sidecar"]
+        rt["parlevox-runtime<br/>Session actor<br/>TurnMachine · MonoClock<br/>AudioRing · EventQueue"]
+        pr["parlevox-providers<br/>Stt / Llm / Tts / Vad traits<br/>manifests · in-process fakes"]
+        core["parlevox-core<br/>AudioFrame · OverflowPolicy<br/>TurnState table · ErrorClass"]
         cli --> rt
         rt --> pr
         rt --> core
@@ -38,9 +38,9 @@ flowchart LR
     end
 
     subgraph side["optional sidecar (only when requested)"]
-        sc["voicekit-sidecar<br/>supervisor · client · adapters"]
-        ipc["voicekit-ipc<br/>framed protocol<br/>MAX_FRAME_BYTES = 1 MiB"]
-        py["Python plugin<br/>voicekit_sdk.Plugin<br/>sidecar_main"]
+        sc["parlevox-sidecar<br/>supervisor · client · adapters"]
+        ipc["parlevox-ipc<br/>framed protocol<br/>MAX_FRAME_BYTES = 1 MiB"]
+        py["Python plugin<br/>parlevox_sdk.Plugin<br/>sidecar_main"]
     end
 
     rt -. "provider configured as sidecar" .-> sc
@@ -55,13 +55,13 @@ sidecar is started only when a session resolves a provider that lives there.
 
 | Crate | Owns | Key types |
 |---|---|---|
-| `voicekit-core` | Audio frame, clock, bounded ring, FSM, error classes | `AudioFrame`, `MonoClock`, `AudioRing`, `OverflowPolicy`, `TurnMachine`, `TurnState`, `ErrorClass` |
-| `voicekit-providers` | Streaming traits + manifests + deterministic fakes | `SttProvider`, `LlmProvider`, `TtsProvider`, `VadProvider`, `ProviderManifest`, `Fake*` |
-| `voicekit-runtime` | One session: FSM owner, rings, event handoff, provider selection, barge-in | `Session`, `SessionConfig`, `SessionEvent`, `EventQueue`, `ProviderRegistry`, `TurnReport` |
-| `voicekit-ipc` | The framed wire protocol — used **only** by the sidecar path | `Frame`, `AudioHeader`, `read_frame`, `write_frame`, `MAX_FRAME_BYTES` |
-| `voicekit-sidecar` | Process supervision and the adapter from plugin → provider trait | `SidecarClient`, `SidecarSupervisor`, `SidecarStt/Llm/Tts`, `RestartPolicy` |
-| `voicekit-cli` | Argument parsing and the one-turn demo, in a library so tests drive the same path | `run_args`, `demo_fake`, `demo_sidecar` |
-| `sdks/python/voicekit_sdk` | Reference Python implementation of the plugin side | `Plugin`, `protocol`, `fakes`, `sidecar_main` |
+| `parlevox-core` | Audio frame, clock, bounded ring, FSM, error classes | `AudioFrame`, `MonoClock`, `AudioRing`, `OverflowPolicy`, `TurnMachine`, `TurnState`, `ErrorClass` |
+| `parlevox-providers` | Streaming traits + manifests + deterministic fakes | `SttProvider`, `LlmProvider`, `TtsProvider`, `VadProvider`, `ProviderManifest`, `Fake*` |
+| `parlevox-runtime` | One session: FSM owner, rings, event handoff, provider selection, barge-in | `Session`, `SessionConfig`, `SessionEvent`, `EventQueue`, `ProviderRegistry`, `TurnReport` |
+| `parlevox-ipc` | The framed wire protocol — used **only** by the sidecar path | `Frame`, `AudioHeader`, `read_frame`, `write_frame`, `MAX_FRAME_BYTES` |
+| `parlevox-sidecar` | Process supervision and the adapter from plugin → provider trait | `SidecarClient`, `SidecarSupervisor`, `SidecarStt/Llm/Tts`, `RestartPolicy` |
+| `parlevox-cli` | Argument parsing and the one-turn demo, in a library so tests drive the same path | `run_args`, `demo_fake`, `demo_sidecar` |
+| `sdks/python/parlevox_sdk` | Reference Python implementation of the plugin side | `Plugin`, `protocol`, `fakes`, `sidecar_main` |
 
 ## 3. One turn
 
@@ -69,7 +69,7 @@ sidecar is started only when a session resolves a provider that lives there.
 the turn's invariants live in one closed transition table (`TurnState`:
 `Idle → Listening → UserSpeaking → Thinking → Speaking`, with `Interrupted`
 on barge-in and `Closed` terminal). An event that is illegal in the current
-state returns `VoicekitError::Protocol` — it is never swallowed, which is the
+state returns `ParlevoxError::Protocol` — it is never swallowed, which is the
 point: a misbehaving plugin fails loudly at the boundary instead of silently
 corrupting a turn.
 
@@ -115,7 +115,7 @@ implemented — see the ADR's "Non-goals for v0".
    on the audio and turn paths; wall-clock time does not appear there.
 4. **The default path has no Python.** If `demo --fake` ever needed an
    interpreter, the architecture would be wrong.
-5. **Errors are classified.** `VoicekitError` carries an `ErrorClass` and an
+5. **Errors are classified.** `ParlevoxError` carries an `ErrorClass` and an
    `is_recoverable()` answer, so a caller can retry, degrade or abort without
    string-matching a message.
 6. **The boundary is framed, not textual.** Audio travels as binary frames
@@ -139,7 +139,7 @@ dimension. This is the honest scorecard against the shipped tree:
 | 7 | Observability | OTel turn span + boundary cost meters | **Deferred** — counters only (`dropped_*`, `EventQueueStats`); no traces |
 | 8 | Extensibility cost | New provider = one interface + manifest, no core edits | **Implemented** — register/select by name |
 | 9 | Deployment & scale | Warm pools sized by provider concurrency and p95 latency | **Deferred** |
-| 10 | Language boundary | Rust owns lifecycle; length-prefixed binary frames with explicit cancel | **Implemented** — `voicekit-ipc` + `voicekit-sidecar` |
+| 10 | Language boundary | Rust owns lifecycle; length-prefixed binary frames with explicit cancel | **Implemented** — `parlevox-ipc` + `parlevox-sidecar` |
 
 Deferred rows are deferrals, not omissions being papered over: they are the
 v0.1+ agenda, and the ADR records the boundary.
@@ -147,13 +147,13 @@ v0.1+ agenda, and the ADR records the boundary.
 ## 6. Adding a provider
 
 A Rust provider is two things: an implementation of one trait from
-`voicekit-providers` (`transcribe`, `generate`, `synthesize` or `analyze`,
+`parlevox-providers` (`transcribe`, `generate`, `synthesize` or `analyze`,
 each returning a stream rather than a whole-utterance future) and a manifest
 declaring name, modality, capabilities and config schema. It is registered
 with `ProviderRegistry::register_*` and selected by name at session
 construction. The runtime and the FSM do not change.
 
-A Python-only provider implements `voicekit_sdk.Plugin` and is reached through
+A Python-only provider implements `parlevox_sdk.Plugin` and is reached through
 the sidecar adapter, which presents it to the runtime as the same trait. The
 plugin host bounds each in-flight request's pending audio, purges it on
 `cancel`, and acknowledges only after the local stream is torn down; the
@@ -163,9 +163,9 @@ process survives a cancel and serves the next request.
 
 ```bash
 cargo test --workspace
-cargo run -q -p voicekit-cli -- demo --fake      # no Python involved
+cargo run -q -p parlevox-cli -- demo --fake      # no Python involved
 PYTHONPATH=sdks/python python3 -m pytest sdks/python/tests -q
-cargo run -q -p voicekit-cli -- demo --sidecar   # same turn through the plugin
+cargo run -q -p parlevox-cli -- demo --sidecar   # same turn through the plugin
 ```
 
 Expected: a turn prints two `AudioOut` frames and a `TurnDone` carrying

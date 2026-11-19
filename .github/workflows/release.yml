@@ -38,8 +38,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: PYTHONPATH=sdks/python python -m pytest sdks/python/tests -q
-      - run: cargo run -q -p voicekit-cli -- demo --fake
-      - run: cargo run -q -p voicekit-cli -- demo --sidecar
+      - run: cargo run -q -p parlevox-cli -- demo --fake
+      - run: cargo run -q -p parlevox-cli -- demo --sidecar
 
   build:
     name: build ${{ matrix.target }}
@@ -64,12 +64,12 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - name: Build
-        run: cargo build --release -p voicekit-cli --target ${{ matrix.target }}
+        run: cargo build --release -p parlevox-cli --target ${{ matrix.target }}
       - name: Package
         run: |
           mkdir -p dist
-          name="voicekit-cli-${GITHUB_REF_NAME}-${{ matrix.target }}"
-          tar -czf "dist/${name}.tar.gz" -C "target/${{ matrix.target }}/release" voicekit-cli
+          name="parlevox-cli-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          tar -czf "dist/${name}.tar.gz" -C "target/${{ matrix.target }}/release" parlevox
           ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
       - uses: actions/upload-artifact@v4
         with:
@@ -129,8 +129,8 @@ jobs:
           }
 
           # core -> ipc -> providers -> runtime -> sidecar -> cli.
-          for crate in voicekit-core voicekit-ipc voicekit-providers \
-                       voicekit-runtime voicekit-sidecar voicekit-cli; do
+          for crate in parlevox-core parlevox-ipc parlevox-providers \
+                       parlevox-runtime parlevox-sidecar parlevox-cli; do
             version=$(version_of "$crate")
             if cargo search "$crate" --limit 1 2>/dev/null \
                  | grep -q "^$crate = \"$version\""; then

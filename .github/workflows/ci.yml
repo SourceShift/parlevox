@@ -61,7 +61,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
       # The default turn must run with no Python process and no network.
-      - run: cargo run -q -p voicekit-cli -- demo --fake
+      - run: cargo run -q -p parlevox-cli -- demo --fake
 
   docs:
     name: rustdoc (-D warnings)
@@ -102,7 +102,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: cargo run -q -p voicekit-cli -- demo --sidecar
+      - run: cargo run -q -p parlevox-cli -- demo --sidecar
 
   package:
     name: package metadata
@@ -116,7 +116,7 @@ jobs:
       # can be packaged before the first release (dependents resolve their
       # siblings from crates.io), so the rest is checked statically.
       - name: package leaf crate
-        run: cargo package -p voicekit-core --no-verify
+        run: cargo package -p parlevox-core --no-verify
       - name: check publishable metadata
         run: |
           python3 - <<'PY'

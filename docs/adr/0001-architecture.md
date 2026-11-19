@@ -36,7 +36,7 @@ requirement for the default turn.
    JSON audio. In-process audio travels in owned `i16` buffers; sidecar audio
    travels in binary frames.
 5. **Invariants are enforced, not documented.** Illegal turn transitions remain
-   `VoicekitError::Protocol`; every audio path is a bounded ring with an explicit
+   `ParlevoxError::Protocol`; every audio path is a bounded ring with an explicit
    overflow policy and dropped-frame/dropped-ms counters; duration measurement
    uses one monotonic clock per session.
 

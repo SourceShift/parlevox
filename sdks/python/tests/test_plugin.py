@@ -3,13 +3,13 @@
 import io
 from collections import deque
 
-from voicekit_sdk.plugin import (
+from parlevox_sdk.plugin import (
     MAX_CANCELLED,
     MAX_PENDING_AUDIO_FRAMES,
     CancelledTombstones,
     Plugin,
 )
-from voicekit_sdk.protocol import (
+from parlevox_sdk.protocol import (
     KIND_AUDIO,
     KIND_JSON,
     decode_audio,
