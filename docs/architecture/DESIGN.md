@@ -12,11 +12,11 @@ record is
 [`../adr/0001-architecture.md`](../adr/0001-architecture.md). Where the two
 disagree about scope, the ADR is authoritative.
 
-Status at `c52be68`: 34 Rust tests, 22 Python tests, `demo --fake` and
-`demo --sidecar` both green. The panel verdict for this tree is
-[`panel-verdict-iter2.json`](panel-verdict-iter2.json) — APPROVE, score 100,
-after one ESCALATE iteration
-([`panel-verdict-iter1.json`](panel-verdict-iter1.json)).
+Status at `7e23e3c`: 81 Rust tests (including property tests for the audio ring
+and the event queue), 27 Python tests, `demo --fake` and `demo --sidecar` both
+green with identical event sequences. The advisory-closure run was approved by
+the four-family panel (glm, kimi, codex, minimax); its verdict is
+[`panel-verdict.json`](panel-verdict.json), copied from the run directory.
 
 ---
 
@@ -171,14 +171,18 @@ Expected: a turn prints two `AudioOut` frames and a `TurnDone` carrying
 
 ## 8. Known gaps
 
-From the APPROVE panel's advisory list and the deferrals above:
+The v0.1 advisory list is closed (run `run-1795127680-3383`): the sidecar's
+dropped-frame count now reaches `TurnDone` as `sidecar_dropped_frames`,
+`EventQueue` has the same property coverage as `AudioRing`, the plugin's
+cancelled-request tombstones are a bounded ledger with counted eviction, and
+CLI parity is a differential run of both backends rather than a framing
+round-trip.
 
-- The sidecar's `dropped_frames` counter is reported in the plugin response
-  but is not yet threaded into the runtime's `TurnDone` as a distinct field.
-- No property tests for `EventQueue`; the analogous `AudioRing` has them.
+What remains open:
+
 - Producers cannot observe backpressure — there are no credits; overflow is
-  handled by dropping, not by slowing the producer.
-- The sidecar's `cancelled` tombstone set is not explicitly bounded.
-- CLI parity is tested as a framing round-trip, not as a differential run of
-  both backends under identical input.
-- Half-duplex turn model (see §3 and the ADR).
+  handled by dropping, not by slowing the producer (see ADR §"Backpressure
+  and loss accounting", which records this as deliberate for v0.1).
+- Half-duplex turn model (see §3 and the ADR's "Non-goals for v0").
+- No warm plugin pool: one plugin process per session (dimension 2, partial).
+- No turn spans or traces; observability is counters only (dimension 7).
