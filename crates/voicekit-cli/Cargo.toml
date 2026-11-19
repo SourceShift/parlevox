@@ -16,10 +16,10 @@ name = "voicekit-cli"
 path = "src/main.rs"
 
 [dependencies]
-voicekit-core = { path = "../voicekit-core" }
-voicekit-providers = { path = "../voicekit-providers" }
-voicekit-runtime = { path = "../voicekit-runtime" }
-voicekit-sidecar = { path = "../voicekit-sidecar" }
+voicekit-core = { version = "0.1.0", path = "../voicekit-core" }
+voicekit-providers = { version = "0.1.0", path = "../voicekit-providers" }
+voicekit-runtime = { version = "0.1.0", path = "../voicekit-runtime" }
+voicekit-sidecar = { version = "0.1.0", path = "../voicekit-sidecar" }
 tokio.workspace = true
 
 [dev-dependencies]
@@ -27,7 +27,7 @@ async-trait.workspace = true
 futures-util.workspace = true
 serde_json.workspace = true
 tokio-util.workspace = true
-voicekit-ipc = { path = "../voicekit-ipc" }
+voicekit-ipc = { version = "0.1.0", path = "../voicekit-ipc" }
 
 [lints]
 workspace = true

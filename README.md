@@ -1,6 +1,8 @@
 # voicekit
 
 [![CI](https://github.com/SourceShift/voicekit/actions/workflows/ci.yml/badge.svg)](https://github.com/SourceShift/voicekit/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/SourceShift/voicekit?include_prereleases&sort=semver)](https://github.com/SourceShift/voicekit/releases)
+[![MSRV: 1.85](https://img.shields.io/badge/rust-1.85%2B-blue.svg)](Cargo.toml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 A voice-agent runtime for one job: run a live audio turn — listen, transcribe,

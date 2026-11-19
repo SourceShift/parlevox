@@ -12,9 +12,9 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-voicekit-core = { path = "../voicekit-core" }
-voicekit-providers = { path = "../voicekit-providers" }
-voicekit-ipc = { path = "../voicekit-ipc" }
+voicekit-core = { version = "0.1.0", path = "../voicekit-core" }
+voicekit-providers = { version = "0.1.0", path = "../voicekit-providers" }
+voicekit-ipc = { version = "0.1.0", path = "../voicekit-ipc" }
 async-trait.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true

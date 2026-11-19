@@ -12,7 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-voicekit-core = { path = "../voicekit-core" }
+voicekit-core = { version = "0.1.0", path = "../voicekit-core" }
 async-trait.workspace = true
 futures-core.workspace = true
 serde.workspace = true

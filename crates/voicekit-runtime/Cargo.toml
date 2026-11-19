@@ -12,8 +12,8 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-voicekit-core = { path = "../voicekit-core" }
-voicekit-providers = { path = "../voicekit-providers" }
+voicekit-core = { version = "0.1.0", path = "../voicekit-core" }
+voicekit-providers = { version = "0.1.0", path = "../voicekit-providers" }
 futures-core.workspace = true
 futures-util.workspace = true
 tokio-util.workspace = true
