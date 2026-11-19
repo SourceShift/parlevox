@@ -12,11 +12,13 @@ record is
 [`../adr/0001-architecture.md`](../adr/0001-architecture.md). Where the two
 disagree about scope, the ADR is authoritative.
 
-Status at `7e23e3c`: 81 Rust tests (including property tests for the audio ring
+Status at `62f0850`: 87 Rust tests (including property tests for the audio ring
 and the event queue), 27 Python tests, `demo --fake` and `demo --sidecar` both
-green with identical event sequences. The advisory-closure run was approved by
-the four-family panel (glm, kimi, codex, minimax); its verdict is
-[`panel-verdict.json`](panel-verdict.json), copied from the run directory.
+green with identical event sequences. The advisory-closure run
+(`run-1795127680-3383`) and the follow-up idiom pass
+(`run-1795129305-30892`) were both approved by the four-family panel (glm,
+kimi, codex, minimax); [`panel-verdict.json`](panel-verdict.json) holds the
+most recent verdict, copied from its run directory.
 
 ---
 
