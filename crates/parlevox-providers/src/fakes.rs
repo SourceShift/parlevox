@@ -4,9 +4,12 @@
 //! instead of racing timers. The fakes never touch the network, the
 //! filesystem, or a Python interpreter.
 
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 use async_trait::async_trait;
+use futures_core::Stream;
 use parlevox_core::ParlevoxError;
 use tokio_util::sync::CancellationToken;
 
@@ -38,6 +41,107 @@ pub const FAKE_FRAME_MS: u64 = 10;
 pub const FAKE_TTS_FRAMES: usize = 2;
 /// Samples per channel in each fake TTS frame.
 pub const FAKE_FRAME_SAMPLES: usize = (FAKE_SAMPLE_RATE as u64 * FAKE_FRAME_MS / 1000) as usize;
+
+/// One observable provider interaction, appended to a [`ProviderCallLog`] in
+/// the order it happens.
+///
+/// This is what lets a test prove an ordering property — for example that a
+/// synthesis request was issued before the LLM emitted its last delta — without
+/// measuring wall-clock time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderCall {
+    /// An LLM delta was yielded to the consumer.
+    LlmDelta(String),
+    /// The LLM stream reached its end and was exhausted, so the consumer saw a
+    /// complete reply. An interrupted stream never records it.
+    LlmEnded,
+    /// A synthesis request was accepted for `text`.
+    TtsSynthesize(String),
+    /// A synthesis stream was dropped before it reached its end, which is what
+    /// a barge-in does to an in-flight synthesis.
+    TtsStreamDropped,
+}
+
+/// Shared, ordered log of [`ProviderCall`]s.
+pub type ProviderCallLog = Arc<Mutex<Vec<ProviderCall>>>;
+
+fn record(log: &Option<ProviderCallLog>, call: ProviderCall) {
+    if let Some(log) = log {
+        log.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(call);
+    }
+}
+
+/// Records each LLM delta as it is yielded, then forwards it unchanged.
+///
+/// End of stream is recorded once as [`ProviderCall::LlmEnded`]. The
+/// `finished` guard keeps a repeated poll after exhaustion from appending the
+/// marker twice, mirroring [`DropAwareTtsStream`].
+struct LoggingLlmStream {
+    inner: ProviderStream<String>,
+    log: ProviderCallLog,
+    finished: bool,
+}
+
+impl Stream for LoggingLlmStream {
+    type Item = Result<String, ParlevoxError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let polled = this.inner.as_mut().poll_next(cx);
+        match &polled {
+            Poll::Ready(Some(Ok(delta))) => {
+                this.log
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(ProviderCall::LlmDelta(delta.clone()));
+            }
+            Poll::Ready(None) if !this.finished => {
+                this.finished = true;
+                this.log
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(ProviderCall::LlmEnded);
+            }
+            Poll::Ready(Some(Err(_))) | Poll::Ready(None) | Poll::Pending => {}
+        }
+        polled
+    }
+}
+
+/// Records a TTS stream that is dropped before completion: an interrupted
+/// synthesis. Reaching the end of the stream marks it finished, so a normal
+/// completion is not misreported as a cancellation.
+struct DropAwareTtsStream {
+    inner: ProviderStream<AudioChunk>,
+    log: ProviderCallLog,
+    finished: bool,
+}
+
+impl Stream for DropAwareTtsStream {
+    type Item = Result<AudioChunk, ParlevoxError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let polled = this.inner.as_mut().poll_next(cx);
+        if matches!(&polled, Poll::Ready(None)) {
+            this.finished = true;
+        }
+        polled
+    }
+}
+
+impl Drop for DropAwareTtsStream {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(ProviderCall::TtsStreamDropped);
+        }
+    }
+}
 
 fn require_non_empty(field: &str, value: &str) -> Result<(), ParlevoxError> {
     if value.trim().is_empty() {
@@ -128,6 +232,13 @@ pub struct FakeLlm {
     /// the fake (the runtime holds one behind `Arc<dyn LlmProvider>`) share the
     /// same cell. The lock is taken and released without an `await` in between.
     last_request: Arc<Mutex<Option<GenerateRequest>>>,
+    /// Deltas this fake streams. Defaults to [`FAKE_LLM_DELTAS`]; a test can
+    /// substitute a scripted multi-sentence reply without touching the default
+    /// path.
+    deltas: Vec<String>,
+    /// Optional ordered log of provider calls, for ordering assertions that
+    /// must not depend on timing.
+    call_log: Option<ProviderCallLog>,
 }
 
 impl Default for FakeLlm {
@@ -143,7 +254,24 @@ impl FakeLlm {
                 .with_capability("streaming")
                 .with_capability("cancel"),
             last_request: Arc::new(Mutex::new(None)),
+            deltas: FAKE_LLM_DELTAS
+                .iter()
+                .map(|delta| (*delta).to_string())
+                .collect(),
+            call_log: None,
         }
+    }
+
+    /// Stream exactly `deltas` instead of the default script.
+    pub fn with_deltas(mut self, deltas: Vec<String>) -> Self {
+        self.deltas = deltas;
+        self
+    }
+
+    /// Record every yielded delta into `log`.
+    pub fn with_call_log(mut self, log: ProviderCallLog) -> Self {
+        self.call_log = Some(log);
+        self
     }
 
     /// The most recent request this fake served, if any.
@@ -177,17 +305,25 @@ impl LlmProvider for FakeLlm {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *slot = Some(request);
         }
-        let items = FAKE_LLM_DELTAS
-            .iter()
-            .map(|delta| Ok((*delta).to_string()))
-            .collect();
-        Ok(cancelable_stream(items, cancel))
+        let items = self.deltas.iter().map(|delta| Ok(delta.clone())).collect();
+        let stream = cancelable_stream(items, cancel);
+        match &self.call_log {
+            Some(log) => Ok(Box::pin(LoggingLlmStream {
+                inner: stream,
+                log: Arc::clone(log),
+                finished: false,
+            })),
+            None => Ok(stream),
+        }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct FakeTts {
     manifest: ProviderManifest,
+    /// Optional ordered log of provider calls, including a drop recorded when
+    /// an in-flight stream is abandoned (a barge-in).
+    call_log: Option<ProviderCallLog>,
 }
 
 impl Default for FakeTts {
@@ -203,7 +339,14 @@ impl FakeTts {
                 .with_capability("streaming")
                 .with_capability("binary_pcm")
                 .with_capability("cancel"),
+            call_log: None,
         }
+    }
+
+    /// Record each synthesis request and each abandoned stream into `log`.
+    pub fn with_call_log(mut self, log: ProviderCallLog) -> Self {
+        self.call_log = Some(log);
+        self
     }
 }
 
@@ -224,16 +367,29 @@ impl TtsProvider for FakeTts {
                 "sample_rate and channels must be non-zero".into(),
             ));
         }
+        // Move the owned text into the log entry: the fake never needs it
+        // again, and the remaining fields are `Copy`.
+        let sample_rate = request.sample_rate;
+        let channels = request.channels;
+        record(&self.call_log, ProviderCall::TtsSynthesize(request.text));
         let items = (0..FAKE_TTS_FRAMES)
             .map(|frame_index| {
                 Ok(AudioChunk::new(
-                    request.sample_rate,
-                    request.channels,
+                    sample_rate,
+                    channels,
                     fake_pcm(frame_index),
                 ))
             })
             .collect();
-        Ok(cancelable_stream(items, cancel))
+        let stream = cancelable_stream(items, cancel);
+        match &self.call_log {
+            Some(log) => Ok(Box::pin(DropAwareTtsStream {
+                inner: stream,
+                log: Arc::clone(log),
+                finished: false,
+            })),
+            None => Ok(stream),
+        }
     }
 }
 

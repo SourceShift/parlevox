@@ -12,13 +12,14 @@
 
 use std::sync::Arc;
 
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use parlevox_core::{
     AudioRing, MonoClock, OverflowPolicy, ParlevoxError, PushOutcome, RingStats, TurnEvent,
     TurnMachine, TurnState,
 };
 use parlevox_providers::{
-    AudioChunk, GenerateRequest, ProviderManifest, SynthesizeRequest, VadEvent,
+    AudioChunk, ChatMessage, GenerateRequest, ProviderManifest, ProviderStream, SynthesizeRequest,
+    VadEvent,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -26,11 +27,14 @@ use crate::context::{ChatContext, ContextStats};
 use crate::events::{
     EventPushOutcome, EventQueue, EventQueueStats, SessionEvent, MIN_EVENT_CAPACITY,
 };
+use crate::pipeline::{PipelineStats, SentenceQueue, SentenceSplitter};
 use crate::registry::Providers;
 #[cfg(feature = "otel")]
-use crate::telemetry::{counter, millis, to_u64, TraceClock, TurnTrace};
+use crate::telemetry::{counter, millis, to_u64, StageSpan, TraceClock, TurnTrace};
 #[cfg(feature = "otel")]
 use opentelemetry::KeyValue;
+#[cfg(feature = "otel")]
+use parlevox_core::Timestamp;
 
 /// Tunables for one session.
 #[derive(Debug, Clone)]
@@ -52,6 +56,19 @@ pub struct SessionConfig {
     pub context_chars: usize,
     /// Test hook: trigger a barge-in after this many reply deltas.
     pub barge_in_after_deltas: Option<usize>,
+    /// Opt-in: synthesize each completed sentence while the LLM is still
+    /// producing the rest of the reply.
+    ///
+    /// Defaults to `false`. With it off, the turn loop is the sequential
+    /// VAD → STT → LLM → TTS sequence: same provider calls, same order, same
+    /// events, same span shape.
+    pub pipelined_tts: bool,
+    /// Bounded capacity of the completed-sentence handoff used by the
+    /// pipelined mode. Must be at least one.
+    pub pipeline_queue_capacity: usize,
+    /// Maximum sentence length, in characters, before the splitter
+    /// force-splits an unpunctuated run. Must be at least one.
+    pub pipeline_max_sentence_chars: usize,
 }
 
 impl Default for SessionConfig {
@@ -66,6 +83,9 @@ impl Default for SessionConfig {
             context_messages: 16,
             context_chars: 8_192,
             barge_in_after_deltas: None,
+            pipelined_tts: false,
+            pipeline_queue_capacity: 8,
+            pipeline_max_sentence_chars: 240,
         }
     }
 }
@@ -103,6 +123,90 @@ struct TurnBaseline {
     context_evicted_messages: u64,
 }
 
+/// Everything the flag-selected LLM/TTS phase needs from the committed turn.
+///
+/// Bundling these keeps the phase signatures small and makes it impossible to
+/// pass the transcript and history in inconsistent order.
+struct PhaseInput<'a> {
+    turn: u64,
+    transcript: &'a str,
+    history: Vec<ChatMessage>,
+    token: CancellationToken,
+    generation: u64,
+    baseline: TurnBaseline,
+}
+
+/// What the flag-selected LLM/TTS phase produced. The prologue and epilogue of
+/// [`Session::drive_turn`] are shared, so the phase only owns the part that
+/// differs between the sequential and pipelined paths.
+struct PhaseOutcome {
+    reply: String,
+    audio_frames: u64,
+    interrupted: bool,
+}
+
+/// Mutable state of the pipelined LLM/TTS phase.
+///
+/// It lives on the turn future's stack: no task is spawned and no state escapes
+/// the turn, so dropping the future (or returning early on barge-in) tears the
+/// in-flight synthesis down structurally.
+struct PipelinePhaseState {
+    splitter: SentenceSplitter,
+    tts: Option<ProviderStream<AudioChunk>>,
+    reply: String,
+    reply_started: bool,
+    delta_count: usize,
+    llm_done: bool,
+    interrupted: bool,
+    audio_frames: u64,
+    sentence_index: u64,
+    request_frames: u64,
+    #[cfg(feature = "otel")]
+    trace: PipelineTraceState,
+}
+
+/// Trace state for the pipelined phase: the `llm` and `playout` spans cover
+/// the phase, while one `tts` span is opened per synthesis request so an
+/// honest start-before-sibling-end interval is recorded.
+#[cfg(feature = "otel")]
+struct PipelineTraceState {
+    llm_span: Option<StageSpan>,
+    playout_span: Option<StageSpan>,
+    tts_stage: Option<StageSpan>,
+    phase_started: Timestamp,
+    saw_audio_chunk: bool,
+}
+
+/// The three observable states of one non-blocking stream poll.
+enum Polled<T> {
+    /// The stream made no progress; its waker is registered for the next poll
+    /// that goes through `await`.
+    Pending,
+    /// The stream yielded an item.
+    Item(Result<T, ParlevoxError>),
+    /// The stream reached its end.
+    Ended,
+}
+
+/// Poll `stream` once without blocking.
+///
+/// Distinguishing `Ended` from `Pending` matters: both map to `None` under a
+/// naive `now_or_never().flatten()`, which would postpone noticing end-of-stream
+/// until the next `await` and stall the loop's fast path.
+fn poll_stream_once<T>(stream: &mut ProviderStream<T>) -> Polled<T> {
+    match stream.next().now_or_never() {
+        None => Polled::Pending,
+        Some(None) => Polled::Ended,
+        Some(Some(item)) => Polled::Item(item),
+    }
+}
+
+/// Which stream the `select` fallback in [`Session::run_pipelined_phase`] woke.
+enum ReadyItem {
+    Llm(Option<Result<String, ParlevoxError>>),
+    Tts(Option<Result<AudioChunk, ParlevoxError>>),
+}
+
 pub struct Session {
     config: SessionConfig,
     machine: TurnMachine,
@@ -114,6 +218,9 @@ pub struct Session {
     generation: u64,
     events: EventQueue,
     context: ChatContext,
+    /// Bounded completed-sentence handoff for the opt-in pipelined mode. Empty
+    /// and unused when [`SessionConfig::pipelined_tts`] is false.
+    pipeline: SentenceQueue,
     /// Facade tracer used by the opt-in `otel` feature. Absent from the
     /// default build, so the default session carries no OpenTelemetry state.
     #[cfg(feature = "otel")]
@@ -130,8 +237,12 @@ impl Session {
     ///
     /// Returns a protocol-class error when a provider manifest is invalid, when
     /// `event_capacity` is below [`MIN_EVENT_CAPACITY`] (the minimum needed to
-    /// reserve the terminal slot plus streaming headroom), or when
-    /// `context_messages` / `context_chars` cannot hold one turn.
+    /// reserve the terminal slot plus streaming headroom), when
+    /// `context_messages` / `context_chars` cannot hold one turn, or when
+    /// either pipelined-TTS bound is zero: `pipeline_queue_capacity == 0` or
+    /// `pipeline_max_sentence_chars == 0`. A zero bound cannot make progress or
+    /// hold one sentence, so it is a protocol-class configuration failure rather
+    /// than a silent no-op.
     pub fn new(config: SessionConfig, providers: Providers) -> Result<Self, ParlevoxError> {
         #[cfg(feature = "otel")]
         {
@@ -191,12 +302,23 @@ impl Session {
                 config.event_capacity
             )));
         }
+        if config.pipeline_queue_capacity == 0 {
+            return Err(ParlevoxError::Protocol(
+                "pipeline_queue_capacity must be at least 1 (got 0)".into(),
+            ));
+        }
+        if config.pipeline_max_sentence_chars == 0 {
+            return Err(ParlevoxError::Protocol(
+                "pipeline_max_sentence_chars must be at least 1 (got 0)".into(),
+            ));
+        }
         // Every audio, event, and context path is bounded by an explicit
         // capacity; the context's own constructor validates its two bounds.
         let input = AudioRing::new(config.input_ring_capacity, OverflowPolicy::DropOldest);
         let output = AudioRing::new(config.output_ring_capacity, OverflowPolicy::DropOldest);
         let events = EventQueue::new(config.event_capacity, config.event_overflow_policy);
         let context = ChatContext::new(config.context_messages, config.context_chars)?;
+        let pipeline = SentenceQueue::new(config.pipeline_queue_capacity);
         let clock = MonoClock::new();
         Ok(Session {
             config,
@@ -209,6 +331,7 @@ impl Session {
             generation: 0,
             events,
             context,
+            pipeline,
             #[cfg(feature = "otel")]
             tracer,
             #[cfg(feature = "otel")]
@@ -239,6 +362,16 @@ impl Session {
     /// Depth and cumulative loss counters for the bounded conversation context.
     pub fn context_stats(&self) -> ContextStats {
         self.context.stats()
+    }
+
+    /// Depth and cumulative counters for the bounded completed-sentence
+    /// handoff used by the opt-in pipelined mode.
+    ///
+    /// The queue exists for every session but carries nothing when
+    /// [`SessionConfig::pipelined_tts`] is false. Counters are cumulative over
+    /// the session, like the input, playout, and event queues.
+    pub fn pipeline_stats(&self) -> PipelineStats {
+        self.pipeline.stats()
     }
 
     pub fn provider_manifests(&self) -> Vec<ProviderManifest> {
@@ -361,6 +494,10 @@ impl Session {
         self.cancel = token.clone();
         self.generation += 1;
         let generation = self.generation;
+        // A previous turn may have been interrupted with sentences still queued.
+        // They belong to a reply the caller never finished hearing, so never
+        // synthesize them at the head of this turn.
+        self.pipeline.clear_pending();
 
         let baseline = TurnBaseline {
             output: self.output.stats(),
@@ -480,6 +617,130 @@ impl Session {
         let history = self.context.messages();
         self.context.push_user(transcript.clone());
 
+        // 3. Streaming completion and synthesis. The flag selects the phase;
+        // the prologue above and the epilogue below are shared, so the default
+        // sequential turn keeps the same provider calls, order, events, and
+        // span shape as before.
+        let outcome = if self.config.pipelined_tts {
+            self.run_pipelined_phase(
+                PhaseInput {
+                    turn,
+                    transcript: &transcript,
+                    history,
+                    token: token.clone(),
+                    generation,
+                    baseline,
+                },
+                #[cfg(feature = "otel")]
+                trace,
+            )
+            .await?
+        } else {
+            self.run_sequential_phase(
+                PhaseInput {
+                    turn,
+                    transcript: &transcript,
+                    history,
+                    token: token.clone(),
+                    generation,
+                    baseline,
+                },
+                #[cfg(feature = "otel")]
+                trace,
+            )
+            .await?
+        };
+
+        if outcome.interrupted {
+            return self.finish_interrupted(
+                turn,
+                outcome.audio_frames,
+                &transcript,
+                &outcome.reply,
+                baseline,
+            );
+        }
+
+        // 4. Close the turn.
+        self.apply(TurnEvent::ReplyFinished)?;
+        // Only a turn that ran to completion records an assistant message. An
+        // interrupted or failed turn keeps the already-committed user message
+        // but must not teach the model a reply the caller never heard.
+        self.context.push_assistant(outcome.reply.clone());
+        let context_messages = self.context.len();
+        let context_evicted_messages = self
+            .context
+            .stats()
+            .evicted_messages
+            .saturating_sub(baseline.context_evicted_messages);
+        let output_dropped = self.output.stats();
+        let dropped_frames = output_dropped
+            .dropped
+            .saturating_sub(baseline.output.dropped);
+        let dropped_ms = output_dropped
+            .dropped_duration
+            .as_millis()
+            .saturating_sub(baseline.output.dropped_duration.as_millis());
+        let input_dropped_frames = self
+            .input
+            .stats()
+            .dropped
+            .saturating_sub(baseline.input_dropped);
+        let dropped_events = self
+            .events
+            .dropped()
+            .saturating_sub(baseline.events_dropped);
+        // The adapters accumulate per-request sidecar loss; taking it after the
+        // TTS stream ends keeps the value per-turn and never double counts.
+        let sidecar_dropped_frames = self.take_sidecar_dropped_frames();
+
+        self.emit(SessionEvent::TurnDone {
+            turn,
+            audio_frames: outcome.audio_frames,
+            dropped_frames,
+            dropped_ms,
+            dropped_events,
+            sidecar_dropped_frames,
+            interrupted: false,
+        })?;
+
+        Ok(TurnReport {
+            turn,
+            transcript,
+            reply: outcome.reply,
+            audio_frames: outcome.audio_frames,
+            dropped_frames,
+            dropped_ms,
+            dropped_events,
+            sidecar_dropped_frames,
+            input_dropped_frames,
+            interrupted: false,
+            context_messages,
+            context_evicted_messages,
+        })
+    }
+
+    /// Today's sequential LLM-then-TTS phase, unchanged in call order.
+    ///
+    /// It returns what it produced instead of emitting the terminal event, so
+    /// [`Session::drive_turn`] can share its epilogue with the pipelined phase.
+    async fn run_sequential_phase(
+        &mut self,
+        phase: PhaseInput<'_>,
+        #[cfg(feature = "otel")] trace: &mut TurnTrace,
+    ) -> Result<PhaseOutcome, ParlevoxError> {
+        let PhaseInput {
+            turn,
+            transcript,
+            history,
+            token,
+            generation,
+            baseline,
+        } = phase;
+        // The baseline is read only when the playout span is present.
+        #[cfg(not(feature = "otel"))]
+        let _ = baseline;
+
         // 3. Streaming completion.
         #[cfg(feature = "otel")]
         let llm_started = self.clock.now();
@@ -489,7 +750,7 @@ impl Session {
         let mut llm = match llm_provider
             .generate(
                 GenerateRequest {
-                    prompt: transcript.clone(),
+                    prompt: transcript.to_string(),
                     history,
                 },
                 token.clone(),
@@ -553,7 +814,11 @@ impl Session {
             ));
         }
         if interrupted {
-            return self.finish_interrupted(turn, 0, &transcript, &reply, baseline);
+            return Ok(PhaseOutcome {
+                reply,
+                audio_frames: 0,
+                interrupted: true,
+            });
         }
 
         // 4. Streaming synthesis with bounded playout. Producing audio is a
@@ -629,66 +894,484 @@ impl Session {
             tts_span.end();
         }
         if interrupted {
-            return self.finish_interrupted(turn, audio_frames, &transcript, &reply, baseline);
+            return Ok(PhaseOutcome {
+                reply,
+                audio_frames,
+                interrupted: true,
+            });
         }
 
-        // 5. Close the turn.
-        self.apply(TurnEvent::ReplyFinished)?;
-        // Only a turn that ran to completion records an assistant message. An
-        // interrupted or failed turn keeps the already-committed user message
-        // but must not teach the model a reply the caller never heard.
-        self.context.push_assistant(reply.clone());
-        let context_messages = self.context.len();
-        let context_evicted_messages = self
-            .context
-            .stats()
-            .evicted_messages
-            .saturating_sub(baseline.context_evicted_messages);
-        let output_dropped = self.output.stats();
-        let dropped_frames = output_dropped
-            .dropped
-            .saturating_sub(baseline.output.dropped);
-        let dropped_ms = output_dropped
-            .dropped_duration
-            .as_millis()
-            .saturating_sub(baseline.output.dropped_duration.as_millis());
-        let input_dropped_frames = self
-            .input
-            .stats()
-            .dropped
-            .saturating_sub(baseline.input_dropped);
-        let dropped_events = self
-            .events
-            .dropped()
-            .saturating_sub(baseline.events_dropped);
-        // The adapters accumulate per-request sidecar loss; taking it after the
-        // TTS stream ends keeps the value per-turn and never double counts.
-        let sidecar_dropped_frames = self.take_sidecar_dropped_frames();
-
-        self.emit(SessionEvent::TurnDone {
-            turn,
-            audio_frames,
-            dropped_frames,
-            dropped_ms,
-            dropped_events,
-            sidecar_dropped_frames,
-            interrupted: false,
-        })?;
-
-        Ok(TurnReport {
-            turn,
-            transcript,
+        Ok(PhaseOutcome {
             reply,
             audio_frames,
-            dropped_frames,
-            dropped_ms,
-            dropped_events,
-            sidecar_dropped_frames,
-            input_dropped_frames,
             interrupted: false,
-            context_messages,
-            context_evicted_messages,
         })
+    }
+
+    /// Opt-in pipelined phase: synthesize each completed sentence while the LLM
+    /// is still producing the rest of the reply.
+    ///
+    /// This is one async state machine on the turn's own future. It spawns no
+    /// task and uses no timer: the in-flight synthesis stream is a local, so a
+    /// barge-in tears it down structurally when the future returns. Both
+    /// streams are polled without blocking on each pass of the loop; when
+    /// neither is ready the loop awaits `select(llm.next(), tts.next())` so
+    /// neither side can starve the other and both wakers stay live.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the LLM or TTS provider reports, and a protocol-class
+    /// error when the state machine rejects an event or an over-long sentence
+    /// configuration is unusable. Every failure goes through [`Session::fail`]
+    /// so the turn fails loudly instead of being masked by other in-flight
+    /// sentences.
+    async fn run_pipelined_phase(
+        &mut self,
+        phase: PhaseInput<'_>,
+        #[cfg(feature = "otel")] trace: &mut TurnTrace,
+    ) -> Result<PhaseOutcome, ParlevoxError> {
+        let PhaseInput {
+            turn,
+            transcript,
+            history,
+            token,
+            generation,
+            baseline,
+        } = phase;
+        // The baseline is read only when the playout span is present.
+        #[cfg(not(feature = "otel"))]
+        let _ = baseline;
+
+        #[cfg(feature = "otel")]
+        let phase_started = self.clock.now();
+
+        let llm_provider = Arc::clone(&self.providers.llm);
+        let mut llm = match llm_provider
+            .generate(
+                GenerateRequest {
+                    prompt: transcript.to_string(),
+                    history,
+                },
+                token.clone(),
+            )
+            .await
+        {
+            Ok(stream) => stream,
+            Err(err) => return self.fail(err),
+        };
+
+        let mut state = PipelinePhaseState {
+            splitter: SentenceSplitter::new(self.config.pipeline_max_sentence_chars)?,
+            tts: None,
+            reply: String::new(),
+            reply_started: false,
+            delta_count: 0,
+            llm_done: false,
+            interrupted: false,
+            audio_frames: 0,
+            sentence_index: 0,
+            request_frames: 0,
+            #[cfg(feature = "otel")]
+            trace: PipelineTraceState {
+                llm_span: Some(trace.stage("llm", phase_started)),
+                playout_span: Some(trace.stage("playout", phase_started)),
+                tts_stage: None,
+                phase_started,
+                saw_audio_chunk: false,
+            },
+        };
+
+        loop {
+            if token.is_cancelled() || self.generation != generation {
+                state.interrupted = true;
+                break;
+            }
+            let mut progressed = false;
+
+            // 1. Service the in-flight synthesis stream without blocking.
+            let tts_item = state.tts.as_mut().map(poll_stream_once);
+            match tts_item {
+                Some(Polled::Item(item)) => {
+                    progressed = true;
+                    self.handle_pipeline_tts_item(
+                        turn,
+                        &mut state,
+                        Some(item),
+                        #[cfg(feature = "otel")]
+                        trace,
+                    )?;
+                }
+                Some(Polled::Ended) => {
+                    progressed = true;
+                    self.handle_pipeline_tts_item(
+                        turn,
+                        &mut state,
+                        None,
+                        #[cfg(feature = "otel")]
+                        trace,
+                    )?;
+                }
+                Some(Polled::Pending) | None => {}
+            }
+            if state.interrupted {
+                break;
+            }
+
+            // 2. Start the next queued sentence as soon as the synthesizer is
+            //    free, before the LLM is polled again. This is what makes the
+            //    first `synthesize` precede the LLM's last delta.
+            if state.tts.is_none() {
+                if let Some(sentence) = self.pipeline.pop() {
+                    progressed = true;
+                    self.start_pipelined_synthesis(
+                        &mut state,
+                        sentence,
+                        &token,
+                        #[cfg(feature = "otel")]
+                        trace,
+                    )
+                    .await?;
+                }
+            }
+
+            // 3. Poll the LLM once. Once it has ended it must not be treated as
+            //    "ready" again, or the `progressed` fast path would spin
+            //    without ever reaching the `await` that yields to the executor.
+            let llm_item = if state.llm_done {
+                Polled::Pending
+            } else {
+                poll_stream_once(&mut llm)
+            };
+            match llm_item {
+                Polled::Item(item) => {
+                    progressed = true;
+                    self.handle_pipeline_llm_item(
+                        turn,
+                        &mut state,
+                        Some(item),
+                        #[cfg(feature = "otel")]
+                        trace,
+                    )?;
+                }
+                Polled::Ended => {
+                    progressed = true;
+                    self.handle_pipeline_llm_item(
+                        turn,
+                        &mut state,
+                        None,
+                        #[cfg(feature = "otel")]
+                        trace,
+                    )?;
+                }
+                Polled::Pending => {}
+            }
+            if state.interrupted {
+                break;
+            }
+
+            // 4. Start a sentence this delta just completed, again before the
+            //    next LLM poll.
+            if state.tts.is_none() {
+                if let Some(sentence) = self.pipeline.pop() {
+                    progressed = true;
+                    self.start_pipelined_synthesis(
+                        &mut state,
+                        sentence,
+                        &token,
+                        #[cfg(feature = "otel")]
+                        trace,
+                    )
+                    .await?;
+                }
+            }
+
+            if state.llm_done && state.tts.is_none() && self.pipeline.is_empty() {
+                break;
+            }
+            if progressed {
+                continue;
+            }
+
+            // 5. Neither side was ready this pass. Await whichever side can
+            //    make progress; when both are live, `select` re-registers both
+            //    wakers so no wakeup is lost. A `now_or_never`-only loop would
+            //    busy-spin here.
+            let ready = if let Some(stream) = state.tts.as_mut() {
+                if state.llm_done {
+                    ReadyItem::Tts(stream.next().await)
+                } else {
+                    let llm_next = llm.next();
+                    let tts_next = stream.next();
+                    match futures_util::future::select(llm_next, tts_next).await {
+                        futures_util::future::Either::Left((item, pending)) => {
+                            drop(pending);
+                            ReadyItem::Llm(item)
+                        }
+                        futures_util::future::Either::Right((item, pending)) => {
+                            drop(pending);
+                            ReadyItem::Tts(item)
+                        }
+                    }
+                }
+            } else {
+                // No synthesis in flight; the LLM is the only live source.
+                ReadyItem::Llm(llm.next().await)
+            };
+            match ready {
+                ReadyItem::Llm(item) => {
+                    self.handle_pipeline_llm_item(
+                        turn,
+                        &mut state,
+                        item,
+                        #[cfg(feature = "otel")]
+                        trace,
+                    )?;
+                }
+                ReadyItem::Tts(item) => {
+                    self.handle_pipeline_tts_item(
+                        turn,
+                        &mut state,
+                        item,
+                        #[cfg(feature = "otel")]
+                        trace,
+                    )?;
+                }
+            }
+        }
+
+        #[cfg(feature = "otel")]
+        {
+            if let Some(mut span) = state.trace.llm_span.take() {
+                span.set_attribute(KeyValue::new(
+                    "reply.chars",
+                    counter(to_u64(state.reply.chars().count())),
+                ));
+                span.set_attribute(KeyValue::new(
+                    "reply.deltas",
+                    counter(to_u64(state.delta_count)),
+                ));
+                span.end();
+            }
+            if let Some(mut span) = state.trace.playout_span.take() {
+                let output = self.output.stats();
+                let dropped = output.dropped.saturating_sub(baseline.output.dropped);
+                span.set_attribute(KeyValue::new("playout.frames", counter(state.audio_frames)));
+                span.set_attribute(KeyValue::new("playout.dropped_frames", counter(dropped)));
+                span.end();
+            }
+            // An in-flight synthesis still owns its stage span; close it now so
+            // the span timeline ends with the phase rather than relying on the
+            // drop order of local state.
+            if let Some(span) = state.trace.tts_stage.take() {
+                span.end();
+            }
+        }
+
+        if !state.reply_started && !state.interrupted {
+            return self.fail(ParlevoxError::Protocol(
+                "llm produced no reply deltas".into(),
+            ));
+        }
+
+        // Move the reply out instead of cloning it; the state is torn down at
+        // return, which drops any still-in-flight synthesis stream.
+        let reply = std::mem::take(&mut state.reply);
+        Ok(PhaseOutcome {
+            reply,
+            audio_frames: state.audio_frames,
+            interrupted: state.interrupted,
+        })
+    }
+
+    /// Handle one item from the in-flight synthesis stream.
+    fn handle_pipeline_tts_item(
+        &mut self,
+        turn: u64,
+        state: &mut PipelinePhaseState,
+        item: Option<Result<AudioChunk, ParlevoxError>>,
+        #[cfg(feature = "otel")] trace: &TurnTrace,
+    ) -> Result<(), ParlevoxError> {
+        match item {
+            None => {
+                // The stream reached its end: count the completed request and
+                // close its stage span. Dropping the stream here is what tells
+                // a logged fake this was completion, not cancellation.
+                self.pipeline.record_synthesized();
+                #[cfg(feature = "otel")]
+                if let Some(mut span) = state.trace.tts_stage.take() {
+                    span.set_attribute(KeyValue::new(
+                        "audio.frames",
+                        counter(state.request_frames),
+                    ));
+                    span.end();
+                }
+                state.request_frames = 0;
+                state.tts = None;
+            }
+            Some(Ok(chunk)) => {
+                #[cfg(feature = "otel")]
+                if !state.trace.saw_audio_chunk {
+                    state.trace.saw_audio_chunk = true;
+                    trace.set_attribute(KeyValue::new(
+                        "tts.first_audio_ms",
+                        millis(self.clock.now().since(state.trace.phase_started)),
+                    ));
+                }
+                let frames = self.push_playout_chunk(turn, chunk)?;
+                state.audio_frames = state.audio_frames.saturating_add(frames);
+                state.request_frames = state.request_frames.saturating_add(frames);
+            }
+            Some(Err(ParlevoxError::Cancelled)) => state.interrupted = true,
+            Some(Err(err)) => return self.fail(err),
+        }
+        Ok(())
+    }
+
+    /// Handle one item from the LLM stream, splitting it into sentences.
+    fn handle_pipeline_llm_item(
+        &mut self,
+        turn: u64,
+        state: &mut PipelinePhaseState,
+        item: Option<Result<String, ParlevoxError>>,
+        #[cfg(feature = "otel")] trace: &TurnTrace,
+    ) -> Result<(), ParlevoxError> {
+        match item {
+            None => {
+                state.llm_done = true;
+                #[cfg(feature = "otel")]
+                if let Some(mut span) = state.trace.llm_span.take() {
+                    span.set_attribute(KeyValue::new(
+                        "reply.chars",
+                        counter(to_u64(state.reply.chars().count())),
+                    ));
+                    span.set_attribute(KeyValue::new(
+                        "reply.deltas",
+                        counter(to_u64(state.delta_count)),
+                    ));
+                    span.end();
+                }
+                if let Some(rest) = state.splitter.flush() {
+                    // The splitter keeps the byte-exact partition, so a
+                    // whitespace-only remainder is dropped at the one
+                    // pre-synthesis gate in `enqueue_sentence` rather than
+                    // duplicated here.
+                    self.enqueue_sentence(rest);
+                }
+            }
+            Some(Ok(delta)) => {
+                if !state.reply_started {
+                    self.apply(TurnEvent::ReplyStarted)?;
+                    state.reply_started = true;
+                }
+                #[cfg(feature = "otel")]
+                if state.delta_count == 0 {
+                    trace.set_attribute(KeyValue::new(
+                        "llm.first_delta_ms",
+                        millis(self.clock.now().since(state.trace.phase_started)),
+                    ));
+                }
+                let completed = state.splitter.push_delta(&delta);
+                state.reply.push_str(&delta);
+                state.delta_count += 1;
+                self.emit(SessionEvent::ReplyDelta { turn, text: delta })?;
+                if self.config.barge_in_after_deltas == Some(state.delta_count) {
+                    self.request_barge_in()?;
+                    state.interrupted = true;
+                    return Ok(());
+                }
+                for sentence in completed {
+                    self.enqueue_sentence(sentence);
+                }
+            }
+            Some(Err(ParlevoxError::Cancelled)) => state.interrupted = true,
+            Some(Err(err)) => return self.fail(err),
+        }
+        Ok(())
+    }
+
+    /// Queue one completed sentence, observing (and tracing) a bounded drop.
+    ///
+    /// A whitespace-only unit never reaches the TTS provider: fakes and real
+    /// adapters both reject empty text, and such a unit carries no audio. This
+    /// is the last gate before synthesis, so no other caller can bypass it.
+    fn enqueue_sentence(&mut self, sentence: String) {
+        if sentence.trim().is_empty() {
+            tracing::trace!(
+                target: "parlevox_runtime",
+                "skipping whitespace-only sentence before synthesis"
+            );
+            return;
+        }
+        match self.pipeline.push(sentence) {
+            PushOutcome::Accepted | PushOutcome::Replaced => {}
+            PushOutcome::Dropped => {
+                tracing::trace!(
+                    target: "parlevox_runtime",
+                    "sentence queue dropped an incoming sentence"
+                );
+            }
+        }
+    }
+
+    /// Issue one synthesis request for `text` and keep its stream in flight.
+    async fn start_pipelined_synthesis(
+        &mut self,
+        state: &mut PipelinePhaseState,
+        text: String,
+        token: &CancellationToken,
+        #[cfg(feature = "otel")] trace: &TurnTrace,
+    ) -> Result<(), ParlevoxError> {
+        #[cfg(feature = "otel")]
+        let index = state.sentence_index;
+        state.sentence_index = state.sentence_index.saturating_add(1);
+        #[cfg(feature = "otel")]
+        {
+            let mut span = trace.stage("tts", self.clock.now());
+            span.set_attribute(KeyValue::new("tts.sentence_index", counter(index)));
+            span.set_attribute(KeyValue::new(
+                "tts.sentence_chars",
+                counter(to_u64(text.chars().count())),
+            ));
+            state.trace.tts_stage = Some(span);
+        }
+        let request = SynthesizeRequest {
+            text,
+            sample_rate: self.config.sample_rate,
+            channels: self.config.channels,
+        };
+        let tts_provider = Arc::clone(&self.providers.tts);
+        match tts_provider.synthesize(request, token.clone()).await {
+            Ok(stream) => {
+                state.request_frames = 0;
+                state.tts = Some(stream);
+                Ok(())
+            }
+            Err(err) => self.fail(err),
+        }
+    }
+
+    /// Push one synthesized chunk into the bounded playout ring and drain the
+    /// ring in order, returning the number of frames emitted.
+    fn push_playout_chunk(&mut self, turn: u64, chunk: AudioChunk) -> Result<u64, ParlevoxError> {
+        let ts = self.clock.now();
+        match self.output.push(chunk.to_frame(ts)) {
+            PushOutcome::Accepted | PushOutcome::Replaced => {}
+            PushOutcome::Dropped => {
+                tracing::trace!(
+                    target: "parlevox_runtime",
+                    "playout ring rejected an audio frame"
+                );
+            }
+        }
+        let mut frames = 0u64;
+        while let Some(played) = self.output.pop() {
+            frames += 1;
+            self.emit(SessionEvent::AudioOut {
+                turn,
+                frame: played,
+            })?;
+        }
+        Ok(frames)
     }
 
     /// Enqueue one event under the bounded-queue policy. Droppable overflow is
@@ -1295,6 +1978,40 @@ mod tests {
             Ok(_) => panic!("expected zero event capacity to be rejected"),
         };
         assert!(matches!(err, ParlevoxError::Protocol(_)));
+    }
+
+    #[test]
+    fn zero_pipeline_bounds_are_rejected_at_construction() {
+        for (config, bound) in [
+            (
+                SessionConfig {
+                    pipeline_queue_capacity: 0,
+                    ..SessionConfig::default()
+                },
+                "pipeline_queue_capacity",
+            ),
+            (
+                SessionConfig {
+                    pipeline_max_sentence_chars: 0,
+                    ..SessionConfig::default()
+                },
+                "pipeline_max_sentence_chars",
+            ),
+        ] {
+            let providers = ProviderRegistry::fakes()
+                .unwrap()
+                .resolve(&Default::default())
+                .unwrap();
+            let err = match Session::new(config, providers) {
+                Err(err) => err,
+                Ok(_) => panic!("expected zero {bound} to be rejected"),
+            };
+            assert!(matches!(err, ParlevoxError::Protocol(_)));
+            assert!(
+                err.to_string().contains(bound),
+                "error must name {bound}: {err}"
+            );
+        }
     }
 
     #[test]

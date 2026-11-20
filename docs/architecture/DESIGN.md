@@ -94,10 +94,21 @@ deterministic — no task is killed from outside and no provider future is left
 dangling. The runtime reports the interrupted turn as `TurnDone { interrupted:
 true }`.
 
-**v0 is half-duplex.** The next stage does not start until the previous one
-finishes. Early-start and pipelined decoding (synthesizing before the
-transcript is final, overlapping LLM deltas with TTS) are deliberately not
-implemented — see the ADR's "Non-goals for v0".
+**The default turn is half-duplex.** The next stage does not start until the
+previous one finishes. Early-start STT (synthesizing before the transcript is
+final) remains deliberately unimplemented — see the ADR's "Non-goals for v0".
+
+The reply side has one opt-in exception, `SessionConfig::pipelined_tts`
+(default `false`). With it enabled, the reply is split on sentence boundaries
+as deltas arrive and each completed sentence is synthesized while the LLM is
+still producing the rest. This is `pipelined_tts`, not early-start: it never
+synthesizes from a partial transcript, and it does not overlap STT with
+anything. The handoff from the delta producer to the synthesizer is a bounded
+FIFO sentence queue that drops the incoming sentence under overload and counts
+it (`Session::pipeline_stats`); the in-flight synthesis stream stays on the
+turn future, so a barge-in tears it down structurally with no spawned task.
+With the flag off, the turn loop is the sequential one described above — same
+provider calls, order, events and span shape.
 
 ## 4. Invariants (the reason this exists)
 
@@ -189,12 +200,18 @@ What remains open:
 - Producers cannot observe backpressure — there are no credits; overflow is
   handled by dropping, not by slowing the producer (see ADR §"Backpressure
   and loss accounting", which records this as deliberate for v0.1).
-- Half-duplex turn model (see §3 and the ADR's "Non-goals for v0").
+- Half-duplex turn model by default (see §3 and the ADR's "Non-goals for v0").
+  Reply-side `pipelined_tts` exists behind an opt-in flag; early-start STT
+  (synthesis before the final transcript) remains unimplemented. The pipelined
+  sentence handoff is bounded and its drops are counted through
+  `Session::pipeline_stats`.
 - No warm plugin pool: one plugin process per session (dimension 2, partial).
 - Turn spans exist but are opt-in: `cargo build -p parlevox-runtime --features otel`
   emits one `turn` root span with `vad`, `stt`, `llm`, `tts` and `playout`
   children plus MonoClock-derived boundary-cost attributes, and the default
-  build still carries no OpenTelemetry dependency. There is no OTLP exporter
+  build still carries no OpenTelemetry dependency. With `pipelined_tts` on,
+  the `llm` and per-sentence `tts` spans honestly overlap; the span timeline is
+  not serialized to preserve the sequential shape. There is no OTLP exporter
   configuration, no collector wiring, and no OTel metrics in v0 — the caller
   installs a tracer or passes one to `Session::with_tracer` (dimension 7 is
   implemented for spans, not for an export pipeline).

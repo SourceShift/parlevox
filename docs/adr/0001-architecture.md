@@ -82,10 +82,15 @@ The contract is uniform across paths:
    capacity-bounded: an entry exists only while its request is open and is
    removed on `audio_end` or `cancel`. The one ledger that outlives requests —
    cancelled request ids — is explicitly bounded (point 4), so a client that
-   cancels and walks away cannot grow it forever.
-2. **Push returns a typed outcome the producer branches on.** `AudioRing::push`
-   and `EventQueue::push` report `Accepted`, `Replaced` (an older entry was
-   evicted), or `Dropped` (the incoming entry was rejected). A producer either
+   cancels and walks away cannot grow it forever. The opt-in `pipelined_tts`
+   path adds one more bounded handoff: a FIFO sentence queue from the LLM delta
+   producer to the synthesizer. It uses `DropNewest` because evicting the head
+   would speak the remaining sentences out of reply order; drops are counted
+   and exposed with depth and capacity through `Session::pipeline_stats`.
+2. **Push returns a typed outcome the producer branches on.** `AudioRing::push`,
+   `EventQueue::push` and the pipelined `SentenceQueue::push` report
+   `Accepted`, `Replaced` (an older entry was evicted), or `Dropped` (the
+   incoming entry was rejected). A producer either
    observes a drop and keeps going, or receives a loud `Protocol` error for a
    control-lane refusal that must fail the turn. Silent truncation is not an
    option.
@@ -132,12 +137,21 @@ in-process. Rejected; the sidecar is an escape hatch, not the architecture.
 
 ## Non-goals for v0
 
-The v0 turn model is **half-duplex**: one turn runs VAD → STT → LLM → TTS in
-sequence, and the next stage does not begin until the previous one finishes.
-Early-start and pipelined decoding — starting synthesis before the transcript is
-final, or overlapping LLM deltas with TTS — are a v0.1 item. They are explicitly
-**not implemented** in this version, and the sequential turn loop should not be
-read as providing them.
+The default v0 turn model is **half-duplex**: one turn runs VAD → STT → LLM →
+TTS in sequence, and the next stage does not begin until the previous one
+finishes.
+
+One narrow exception is opt-in: `SessionConfig::pipelined_tts` (default
+`false`) lets the reply side start synthesizing a completed sentence while the
+LLM is still producing the rest. That is reply-side pipelining only. It does
+not read a partial transcript, does not start STT early, and does not overlap
+listening with speaking; with the flag off the sequential turn loop is exactly
+today's behaviour.
+
+**Early-start STT remains a non-goal for this version.** Starting synthesis
+before the transcript is final — or from partial transcripts at all — is
+explicitly **not implemented**, and neither the sequential turn loop nor the
+opt-in `pipelined_tts` mode should be read as providing it.
 
 ## Consequences
 
