@@ -233,13 +233,16 @@ pub async fn demo_sidecar_pooled() -> Result<(), ParlevoxError> {
     pool.shutdown().await;
     let stats = pool.stats();
     eprintln!(
-        "pool spawned={} reused={} evicted={} shutdown={} reset_failures={} expired={}",
+        "pool spawned={} reused={} evicted={} shutdown={} reset_failures={} expired={} \
+         release_refused={} retired={}",
         stats.spawned,
         stats.reused,
         stats.evicted,
         stats.shutdown,
         stats.reset_failures,
-        stats.expired
+        stats.expired,
+        stats.release_refused,
+        stats.retired
     );
     turns
 }

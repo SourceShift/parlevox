@@ -16,7 +16,7 @@ pub use config::{
 };
 pub use pool::{
     IdleEntry, IdleQueue, PoolConfig, PoolLease, PoolStats, PoolStatsSnapshot, PushOutcome,
-    SidecarPool, TakeOutcome,
+    RefusalReason, SidecarPool, TakeOutcome,
 };
 pub use provider::{SidecarLlm, SidecarStt, SidecarTts};
 pub use supervisor::{RestartPolicy, SidecarSupervisor};

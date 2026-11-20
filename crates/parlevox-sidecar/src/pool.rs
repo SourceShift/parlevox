@@ -11,6 +11,10 @@
 //! whose acquire-time probe reset fails is killed, counted, and replaced by a
 //! fresh spawn — it is never handed out dirty.
 //!
+//! A process is also retired after it has served [`PoolConfig::max_reuses`]
+//! pooled returns, so a plugin that accumulates state across `reset` calls is
+//! replaced instead of being reused forever.
+//!
 //! Reset runs twice per reuse: once on release, so only a process that proved
 //! it can clear itself enters the idle queue, and once on acquire, which is the
 //! only authoritative liveness and cleanliness check before handover. That is
@@ -37,6 +41,10 @@ pub struct PoolConfig {
     /// Maximum time a process may sit idle. Age is checked at lease time: a
     /// process older than this is shut down rather than handed out.
     pub max_age: Duration,
+    /// Maximum number of pooled returns a single process may serve before it
+    /// is retired instead of pooled again. Unlike [`PoolConfig::max_idle`],
+    /// where `0` disables pooling, `0` here means **unlimited**.
+    pub max_reuses: u64,
 }
 
 impl Default for PoolConfig {
@@ -44,15 +52,23 @@ impl Default for PoolConfig {
         PoolConfig {
             max_idle: 2,
             max_age: Duration::from_secs(60),
+            max_reuses: 64,
         }
     }
 }
 
 impl PoolConfig {
     /// Build a configuration with an explicit idle cap and age ceiling.
+    ///
+    /// [`PoolConfig::max_reuses`] keeps its default; use
+    /// [`PoolConfig::with_max_reuses`] to change it.
     #[must_use]
     pub fn new(max_idle: usize, max_age: Duration) -> Self {
-        PoolConfig { max_idle, max_age }
+        PoolConfig {
+            max_idle,
+            max_age,
+            ..PoolConfig::default()
+        }
     }
 
     /// Return this configuration with a different [`PoolConfig::max_idle`].
@@ -68,6 +84,15 @@ impl PoolConfig {
         self.max_age = max_age;
         self
     }
+
+    /// Return this configuration with a different [`PoolConfig::max_reuses`].
+    ///
+    /// `0` means unlimited, the opposite of [`PoolConfig::max_idle`]'s `0`.
+    #[must_use = "builder methods return a modified config; chain or assign the result"]
+    pub fn with_max_reuses(mut self, max_reuses: u64) -> Self {
+        self.max_reuses = max_reuses;
+        self
+    }
 }
 
 /// One idle client plus the instant it became idle.
@@ -80,14 +105,43 @@ pub struct IdleEntry<T> {
     pub client: T,
     /// The instant the client became idle, used to enforce the age ceiling.
     pub since: Instant,
+    /// Accepted pooled returns this process has served. A fresh spawn starts at
+    /// `0`; each accepted [`IdleQueue::push`] increments it by one.
+    pub reuses: u64,
 }
 
 impl<T> IdleEntry<T> {
     /// Pair a client with the instant it became idle.
+    ///
+    /// The reuse count starts at `0`; use [`IdleEntry::with_reuses`] to restore
+    /// a process's history when it is offered back to the queue.
     #[must_use]
     pub fn new(client: T, since: Instant) -> Self {
-        IdleEntry { client, since }
+        IdleEntry {
+            client,
+            since,
+            reuses: 0,
+        }
     }
+
+    /// Return this entry with a different [`IdleEntry::reuses`] count.
+    #[must_use = "builder methods return a modified entry; chain or assign the result"]
+    pub fn with_reuses(mut self, reuses: u64) -> Self {
+        self.reuses = reuses;
+        self
+    }
+}
+
+/// Why [`IdleQueue::push`] refused an offered entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RefusalReason {
+    /// Pooling is disabled (`max_idle == 0`) or the entry is already at or past
+    /// the age ceiling. This keeps the historical `shutdown` fate.
+    Configuration,
+    /// The process has served [`PoolConfig::max_reuses`] pooled returns, so it
+    /// is retired rather than pooled again.
+    Retirement,
 }
 
 /// What [`IdleQueue::push`] did with an offered entry.
@@ -100,8 +154,20 @@ pub struct PushOutcome<T> {
     /// Entries displaced to stay within the idle cap. At most one.
     pub displaced: Vec<T>,
     /// The offered entry, returned unchanged when the queue refuses it because
-    /// pooling is disabled or it is already past the age ceiling.
+    /// pooling is disabled, it is already past the age ceiling, or it has
+    /// reached its reuse ceiling.
     pub refused: Option<IdleEntry<T>>,
+    /// Why the entry was refused. `Some` exactly when [`PushOutcome::refused`]
+    /// is `Some`, because both are set by the same refusal branch.
+    refusal: Option<RefusalReason>,
+}
+
+impl<T> PushOutcome<T> {
+    /// Why the offered entry was refused, or `None` when it was accepted.
+    #[must_use]
+    pub fn refusal_reason(&self) -> Option<RefusalReason> {
+        self.refusal
+    }
 }
 
 /// What [`IdleQueue::take`] found.
@@ -124,17 +190,29 @@ pub struct IdleQueue<T> {
     entries: VecDeque<IdleEntry<T>>,
     max_idle: usize,
     max_age: Duration,
+    max_reuses: u64,
 }
 
 impl<T> IdleQueue<T> {
     /// Create an empty queue bounded by an idle cap and an age ceiling.
+    ///
+    /// The reuse ceiling defaults to `0`, meaning unlimited; use
+    /// [`IdleQueue::with_max_reuses`] to bound it.
     #[must_use]
     pub fn new(max_idle: usize, max_age: Duration) -> Self {
         IdleQueue {
             entries: VecDeque::new(),
             max_idle,
             max_age,
+            max_reuses: 0,
         }
+    }
+
+    /// Return this queue with a per-process reuse ceiling. `0` means unlimited.
+    #[must_use = "builder methods return a modified queue; chain or assign the result"]
+    pub fn with_max_reuses(mut self, max_reuses: u64) -> Self {
+        self.max_reuses = max_reuses;
+        self
     }
 
     /// Number of entries currently parked in the queue.
@@ -151,19 +229,30 @@ impl<T> IdleQueue<T> {
 
     /// Offer `entry` to the queue at `now`.
     ///
-    /// This is the single home of the refusal rule: an entry is refused when
-    /// pooling is disabled or it is already at or past the age ceiling. An
-    /// accepted entry may still displace the oldest one to respect the idle
-    /// cap. Every client the queue did not retain is returned for the caller to
-    /// shut down.
+    /// This is the single home of the refusal rule. An entry is first refused
+    /// for [`RefusalReason::Configuration`] when pooling is disabled or it is
+    /// already at or past the age ceiling, then for
+    /// [`RefusalReason::Retirement`] when it has reached the reuse ceiling. An
+    /// accepted entry has its [`IdleEntry::reuses`] count incremented and may
+    /// still displace the oldest one to respect the idle cap. Every client the
+    /// queue did not retain is returned for the caller to shut down.
     #[must_use = "the outcome carries clients the caller must shut down"]
-    pub fn push(&mut self, entry: IdleEntry<T>, now: Instant) -> PushOutcome<T> {
+    pub fn push(&mut self, mut entry: IdleEntry<T>, now: Instant) -> PushOutcome<T> {
         if self.max_idle == 0 || now.saturating_duration_since(entry.since) >= self.max_age {
             return PushOutcome {
                 displaced: Vec::new(),
                 refused: Some(entry),
+                refusal: Some(RefusalReason::Configuration),
             };
         }
+        if self.max_reuses != 0 && entry.reuses >= self.max_reuses {
+            return PushOutcome {
+                displaced: Vec::new(),
+                refused: Some(entry),
+                refusal: Some(RefusalReason::Retirement),
+            };
+        }
+        entry.reuses = entry.reuses.saturating_add(1);
         if self.entries.len() >= self.max_idle {
             let displaced: Vec<T> = self
                 .entries
@@ -175,12 +264,14 @@ impl<T> IdleQueue<T> {
             return PushOutcome {
                 displaced,
                 refused: None,
+                refusal: None,
             };
         }
         self.entries.push_back(entry);
         PushOutcome {
             displaced: Vec::new(),
             refused: None,
+            refusal: None,
         }
     }
 
@@ -220,6 +311,7 @@ pub struct PoolStats {
     expired: AtomicU64,
     evicted: AtomicU64,
     shutdown: AtomicU64,
+    retired: AtomicU64,
 }
 
 /// A point-in-time copy of [`PoolStats`].
@@ -241,9 +333,14 @@ pub struct PoolStatsSnapshot {
     /// reached. A release refused by configuration is not counted here.
     pub evicted: u64,
     /// Processes shut down without being pooled: a non-reset-capable release,
-    /// a release the configuration refuses (an idle cap or age ceiling of
-    /// zero), or [`SidecarPool::shutdown`].
+    /// a release the configuration refuses (pooling disabled or the age
+    /// ceiling), or [`SidecarPool::shutdown`]. A retirement is counted
+    /// separately in [`PoolStatsSnapshot::retired`].
     pub shutdown: u64,
+    /// Processes shut down because they reached [`PoolConfig::max_reuses`]
+    /// pooled returns. A retirement is not counted in
+    /// [`PoolStatsSnapshot::shutdown`].
+    pub retired: u64,
 }
 
 impl PoolStats {
@@ -258,6 +355,7 @@ impl PoolStats {
             expired: self.expired.load(Ordering::Relaxed),
             evicted: self.evicted.load(Ordering::Relaxed),
             shutdown: self.shutdown.load(Ordering::Relaxed),
+            retired: self.retired.load(Ordering::Relaxed),
         }
     }
 
@@ -283,7 +381,10 @@ impl SidecarPool {
     pub fn new(config: SidecarConfig, pool_config: PoolConfig) -> Self {
         SidecarPool {
             config,
-            queue: Mutex::new(IdleQueue::new(pool_config.max_idle, pool_config.max_age)),
+            queue: Mutex::new(
+                IdleQueue::new(pool_config.max_idle, pool_config.max_age)
+                    .with_max_reuses(pool_config.max_reuses),
+            ),
             stats: PoolStats::default(),
         }
     }
@@ -315,11 +416,12 @@ impl SidecarPool {
         }
 
         if let Some(entry) = entry {
+            let reuses = entry.reuses;
             let client = entry.client;
             match client.reset().await {
                 Ok(()) => {
                     PoolStats::bump(&self.stats.reused);
-                    return Ok(PoolLease::new(client, Arc::clone(self)));
+                    return Ok(PoolLease::new(client, Arc::clone(self), reuses));
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -335,7 +437,7 @@ impl SidecarPool {
 
         let client = Arc::new(SidecarClient::spawn(self.config.clone()).await?);
         PoolStats::bump(&self.stats.spawned);
-        Ok(PoolLease::new(client, Arc::clone(self)))
+        Ok(PoolLease::new(client, Arc::clone(self), 0))
     }
 
     /// Shut down every idle process. Leases still outstanding are not touched;
@@ -354,7 +456,14 @@ impl SidecarPool {
     }
 
     /// Return one lease's process to the pool, or shut it down.
-    async fn release_client(&self, client: Arc<SidecarClient>) -> Result<(), ParlevoxError> {
+    ///
+    /// `reuses` is how many pooled returns the process has already served, so
+    /// the queue alone decides whether this return retires it.
+    async fn release_client(
+        &self,
+        client: Arc<SidecarClient>,
+        reuses: u64,
+    ) -> Result<(), ParlevoxError> {
         if !client.supports_reset() {
             // Today's lifecycle for a plugin built before the capability:
             // one process per session.
@@ -364,10 +473,13 @@ impl SidecarPool {
         match client.reset().await {
             Ok(()) => {
                 let now = Instant::now();
+                let entry = IdleEntry::new(client, now).with_reuses(reuses);
                 let outcome = {
                     let mut queue = self.queue.lock().await;
-                    queue.push(IdleEntry::new(client, now), now)
+                    queue.push(entry, now)
                 };
+                // Capture the typed reason before moving `outcome.refused`.
+                let reason = outcome.refusal_reason();
                 for victim in outcome.displaced {
                     PoolStats::bump(&self.stats.evicted);
                     if victim.shutdown().await.is_err() {
@@ -375,10 +487,20 @@ impl SidecarPool {
                     }
                 }
                 if let Some(entry) = outcome.refused {
-                    // The configuration refuses this release, so the process is
-                    // shut down without ever being pooled. That is the
-                    // documented meaning of `shutdown`, not a cap displacement.
-                    PoolStats::bump(&self.stats.shutdown);
+                    // The queue refused this release, so the process is shut
+                    // down without ever being pooled. The reason selects the
+                    // counter: reaching the reuse ceiling is a retirement,
+                    // everything else keeps the historical `shutdown` fate. A
+                    // missing reason cannot occur while `refused` is `Some`,
+                    // but it is mapped to `shutdown` rather than panicking.
+                    match reason {
+                        Some(RefusalReason::Retirement) => {
+                            PoolStats::bump(&self.stats.retired);
+                        }
+                        Some(RefusalReason::Configuration) | None => {
+                            PoolStats::bump(&self.stats.shutdown);
+                        }
+                    }
                     if entry.client.shutdown().await.is_err() {
                         entry.client.kill().await;
                     }
@@ -401,14 +523,18 @@ impl SidecarPool {
 pub struct PoolLease {
     client: Arc<SidecarClient>,
     pool: Arc<SidecarPool>,
+    /// Pooled returns this process has already served, carried from its idle
+    /// entry (or `0` for a fresh spawn) so a release can be classified.
+    reuses: u64,
     released: bool,
 }
 
 impl PoolLease {
-    fn new(client: Arc<SidecarClient>, pool: Arc<SidecarPool>) -> Self {
+    fn new(client: Arc<SidecarClient>, pool: Arc<SidecarPool>, reuses: u64) -> Self {
         PoolLease {
             client,
             pool,
+            reuses,
             released: false,
         }
     }
@@ -479,7 +605,8 @@ impl PoolLease {
         // dropping the future detaches the release instead of aborting it.
         let pool = Arc::clone(&self.pool);
         let client = Arc::clone(&self.client);
-        let detached = runtime.spawn(async move { pool.release_client(client).await });
+        let reuses = self.reuses;
+        let detached = runtime.spawn(async move { pool.release_client(client, reuses).await });
         // Only mark the lease handed over once the task exists; if anything
         // above failed, `Drop` still owns the process and kills it.
         self.released = true;
@@ -596,6 +723,50 @@ mod tests {
         assert!(refused.displaced.is_empty());
         assert_eq!(refused.refused.map(|entry| entry.client), Some(8));
         assert!(disabled.is_empty());
+    }
+
+    #[test]
+    fn push_counts_each_accepted_return_as_one_reuse() {
+        let mut queue = IdleQueue::new(4, Duration::from_secs(60));
+        let base = Instant::now();
+        assert!(queue.push(entry(1, base), base).refused.is_none());
+
+        let taken = queue.take(base).entry.expect("the entry is pooled");
+        assert_eq!(taken.reuses, 1, "an accepted return counts as one reuse");
+
+        assert!(queue.push(taken, base).refused.is_none());
+        let taken = queue.take(base).entry.expect("the entry is pooled");
+        assert_eq!(taken.reuses, 2, "each accepted return increments the count");
+    }
+
+    #[test]
+    fn push_retires_an_entry_at_the_reuse_ceiling() {
+        let mut queue = IdleQueue::new(4, Duration::from_secs(60)).with_max_reuses(2);
+        let base = Instant::now();
+
+        // Two accepted returns fit under the ceiling and are counted.
+        assert!(queue.push(entry(1, base), base).refused.is_none());
+        let taken = queue.take(base).entry.expect("the entry is pooled");
+        assert_eq!(taken.reuses, 1);
+        assert!(queue.push(taken, base).refused.is_none());
+        let taken = queue.take(base).entry.expect("the entry is pooled");
+        assert_eq!(taken.reuses, 2);
+
+        // The next return reaches the ceiling and is refused as a retirement.
+        let outcome = queue.push(taken, base);
+        assert_eq!(outcome.refusal_reason(), Some(RefusalReason::Retirement));
+        assert!(outcome.displaced.is_empty());
+        assert_eq!(outcome.refused.map(|entry| entry.client), Some(1));
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn push_reports_a_configuration_refusal_reason() {
+        let base = Instant::now();
+        let mut disabled = IdleQueue::new(0, Duration::from_secs(60));
+        let refused = disabled.push(entry(1, base), base);
+        assert_eq!(refused.refusal_reason(), Some(RefusalReason::Configuration));
+        assert_eq!(refused.refused.map(|entry| entry.client), Some(1));
     }
 
     #[test]
