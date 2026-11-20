@@ -10,6 +10,7 @@
 //! runtime tests deterministic and Python-free.
 
 pub mod fakes;
+pub mod fallback;
 pub mod manifest;
 pub mod stream;
 pub mod traits;
@@ -19,6 +20,7 @@ pub use fakes::{
     FAKE_FRAME_MS, FAKE_FRAME_SAMPLES, FAKE_LLM_DELTAS, FAKE_PARTIAL_TRANSCRIPT, FAKE_REPLY,
     FAKE_SAMPLE_RATE, FAKE_TRANSCRIPT, FAKE_TTS_FRAMES,
 };
+pub use fallback::{FallbackLlm, FallbackStats, FallbackStatsSnapshot, FallbackTts};
 pub use manifest::{Modality, ProviderManifest};
 pub use stream::cancelable_stream;
 pub use traits::{
