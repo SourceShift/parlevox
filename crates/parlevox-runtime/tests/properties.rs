@@ -9,7 +9,7 @@
 //! rest of the workspace.
 
 use parlevox_core::{OverflowPolicy, ParlevoxError};
-use parlevox_runtime::{EventPushOutcome, EventQueue, SessionEvent};
+use parlevox_runtime::{EventPushOutcome, EventQueue, SentenceSplitter, SessionEvent};
 use proptest::prelude::*;
 
 #[derive(Debug, Clone, Copy)]
@@ -74,6 +74,32 @@ fn is_control(event: &SessionEvent) -> bool {
             | SessionEvent::TurnDone { .. }
             | SessionEvent::Failed { .. }
     )
+}
+
+/// Text with no terminal punctuation, so the splitter can only emit through
+/// its bounded force-split path.
+fn punctuation_free() -> impl Strategy<Value = String> {
+    prop::collection::vec(
+        prop_oneof![
+            prop::char::range('a', 'z'),
+            prop::char::range('0', '9'),
+            Just(' '),
+        ],
+        0..200,
+    )
+    .prop_map(|chars| chars.into_iter().collect())
+}
+
+fn split_all(max_chars: usize, deltas: &[String]) -> Vec<String> {
+    let mut splitter = SentenceSplitter::new(max_chars).expect("max_chars is at least 1");
+    let mut emitted = Vec::new();
+    for delta in deltas {
+        emitted.extend(splitter.push_delta(delta));
+    }
+    if let Some(rest) = splitter.flush() {
+        emitted.push(rest);
+    }
+    emitted
 }
 
 proptest! {
@@ -211,6 +237,31 @@ proptest! {
         prop_assert_eq!(
             queue.push(terminal).unwrap(),
             EventPushOutcome::Accepted
+        );
+    }
+
+    #[test]
+    fn splitter_partition_is_byte_exact(
+        max_chars in 1usize..64,
+        deltas in prop::collection::vec(any::<String>(), 0..16),
+    ) {
+        let emitted = split_all(max_chars, &deltas);
+        prop_assert_eq!(emitted.concat(), deltas.concat());
+        prop_assert!(emitted.iter().all(|sentence| !sentence.is_empty()));
+    }
+
+    #[test]
+    fn splitter_forced_chunks_respect_max_chars(
+        max_chars in 1usize..64,
+        text in punctuation_free(),
+    ) {
+        let emitted = split_all(max_chars, std::slice::from_ref(&text));
+        prop_assert_eq!(emitted.concat(), text);
+        prop_assert!(
+            emitted
+                .iter()
+                .all(|sentence| sentence.chars().count() <= max_chars),
+            "a forced chunk exceeded {max_chars} characters: {emitted:?}"
         );
     }
 

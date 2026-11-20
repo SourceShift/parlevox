@@ -15,9 +15,9 @@ pub mod stream;
 pub mod traits;
 
 pub use fakes::{
-    FakeLlm, FakeStt, FakeTts, FakeVad, FAKE_CHANNELS, FAKE_FRAME_MS, FAKE_FRAME_SAMPLES,
-    FAKE_LLM_DELTAS, FAKE_PARTIAL_TRANSCRIPT, FAKE_REPLY, FAKE_SAMPLE_RATE, FAKE_TRANSCRIPT,
-    FAKE_TTS_FRAMES,
+    FakeLlm, FakeStt, FakeTts, FakeVad, ProviderCall, ProviderCallLog, FAKE_CHANNELS,
+    FAKE_FRAME_MS, FAKE_FRAME_SAMPLES, FAKE_LLM_DELTAS, FAKE_PARTIAL_TRANSCRIPT, FAKE_REPLY,
+    FAKE_SAMPLE_RATE, FAKE_TRANSCRIPT, FAKE_TTS_FRAMES,
 };
 pub use manifest::{Modality, ProviderManifest};
 pub use stream::cancelable_stream;
