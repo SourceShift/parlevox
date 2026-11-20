@@ -116,8 +116,11 @@ Tests are hermetic: no network, no API keys, no installed Python package.
 
 The remaining gaps are listed in [`DESIGN.md` §8](docs/architecture/DESIGN.md):
 producer credits (slow the producer instead of dropping), a full-duplex turn
-model, a warm plugin pool, and OTel turn spans. Beyond those: composable
-turn-taking strategies and early-start/pipelined decoding.
+model (early-start STT; reply-side `pipelined_tts` shipped behind an opt-in
+flag), and an OTel export pipeline — turn spans exist behind the `otel`
+feature, but there is no OTLP exporter configuration, collector wiring, or
+OTel metrics. Beyond those: composable turn-taking strategies and adaptive
+endpointing.
 
 ## License
 
