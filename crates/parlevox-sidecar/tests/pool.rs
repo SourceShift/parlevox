@@ -70,6 +70,32 @@ async fn pool_enforces_idle_cap() {
 }
 
 #[tokio::test]
+async fn pool_with_zero_idle_counts_configuration_refusal_as_shutdown() {
+    if !python_available() {
+        eprintln!("skipping zero-idle test: no Python interpreter");
+        return;
+    }
+
+    let pool = Arc::new(SidecarPool::new(
+        scripted("ack"),
+        PoolConfig::default().with_max_idle(0),
+    ));
+
+    let lease = pool.acquire().await.unwrap();
+    lease.release().await.unwrap();
+
+    // The configuration refuses to pool the process, so it is shut down. That
+    // is a `shutdown`, not an `evicted`: no idle entry was ever displaced.
+    let stats = pool.stats();
+    assert_eq!(stats.spawned, 1);
+    assert_eq!(stats.reused, 0);
+    assert_eq!(stats.evicted, 0);
+    assert_eq!(stats.shutdown, 1);
+
+    pool.shutdown().await;
+}
+
+#[tokio::test]
 async fn pool_expires_idle_processes_past_max_age() {
     if !python_available() {
         eprintln!("skipping max-age test: no Python interpreter");

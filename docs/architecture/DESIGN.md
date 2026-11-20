@@ -66,13 +66,14 @@ sidecar is started only when a session resolves a provider that lives there.
 A session obtains its plugin process in one of two ways. When a `SidecarPool`
 is configured, the session leases an already-handshaken process from it and
 returns the process on release; the pool performs the additive `reset`
-handshake on return, keeps at most `PoolConfig::max_idle` processes idle for at
-most `max_age`, and kills and counts a process whose acquire-time probe reset
-fails rather than handing it out dirty. Without a pool — including
-`demo --sidecar` and every existing test — the session spawns a fresh process
-and reaps it, exactly as before. `PROTOCOL_VERSION` and `SIDECAR_ABI` are
-unchanged: `reset` is an additive control message and a plugin that does not
-advertise the `reset` capability is never pooled.
+handshake on return, keeps at most `PoolConfig::max_idle` processes idle, and
+checks age at lease time: a process idle longer than `max_age` is shut down
+then and never handed out. It also kills and counts a process whose
+acquire-time probe reset fails rather than handing it out dirty. Without a
+pool — including `demo --sidecar` and every existing test — the session spawns
+a fresh process and reaps it, exactly as before. `PROTOCOL_VERSION` and
+`SIDECAR_ABI` are unchanged: `reset` is an additive control message and a
+plugin that does not advertise the `reset` capability is never pooled.
 
 ## 3. One turn
 
