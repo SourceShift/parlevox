@@ -24,8 +24,9 @@ use std::time::{Duration, SystemTime};
 use opentelemetry::global::BoxedTracer;
 use opentelemetry::trace::{Span, SpanKind, Status, TraceContextExt, Tracer};
 use opentelemetry::{Context, KeyValue};
-use parlevox_core::{DurationMs, ErrorClass, MonoClock, ParlevoxError, Timestamp};
+use parlevox_core::{DurationMs, ErrorClass, MonoClock, ParlevoxError, RingStats, Timestamp};
 
+use crate::events::EventQueueStats;
 use crate::session::TurnReport;
 
 /// The single wall-clock capture per session, paired with the monotonic clock
@@ -69,18 +70,21 @@ pub(crate) struct TurnTrace {
     cx: Context,
     started: Timestamp,
     ended: bool,
+    /// The committed turn index, once known. `None` until the turn reaches
+    /// `FinalTranscript` (or the turn ends and its outcome supplies it).
+    turn: Option<u64>,
 }
 
 impl TurnTrace {
-    /// Start the root `turn` span. `turn` is the index the turn is about to
-    /// commit.
-    pub(crate) fn start(tracer: &Arc<BoxedTracer>, clock: &TraceClock, turn: u64) -> Self {
+    /// Start the root `turn` span. The turn index is not known yet: a turn can
+    /// fail before it commits one, so [`TurnTrace::record_turn`] records it
+    /// once the state machine reports it.
+    pub(crate) fn start(tracer: &Arc<BoxedTracer>, clock: &TraceClock) -> Self {
         let started = clock.now();
         let span = tracer
             .span_builder("turn")
             .with_kind(SpanKind::Server)
             .with_start_time(clock.to_system_time(started))
-            .with_attributes([KeyValue::new("turn.index", counter(turn))])
             .start_with_context(tracer.as_ref(), &Context::current());
         TurnTrace {
             tracer: Arc::clone(tracer),
@@ -88,7 +92,37 @@ impl TurnTrace {
             cx: Context::current_with_span(span),
             started,
             ended: false,
+            turn: None,
         }
+    }
+
+    /// Record the committed turn index on the root span.
+    ///
+    /// First write wins. The turn body records the index as soon as
+    /// `FinalTranscript` commits; the error fallback that runs when a turn
+    /// fails earlier only fills in the id the next commit will report, and must
+    /// never overwrite an index the turn actually committed.
+    pub(crate) fn record_turn(&mut self, turn: u64) {
+        if self.turn.is_some() {
+            return;
+        }
+        self.turn = Some(turn);
+        self.cx
+            .span()
+            .set_attribute(KeyValue::new("turn.index", counter(turn)));
+    }
+
+    /// Record the depth and capacity of the three bounded handoffs (input,
+    /// playout, event queue) as sampled at turn end.
+    pub(crate) fn record_boundaries(
+        &self,
+        input: &RingStats,
+        playout: &RingStats,
+        events: &EventQueueStats,
+    ) {
+        self.cx
+            .span()
+            .set_attributes(boundary_attributes(input, playout, events));
     }
 
     /// Start a child stage span rooted at the turn span.
@@ -122,6 +156,12 @@ impl TurnTrace {
             return;
         }
         self.ended = true;
+        // A turn that ended before `FinalTranscript` (a pre-commit barge-in)
+        // still has a `TurnReport`; record its id so the span always matches
+        // the report. The first-write-wins rule keeps the committed id intact.
+        if let Ok(report) = result {
+            self.record_turn(report.turn);
+        }
         let span = self.cx.span();
         match result {
             Ok(report) => {
@@ -204,6 +244,27 @@ impl Drop for StageSpan {
     fn drop(&mut self) {
         self.finish();
     }
+}
+
+/// Boundary occupancy at turn end, read from the same stats structs a caller
+/// observes ([`parlevox_core::AudioRing::stats`] and
+/// [`crate::events::EventQueue::stats`]) so the span never invents a second
+/// source of truth.
+fn boundary_attributes(
+    input: &RingStats,
+    playout: &RingStats,
+    events: &EventQueueStats,
+) -> Vec<KeyValue> {
+    // A fixed six-element literal allocates exactly once, so this satisfies
+    // the known-size case without a `Vec::with_capacity` + `push` sequence.
+    vec![
+        KeyValue::new("ring.input.depth", counter(to_u64(input.depth))),
+        KeyValue::new("ring.input.capacity", counter(to_u64(input.capacity))),
+        KeyValue::new("ring.playout.depth", counter(to_u64(playout.depth))),
+        KeyValue::new("ring.playout.capacity", counter(to_u64(playout.capacity))),
+        KeyValue::new("events.depth", counter(to_u64(events.depth))),
+        KeyValue::new("events.capacity", counter(to_u64(events.capacity))),
+    ]
 }
 
 fn report_attributes(report: &TurnReport) -> Vec<KeyValue> {
