@@ -175,7 +175,7 @@ impl LlmProvider for FakeLlm {
                 .last_request
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *slot = Some(request.clone());
+            *slot = Some(request);
         }
         let items = FAKE_LLM_DELTAS
             .iter()
