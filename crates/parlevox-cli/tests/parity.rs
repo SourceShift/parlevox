@@ -132,7 +132,7 @@ async fn real_sidecar_matches_the_in_process_turn() {
     let (fake_report, fake_events) = run_fake().await;
 
     let client = Arc::new(
-        SidecarClient::spawn(SidecarConfig::python_sdk())
+        SidecarClient::spawn(SidecarConfig::python_sdk().expect("resolve the bundled SDK"))
             .await
             .expect("spawn the Python sidecar"),
     );

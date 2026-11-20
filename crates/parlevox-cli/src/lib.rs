@@ -16,7 +16,7 @@ use parlevox_runtime::{
     TurnReport,
 };
 use parlevox_sidecar::{
-    sdk_is_available, SidecarClient, SidecarConfig, SidecarLlm, SidecarStt, SidecarTts,
+    resolve_sdk_path, SdkSearch, SidecarClient, SidecarConfig, SidecarLlm, SidecarStt, SidecarTts,
 };
 
 /// Parse process arguments and run the matching demo.
@@ -68,16 +68,15 @@ pub async fn demo_fake() -> Result<(), ParlevoxError> {
 ///
 /// # Errors
 ///
-/// Returns a transport-class error when the bundled SDK is unavailable or the
-/// plugin cannot be spawned or reaped, a protocol-class error for an invalid
-/// manifest or session configuration, and any error raised by the turn.
+/// Returns a transport-class error when the bundled SDK cannot be located
+/// (the message names `PARLEVOX_PYTHON_SDK` when that override is honoured but
+/// invalid, and otherwise lists every path tried) or when the plugin cannot be
+/// spawned or reaped, a protocol-class error for an invalid manifest or session
+/// configuration, and any error raised by the turn.
 pub async fn demo_sidecar() -> Result<(), ParlevoxError> {
-    if !sdk_is_available() {
-        return Err(ParlevoxError::Transport(
-            "sdks/python is not available; cannot launch the sidecar plugin".into(),
-        ));
-    }
-    let client = Arc::new(SidecarClient::spawn(SidecarConfig::python_sdk()).await?);
+    let sdk_path = resolve_sdk_path(&SdkSearch::from_process())
+        .map_err(|err| ParlevoxError::Transport(err.to_string()))?;
+    let client = Arc::new(SidecarClient::spawn(SidecarConfig::python_sdk_at(sdk_path)).await?);
 
     let stt = Arc::new(SidecarStt::new(Arc::clone(&client)));
     let llm = Arc::new(SidecarLlm::new(Arc::clone(&client)));
