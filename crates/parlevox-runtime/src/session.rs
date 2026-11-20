@@ -319,12 +319,22 @@ impl Session {
     pub async fn run_turn(&mut self, utterance: AudioChunk) -> Result<TurnReport, ParlevoxError> {
         #[cfg(feature = "otel")]
         {
-            let mut trace = TurnTrace::start(
-                &self.tracer,
-                &self.trace_clock,
-                self.turn_index().saturating_add(1),
-            );
+            let mut trace = TurnTrace::start(&self.tracer, &self.trace_clock);
             let result = self.drive_turn(utterance, &mut trace).await;
+            // A turn that fails before `FinalTranscript` has no commit and so
+            // no report id; carry the id the next commit will report instead.
+            // An already-recorded committed id is never overwritten.
+            if result.is_err() {
+                trace.record_turn(self.turn_index().saturating_add(1));
+            }
+            // Sample the bounded handoffs after the turn body has finished and
+            // before the span closes, so the values match what a caller reads
+            // from the session immediately after `run_turn`.
+            trace.record_boundaries(
+                &self.input.stats(),
+                &self.output.stats(),
+                &self.events.stats(),
+            );
             trace.finish(&result);
             result
         }
@@ -453,6 +463,10 @@ impl Session {
         let transition = self.apply(TurnEvent::FinalTranscript {
             text: transcript.clone(),
         })?;
+        // The turn is committed here: record its id before any later failure
+        // or barge-in can only describe how the committed turn ended.
+        #[cfg(feature = "otel")]
+        trace.record_turn(transition.turn);
         let turn = transition.turn;
         self.emit(SessionEvent::TurnStarted { turn })?;
         self.emit(SessionEvent::TranscriptFinal {
