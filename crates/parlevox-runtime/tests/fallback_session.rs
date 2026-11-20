@@ -286,6 +286,101 @@ async fn barge_in_cancels_mid_stream_without_switching() {
 }
 
 #[tokio::test]
+async fn pre_commit_provider_cancel_interrupts_without_switching() {
+    // Arrange: the primary reports a provider-originated cancel before it
+    // commits; the secondary could answer but must never be started.
+    let primary = Arc::new(ScriptedLlm::new(
+        "primary",
+        Script::FailBeforeCommit(ErrorClass::Cancelled),
+        0,
+    ));
+    let secondary = Arc::new(ScriptedLlm::new(
+        "secondary",
+        Script::Items(vec!["never"]),
+        0,
+    ));
+    let (mut session, chain) = session_with_chain(SessionConfig::default(), &primary, &secondary);
+
+    // Act
+    let report = session
+        .run_turn(demo_utterance(FAKE_SAMPLE_RATE, 1, 40))
+        .await
+        .expect("a provider cancel ends the turn without an error");
+
+    // Assert: a cancel is an interruption, not a switchable failure.
+    assert!(report.interrupted);
+    assert!(secondary.calls().is_empty());
+    assert_eq!(
+        chain.stats(),
+        FallbackStatsSnapshot {
+            switched: 0,
+            exhausted: 0,
+        }
+    );
+
+    let events = session.take_events();
+    assert!(matches!(
+        events.last(),
+        Some(SessionEvent::TurnDone {
+            interrupted: true,
+            ..
+        })
+    ));
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, SessionEvent::Failed { .. })));
+}
+
+#[tokio::test]
+async fn post_commit_provider_cancel_keeps_partial_reply_without_switching() {
+    // Arrange: the primary commits one item and then reports a
+    // provider-originated cancel mid-stream.
+    let primary = Arc::new(ScriptedLlm::new(
+        "primary",
+        Script::OneItemThenFail("half a sentence", ErrorClass::Cancelled),
+        0,
+    ));
+    let secondary = Arc::new(ScriptedLlm::new(
+        "secondary",
+        Script::Items(vec!["never"]),
+        0,
+    ));
+    let (mut session, chain) = session_with_chain(SessionConfig::default(), &primary, &secondary);
+
+    // Act
+    let report = session
+        .run_turn(demo_utterance(FAKE_SAMPLE_RATE, 1, 40))
+        .await
+        .expect("a provider cancel ends the turn without an error");
+
+    // Assert: the already-committed text survives, no audio is synthesized,
+    // and the chain still refuses to switch after a commit.
+    assert!(report.interrupted);
+    assert_eq!(report.reply, "half a sentence");
+    assert_eq!(report.audio_frames, 0);
+    assert!(secondary.calls().is_empty());
+    assert_eq!(
+        chain.stats(),
+        FallbackStatsSnapshot {
+            switched: 0,
+            exhausted: 0,
+        }
+    );
+
+    let events = session.take_events();
+    assert!(matches!(
+        events.last(),
+        Some(SessionEvent::TurnDone {
+            interrupted: true,
+            ..
+        })
+    ));
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, SessionEvent::Failed { .. })));
+}
+
+#[tokio::test]
 async fn turn_report_sums_sidecar_dropped_frames_across_the_chain() {
     // Arrange: the failing primary and the surviving secondary each report
     // their own per-request loss.
