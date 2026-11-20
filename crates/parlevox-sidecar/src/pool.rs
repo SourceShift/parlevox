@@ -375,14 +375,36 @@ impl PoolLease {
 
     /// Reset and return the process to the pool.
     ///
+    /// The release runs on a detached task, so this future is cancellation-safe:
+    /// if it is dropped before it completes, the reset, pooling, or kill still
+    /// runs to completion in the background and the process is reset, pooled,
+    /// or killed and counted exactly as an uninterrupted release would. The
+    /// caller then observes no `Result`, but no process is leaked.
+    ///
     /// # Errors
     ///
     /// Returns a protocol-class error when a request route is still open, or a
     /// transport-class error when the process is dead or does not answer. A
     /// failed release kills and counts the process rather than pooling it.
+    /// Returns a transport-class error when called outside a Tokio runtime or
+    /// when the detached release task cannot be joined.
     pub async fn release(mut self) -> Result<(), ParlevoxError> {
+        // Take ownership before spawning: the task must outlive this future so
+        // dropping the future detaches the release instead of aborting it.
+        let pool = Arc::clone(&self.pool);
+        let client = Arc::clone(&self.client);
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|_| ParlevoxError::Transport("release requires a Tokio runtime".into()))?;
+        let detached = runtime.spawn(async move { pool.release_client(client).await });
+        // Only mark the lease handed over once the task exists; if anything
+        // above failed, `Drop` still owns the process and kills it.
         self.released = true;
-        self.pool.release_client(Arc::clone(&self.client)).await
+        match detached.await {
+            Ok(result) => result,
+            Err(err) => Err(ParlevoxError::Transport(format!(
+                "pooled release task failed: {err}"
+            ))),
+        }
     }
 }
 

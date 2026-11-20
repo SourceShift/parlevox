@@ -38,6 +38,29 @@ fn pid(lease: &parlevox_sidecar::PoolLease) -> u32 {
     lease.client().pid().expect("spawn captures the child pid")
 }
 
+/// Whether a pid still answers `kill -0`. A zombie does, so a killed but
+/// unreaped child also counts as alive: the kill path reaps it.
+fn process_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Poll until `pid` is gone, with a generous bound instead of a fixed sleep.
+async fn wait_until_process_exits(pid: u32) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while process_alive(pid) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "process {pid} outlived its release by more than 10s"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 #[tokio::test]
 async fn pool_enforces_idle_cap() {
     if !python_available() {
@@ -233,4 +256,55 @@ async fn a_plugin_without_reset_keeps_one_process_per_session() {
     second.release().await.unwrap();
     pool.shutdown().await;
     assert_eq!(pool.stats().shutdown, 2);
+}
+
+#[tokio::test]
+async fn release_cancelled_mid_reset_kills_the_process() {
+    if !python_available() {
+        eprintln!("skipping cancellation test: no Python interpreter");
+        return;
+    }
+
+    let pool = Arc::new(SidecarPool::new(
+        scripted("never_ack"),
+        PoolConfig::default().with_max_idle(2),
+    ));
+
+    let lease = pool.acquire().await.unwrap();
+    let first_pid = pid(&lease);
+    assert!(process_alive(first_pid), "the leased process must be live");
+
+    // The fixture never acknowledges a reset and the configured reset timeout
+    // is one second, so this timeout drops the release future while it is
+    // suspended mid-reset. Pre-change, `released` was already true and the
+    // process was left unowned and unkilled with no counter recording it.
+    let cancelled = tokio::time::timeout(Duration::from_millis(100), lease.release()).await;
+    assert!(
+        cancelled.is_err(),
+        "the release must still be suspended when the timeout expires"
+    );
+
+    // The detached release must finish on its own: the reset times out, the
+    // failure is counted, and the process is killed and reaped.
+    wait_until_process_exits(first_pid).await;
+
+    let stats = pool.stats();
+    assert_eq!(stats.spawned, 1);
+    assert_eq!(stats.reused, 0);
+    assert_eq!(stats.reset_failures, 1);
+    assert_eq!(stats.evicted, 0);
+    assert_eq!(stats.shutdown, 0);
+
+    // The pool is still usable after a cancelled release.
+    let next = pool.acquire().await.unwrap();
+    let next_pid = pid(&next);
+    assert_ne!(
+        next_pid, first_pid,
+        "the killed process must be replaced, not reused"
+    );
+    assert_eq!(pool.stats().spawned, 2);
+
+    drop(next);
+    wait_until_process_exits(next_pid).await;
+    pool.shutdown().await;
 }
