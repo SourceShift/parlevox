@@ -11,6 +11,11 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+# Opt-in OpenTelemetry turn spans. Off by default so the default build carries
+# no OTel dependency edge and the event sequence is unchanged.
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk"]
+
 [dependencies]
 parlevox-core = { version = "0.1.0", path = "../parlevox-core" }
 parlevox-providers = { version = "0.1.0", path = "../parlevox-providers" }
@@ -19,6 +24,8 @@ futures-util.workspace = true
 tokio-util.workspace = true
 serde.workspace = true
 tracing.workspace = true
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio.workspace = true

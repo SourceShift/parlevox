@@ -9,6 +9,10 @@ pub mod events;
 pub mod registry;
 pub mod session;
 
+/// Opt-in OpenTelemetry turn tracing, enabled by the `otel` feature.
+#[cfg(feature = "otel")]
+mod telemetry;
+
 pub use context::{ChatContext, ContextStats};
 pub use events::{EventPushOutcome, EventQueue, EventQueueStats, SessionEvent};
 pub use registry::{ProviderNames, ProviderRegistry, Providers};

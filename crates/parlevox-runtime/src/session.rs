@@ -27,6 +27,10 @@ use crate::events::{
     EventPushOutcome, EventQueue, EventQueueStats, SessionEvent, MIN_EVENT_CAPACITY,
 };
 use crate::registry::Providers;
+#[cfg(feature = "otel")]
+use crate::telemetry::{counter, millis, to_u64, TraceClock, TurnTrace};
+#[cfg(feature = "otel")]
+use opentelemetry::KeyValue;
 
 /// Tunables for one session.
 #[derive(Debug, Clone)]
@@ -110,6 +114,13 @@ pub struct Session {
     generation: u64,
     events: EventQueue,
     context: ChatContext,
+    /// Facade tracer used by the opt-in `otel` feature. Absent from the
+    /// default build, so the default session carries no OpenTelemetry state.
+    #[cfg(feature = "otel")]
+    tracer: Arc<opentelemetry::global::BoxedTracer>,
+    /// One wall-clock export anchor plus the session's monotonic clock.
+    #[cfg(feature = "otel")]
+    trace_clock: TraceClock,
 }
 
 impl Session {
@@ -122,6 +133,48 @@ impl Session {
     /// reserve the terminal slot plus streaming headroom), or when
     /// `context_messages` / `context_chars` cannot hold one turn.
     pub fn new(config: SessionConfig, providers: Providers) -> Result<Self, ParlevoxError> {
+        #[cfg(feature = "otel")]
+        {
+            Self::assemble(
+                config,
+                providers,
+                Arc::new(opentelemetry::global::tracer("parlevox-runtime")),
+            )
+        }
+        #[cfg(not(feature = "otel"))]
+        {
+            Self::assemble(config, providers)
+        }
+    }
+
+    /// Build a session with an explicitly supplied tracer.
+    ///
+    /// This is the hermetic hook for tests: pass a tracer backed by an
+    /// in-memory exporter and no process-global provider is touched. It is
+    /// only available with the `otel` feature.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same protocol-class errors as [`Session::new`].
+    #[cfg(feature = "otel")]
+    pub fn with_tracer<T>(
+        config: SessionConfig,
+        providers: Providers,
+        tracer: T,
+    ) -> Result<Self, ParlevoxError>
+    where
+        T: opentelemetry::trace::Tracer + Send + Sync + 'static,
+        T::Span: Send + Sync + 'static,
+    {
+        let tracer = opentelemetry::global::BoxedTracer::new(Box::new(tracer));
+        Self::assemble(config, providers, Arc::new(tracer))
+    }
+
+    fn assemble(
+        config: SessionConfig,
+        providers: Providers,
+        #[cfg(feature = "otel")] tracer: Arc<opentelemetry::global::BoxedTracer>,
+    ) -> Result<Self, ParlevoxError> {
         for manifest in [
             providers.stt.manifest(),
             providers.llm.manifest(),
@@ -144,10 +197,11 @@ impl Session {
         let output = AudioRing::new(config.output_ring_capacity, OverflowPolicy::DropOldest);
         let events = EventQueue::new(config.event_capacity, config.event_overflow_policy);
         let context = ChatContext::new(config.context_messages, config.context_chars)?;
+        let clock = MonoClock::new();
         Ok(Session {
             config,
             machine: TurnMachine::new(),
-            clock: MonoClock::new(),
+            clock,
             input,
             output,
             providers,
@@ -155,6 +209,10 @@ impl Session {
             generation: 0,
             events,
             context,
+            #[cfg(feature = "otel")]
+            tracer,
+            #[cfg(feature = "otel")]
+            trace_clock: TraceClock::new(clock),
         })
     }
 
@@ -259,6 +317,31 @@ impl Session {
     /// is terminal, and the classified provider or transport error when a
     /// provider call fails. Control-event overflow is reported the same way.
     pub async fn run_turn(&mut self, utterance: AudioChunk) -> Result<TurnReport, ParlevoxError> {
+        #[cfg(feature = "otel")]
+        {
+            let mut trace = TurnTrace::start(
+                &self.tracer,
+                &self.trace_clock,
+                self.turn_index().saturating_add(1),
+            );
+            let result = self.drive_turn(utterance, &mut trace).await;
+            trace.finish(&result);
+            result
+        }
+        #[cfg(not(feature = "otel"))]
+        {
+            self.drive_turn(utterance).await
+        }
+    }
+
+    /// The turn body. Kept separate from [`Session::run_turn`] so the optional
+    /// trace can be closed with the turn's final outcome, including on the
+    /// error and interruption paths.
+    async fn drive_turn(
+        &mut self,
+        utterance: AudioChunk,
+        #[cfg(feature = "otel")] trace: &mut TurnTrace,
+    ) -> Result<TurnReport, ParlevoxError> {
         self.start()?;
         if self.machine.state() == TurnState::Closed {
             return Err(ParlevoxError::Closed);
@@ -290,6 +373,8 @@ impl Session {
         }
 
         // 1. Voice activity.
+        #[cfg(feature = "otel")]
+        let vad_span = trace.stage("vad", self.clock.now());
         let vad_provider = Arc::clone(&self.providers.vad);
         let mut vad = match vad_provider.analyze(utterance.clone(), token.clone()).await {
             Ok(stream) => stream,
@@ -324,8 +409,12 @@ impl Session {
         if !speech_started && self.machine.state() == TurnState::Listening {
             self.apply(TurnEvent::UserStartedSpeaking)?;
         }
+        #[cfg(feature = "otel")]
+        vad_span.end();
 
         // 2. Speech-to-text, consuming partials until the final.
+        #[cfg(feature = "otel")]
+        let mut stt_span = trace.stage("stt", self.clock.now());
         let stt_provider = Arc::clone(&self.providers.stt);
         let mut stt = match stt_provider.transcribe(utterance, token.clone()).await {
             Ok(stream) => stream,
@@ -352,6 +441,14 @@ impl Session {
                 "stt produced no final transcript".into(),
             ));
         }
+        #[cfg(feature = "otel")]
+        {
+            stt_span.set_attribute(KeyValue::new(
+                "transcript.chars",
+                counter(to_u64(transcript.chars().count())),
+            ));
+            stt_span.end();
+        }
 
         let transition = self.apply(TurnEvent::FinalTranscript {
             text: transcript.clone(),
@@ -370,6 +467,10 @@ impl Session {
         self.context.push_user(transcript.clone());
 
         // 3. Streaming completion.
+        #[cfg(feature = "otel")]
+        let llm_started = self.clock.now();
+        #[cfg(feature = "otel")]
+        let mut llm_span = trace.stage("llm", llm_started);
         let llm_provider = Arc::clone(&self.providers.llm);
         let mut llm = match llm_provider
             .generate(
@@ -400,6 +501,13 @@ impl Session {
                         self.apply(TurnEvent::ReplyStarted)?;
                         reply_started = true;
                     }
+                    #[cfg(feature = "otel")]
+                    if delta_count == 0 {
+                        trace.set_attribute(KeyValue::new(
+                            "llm.first_delta_ms",
+                            millis(self.clock.now().since(llm_started)),
+                        ));
+                    }
                     reply.push_str(&delta);
                     delta_count += 1;
                     self.emit(SessionEvent::ReplyDelta { turn, text: delta })?;
@@ -416,6 +524,15 @@ impl Session {
                 Some(Err(err)) => return self.fail(err),
             }
         }
+        #[cfg(feature = "otel")]
+        {
+            llm_span.set_attribute(KeyValue::new(
+                "reply.chars",
+                counter(to_u64(reply.chars().count())),
+            ));
+            llm_span.set_attribute(KeyValue::new("reply.deltas", counter(to_u64(delta_count))));
+            llm_span.end();
+        }
         if !reply_started && !interrupted {
             return self.fail(ParlevoxError::Protocol(
                 "llm produced no reply deltas".into(),
@@ -427,6 +544,12 @@ impl Session {
 
         // 4. Streaming synthesis with bounded playout. Producing audio is a
         // bounded operation: overflow drops the oldest frame and is counted.
+        #[cfg(feature = "otel")]
+        let tts_started = self.clock.now();
+        #[cfg(feature = "otel")]
+        let mut tts_span = trace.stage("tts", tts_started);
+        #[cfg(feature = "otel")]
+        let mut playout_span = trace.stage("playout", tts_started);
         let tts_provider = Arc::clone(&self.providers.tts);
         let request = SynthesizeRequest {
             text: reply.clone(),
@@ -446,6 +569,13 @@ impl Session {
             match tts.next().await {
                 None => break,
                 Some(Ok(chunk)) => {
+                    #[cfg(feature = "otel")]
+                    if audio_frames == 0 {
+                        trace.set_attribute(KeyValue::new(
+                            "tts.first_audio_ms",
+                            millis(self.clock.now().since(tts_started)),
+                        ));
+                    }
                     let ts = self.clock.now();
                     // Branch on the bounded playout ring's outcome: a frame the
                     // ring rejects is counted inside the ring, but the producer
@@ -473,6 +603,16 @@ impl Session {
                 }
                 Some(Err(err)) => return self.fail(err),
             }
+        }
+        #[cfg(feature = "otel")]
+        {
+            let output = self.output.stats();
+            let dropped = output.dropped.saturating_sub(baseline.output.dropped);
+            playout_span.set_attribute(KeyValue::new("playout.frames", counter(audio_frames)));
+            playout_span.set_attribute(KeyValue::new("playout.dropped_frames", counter(dropped)));
+            playout_span.end();
+            tts_span.set_attribute(KeyValue::new("audio.frames", counter(audio_frames)));
+            tts_span.end();
         }
         if interrupted {
             return self.finish_interrupted(turn, audio_frames, &transcript, &reply, baseline);
