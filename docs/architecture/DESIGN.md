@@ -68,8 +68,10 @@ is configured, the session leases an already-handshaken process from it and
 returns the process on release; the pool performs the additive `reset`
 handshake on return, keeps at most `PoolConfig::max_idle` processes idle, and
 checks age at lease time: a process idle longer than `max_age` is shut down
-then and never handed out. It also kills and counts a process whose
-acquire-time probe reset fails rather than handing it out dirty. Without a
+then and never handed out. A process that has served `max_reuses` pooled
+returns is retired at its next release instead of being pooled again (`0`
+means unlimited). The pool also kills and counts a process whose acquire-time
+probe reset fails rather than handing it out dirty. Without a
 pool — including `demo --sidecar` and every existing test — the session spawns
 a fresh process and reaps it, exactly as before. `PROTOCOL_VERSION` and
 `SIDECAR_ABI` are unchanged: `reset` is an additive control message and a

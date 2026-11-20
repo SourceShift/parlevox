@@ -409,3 +409,127 @@ async fn release_cancelled_mid_reset_kills_the_process() {
     wait_until_process_exits(next_pid).await;
     pool.shutdown().await;
 }
+
+#[tokio::test]
+async fn pool_retires_a_process_at_max_reuses() {
+    if !python_available() {
+        eprintln!("skipping retirement test: no Python interpreter");
+        return;
+    }
+
+    // With `max_reuses = 1` a process serves one initial lease plus one reuse
+    // and is retired at its second return.
+    let pool = Arc::new(SidecarPool::new(
+        scripted("ack"),
+        PoolConfig::default().with_max_idle(1).with_max_reuses(1),
+    ));
+
+    let first = pool.acquire().await.unwrap();
+    let first_pid = pid(&first);
+    first.release().await.unwrap();
+
+    let reused = pool.acquire().await.unwrap();
+    assert_eq!(
+        pid(&reused),
+        first_pid,
+        "the process is reused exactly once"
+    );
+    assert_eq!(pool.stats().reused, 1);
+    reused.release().await.unwrap();
+
+    // The second return reaches the ceiling: the process is retired instead of
+    // pooled, and no other fate counter moves for it.
+    let stats = pool.stats();
+    assert_eq!(stats.retired, 1, "the ceiling retires exactly one process");
+    assert_eq!(stats.shutdown, 0, "a retirement is not a shutdown");
+    assert_eq!(stats.reset_failures, 0);
+
+    let fresh = pool.acquire().await.unwrap();
+    assert_ne!(
+        pid(&fresh),
+        first_pid,
+        "a retired process must never be handed out again"
+    );
+    assert_eq!(pool.stats().spawned, 2);
+
+    fresh.release().await.unwrap();
+    pool.shutdown().await;
+}
+
+#[tokio::test]
+async fn pool_with_zero_max_reuses_is_unlimited() {
+    if !python_available() {
+        eprintln!("skipping unlimited-reuse test: no Python interpreter");
+        return;
+    }
+
+    let pool = Arc::new(SidecarPool::new(
+        scripted("ack"),
+        PoolConfig::default().with_max_idle(1).with_max_reuses(0),
+    ));
+
+    let first = pool.acquire().await.unwrap();
+    let stable_pid = pid(&first);
+    first.release().await.unwrap();
+
+    // `0` is the opposite of a ceiling, unlike `max_idle = 0`: the same process
+    // keeps coming back past a would-be ceiling of one.
+    for round in 0..3 {
+        let lease = pool.acquire().await.unwrap();
+        assert_eq!(
+            pid(&lease),
+            stable_pid,
+            "round {round} must reuse the process"
+        );
+        lease.release().await.unwrap();
+    }
+
+    let stats = pool.stats();
+    assert_eq!(stats.retired, 0, "an unlimited ceiling never retires");
+    assert_eq!(stats.shutdown, 0);
+    assert_eq!(stats.spawned, 1, "the one process serves every round");
+
+    pool.shutdown().await;
+}
+
+#[tokio::test]
+async fn pool_distinguishes_retirement_from_configuration_refusal() {
+    if !python_available() {
+        eprintln!("skipping refusal-reason test: no Python interpreter");
+        return;
+    }
+
+    // Two pools, deliberately: `max_idle = 0` disables pooling, so no process
+    // can ever accumulate a reuse in that pool, while an age-based
+    // configuration refusal is timing-dependent. Retirement needs pooling
+    // enabled plus a reached ceiling, so one pool cannot deterministically
+    // produce both fates.
+    let retiring = Arc::new(SidecarPool::new(
+        scripted("ack"),
+        PoolConfig::default().with_max_idle(1).with_max_reuses(1),
+    ));
+    let first = retiring.acquire().await.unwrap();
+    first.release().await.unwrap();
+    let reused = retiring.acquire().await.unwrap();
+    reused.release().await.unwrap();
+
+    let retired_stats = retiring.stats();
+    assert_eq!(retired_stats.retired, 1, "the ceiling is a retirement");
+    assert_eq!(retired_stats.shutdown, 0);
+    retiring.shutdown().await;
+
+    let disabled = Arc::new(SidecarPool::new(
+        scripted("ack"),
+        PoolConfig::default().with_max_idle(0),
+    ));
+    let lease = disabled.acquire().await.unwrap();
+    lease.release().await.unwrap();
+
+    let disabled_stats = disabled.stats();
+    assert_eq!(
+        disabled_stats.shutdown, 1,
+        "disabled pooling is a configuration refusal"
+    );
+    assert_eq!(disabled_stats.retired, 0);
+    disabled.shutdown().await;
+}
