@@ -59,9 +59,20 @@ sidecar is started only when a session resolves a provider that lives there.
 | `parlevox-providers` | Streaming traits + manifests + deterministic fakes | `SttProvider`, `LlmProvider`, `TtsProvider`, `VadProvider`, `ProviderManifest`, `ChatMessage`, `Role`, `Fake*` |
 | `parlevox-runtime` | One session: FSM owner, rings, event handoff, provider selection, barge-in, bounded context | `Session`, `SessionConfig`, `SessionEvent`, `EventQueue`, `ProviderRegistry`, `TurnReport`, `ChatContext`, `ContextStats` |
 | `parlevox-ipc` | The framed wire protocol — used **only** by the sidecar path | `Frame`, `AudioHeader`, `read_frame`, `write_frame`, `MAX_FRAME_BYTES` |
-| `parlevox-sidecar` | Process supervision and the adapter from plugin → provider trait | `SidecarClient`, `SidecarSupervisor`, `SidecarStt/Llm/Tts`, `RestartPolicy` |
+| `parlevox-sidecar` | Process supervision, the optional warm pool, and the adapter from plugin → provider trait | `SidecarClient`, `SidecarSupervisor`, `SidecarPool`, `PoolConfig`, `PoolLease`, `SidecarStt/Llm/Tts`, `RestartPolicy` |
 | `parlevox-cli` | Argument parsing and the one-turn demo, in a library so tests drive the same path | `run_args`, `demo_fake`, `demo_sidecar` |
 | `sdks/python/parlevox_sdk` | Reference Python implementation of the plugin side | `Plugin`, `protocol`, `fakes`, `sidecar_main` |
+
+A session obtains its plugin process in one of two ways. When a `SidecarPool`
+is configured, the session leases an already-handshaken process from it and
+returns the process on release; the pool performs the additive `reset`
+handshake on return, keeps at most `PoolConfig::max_idle` processes idle for at
+most `max_age`, and kills and counts a process whose acquire-time probe reset
+fails rather than handing it out dirty. Without a pool — including
+`demo --sidecar` and every existing test — the session spawns a fresh process
+and reaps it, exactly as before. `PROTOCOL_VERSION` and `SIDECAR_ABI` are
+unchanged: `reset` is an additive control message and a plugin that does not
+advertise the `reset` capability is never pooled.
 
 ## 3. One turn
 
@@ -142,7 +153,7 @@ dimension. This is the honest scorecard against the shipped tree:
 | # | Dimension | Adopted direction | v0 status |
 |---|---|---|---|
 | 1 | Transport & audio path | Typed frames over a bounded, lag-counted ring | **Implemented** — `AudioRing`, `RingStats`, `dropped_ms` |
-| 2 | Concurrency & isolation | Supervised plugin processes, multiplexed by `request_id` | **Partial** — supervision + restart backoff + id-multiplexed client exist; no warm pool, one plugin process per session |
+| 2 | Concurrency & isolation | Supervised plugin processes, multiplexed by `request_id` | **Partial** — supervision + restart backoff + id-multiplexed client exist; an opt-in bounded warm pool reuses a `reset`-capable process across sessions, while the default still spawns one plugin process per session |
 | 3 | Turn-taking | Rust-owned FSM with composable strategies | **Partial** — explicit FSM and barge-in are real; strategy list and adaptive endpointing are not |
 | 4 | Provider abstraction | One small interface per modality + versioned manifest | **Implemented** — traits, `ProviderManifest`, registry lookup |
 | 5 | State & context | Rust-owned `ChatContext`, bounded policy | **Implemented** — `ChatContext`/`ContextStats` bound by message count and character budget; eviction prefers non-system messages and all loss is counted. The char budget is an estimate, not a token count |
@@ -205,7 +216,6 @@ What remains open:
   (synthesis before the final transcript) remains unimplemented. The pipelined
   sentence handoff is bounded and its drops are counted through
   `Session::pipeline_stats`.
-- No warm plugin pool: one plugin process per session (dimension 2, partial).
 - Turn spans exist but are opt-in: `cargo build -p parlevox-runtime --features otel`
   emits one `turn` root span with `vad`, `stt`, `llm`, `tts` and `playout`
   children plus MonoClock-derived boundary-cost attributes, and the default

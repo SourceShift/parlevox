@@ -18,15 +18,11 @@
 use std::sync::Arc;
 
 use parlevox_core::ParlevoxError;
-use parlevox_providers::{
-    FakeVad, LlmProvider, SttProvider, TtsProvider, FAKE_REPLY, FAKE_TRANSCRIPT, FAKE_TTS_FRAMES,
-};
+use parlevox_providers::{FAKE_REPLY, FAKE_TRANSCRIPT, FAKE_TTS_FRAMES};
 use parlevox_runtime::{
     ProviderNames, ProviderRegistry, Session, SessionConfig, SessionEvent, TurnReport,
 };
-use parlevox_sidecar::{
-    sdk_is_available, SidecarClient, SidecarConfig, SidecarLlm, SidecarStt, SidecarTts,
-};
+use parlevox_sidecar::{sdk_is_available, SidecarClient, SidecarConfig};
 
 fn python_probe() -> bool {
     let python = std::env::var("PARLEVOX_PYTHON").unwrap_or_else(|_| "python3".into());
@@ -47,62 +43,8 @@ async fn run_fake() -> (TurnReport, Vec<SessionEvent>) {
 async fn run_sidecar(
     client: Arc<SidecarClient>,
 ) -> Result<(TurnReport, Vec<SessionEvent>), ParlevoxError> {
-    let stt = Arc::new(SidecarStt::new(Arc::clone(&client)));
-    let llm = Arc::new(SidecarLlm::new(Arc::clone(&client)));
-    let tts = Arc::new(SidecarTts::new(Arc::clone(&client)));
-    let mut registry = ProviderRegistry::new();
-    registry.register_stt(stt.clone())?;
-    registry.register_llm(llm.clone())?;
-    registry.register_tts(tts.clone())?;
-    registry.register_vad(Arc::new(FakeVad::new()))?;
-
-    let names = ProviderNames {
-        stt: stt.manifest().name.clone(),
-        llm: llm.manifest().name.clone(),
-        tts: tts.manifest().name.clone(),
-        vad: "fake-vad".into(),
-    };
-    let providers = registry.resolve(&names)?;
-    let session = Session::new(SessionConfig::default(), providers)?;
+    let session = parlevox_cli::sidecar_session(client)?;
     parlevox_cli::run_turn_events(session).await
-}
-
-/// Canonical, timestamp-free projection of an event trace.
-fn project(events: &[SessionEvent]) -> Vec<String> {
-    events
-        .iter()
-        .map(|event| match event {
-            SessionEvent::TurnStarted { turn } => format!("TurnStarted turn={turn}"),
-            SessionEvent::TranscriptFinal { turn, text } => {
-                format!("TranscriptFinal turn={turn} text={text:?}")
-            }
-            SessionEvent::ReplyDelta { turn, text } => {
-                format!("ReplyDelta turn={turn} text={text:?}")
-            }
-            SessionEvent::AudioOut { turn, frame } => format!(
-                "AudioOut turn={turn} rate={} channels={} pcm={:?}",
-                frame.sample_rate, frame.channels, frame.pcm
-            ),
-            SessionEvent::TurnDone {
-                turn,
-                audio_frames,
-                dropped_frames,
-                dropped_ms,
-                dropped_events,
-                sidecar_dropped_frames,
-                interrupted,
-            } => format!(
-                "TurnDone turn={turn} audio_frames={audio_frames} \
-                 dropped_frames={dropped_frames} dropped_ms={dropped_ms} \
-                 dropped_events={dropped_events} \
-                 sidecar_dropped_frames={sidecar_dropped_frames} \
-                 interrupted={interrupted}"
-            ),
-            SessionEvent::Failed { class, message } => {
-                format!("Failed class={class:?} message={message:?}")
-            }
-        })
-        .collect()
 }
 
 #[tokio::test]
@@ -111,7 +53,10 @@ async fn fake_turn_is_deterministic() {
     let (second_report, second_events) = run_fake().await;
 
     assert_eq!(first_report, second_report);
-    assert_eq!(project(&first_events), project(&second_events));
+    assert_eq!(
+        parlevox_cli::project_events(&first_events),
+        parlevox_cli::project_events(&second_events)
+    );
     assert_eq!(first_report.transcript, FAKE_TRANSCRIPT);
     assert_eq!(first_report.reply, FAKE_REPLY);
     assert_eq!(first_report.audio_frames as usize, FAKE_TTS_FRAMES);
@@ -144,8 +89,8 @@ async fn real_sidecar_matches_the_in_process_turn() {
     shutdown.expect("sidecar child is reaped");
 
     assert_eq!(
-        project(&sidecar_events),
-        project(&fake_events),
+        parlevox_cli::project_events(&sidecar_events),
+        parlevox_cli::project_events(&fake_events),
         "the real plugin's event trace diverged from the in-process fakes"
     );
     assert_eq!(

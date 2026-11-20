@@ -13,6 +13,8 @@ from parlevox_sdk.plugin import (
 from parlevox_sdk.protocol import (
     KIND_AUDIO,
     KIND_JSON,
+    PROTOCOL_VERSION,
+    SIDECAR_ABI,
     decode_audio,
     decode_json,
     encode_audio,
@@ -439,6 +441,60 @@ def test_late_audio_end_for_evicted_tombstone_is_rejected_not_executed():
         }
     ]
     assert not any(message["type"] in ("partial", "final") for message in messages)
+
+
+def test_reset_clears_pending_state_and_readvertises_capabilities():
+    plugin = Plugin()
+    out = io.BytesIO()
+    pending_audio = {"r1": deque([b"\x00\x00"], maxlen=MAX_PENDING_AUDIO_FRAMES)}
+    pending_requests = {"r1": {"type": "transcribe", "request_id": "r1"}}
+    pending_dropped = {"r1": 4}
+    cancelled = CancelledTombstones()
+    cancelled.remember("r0")
+
+    assert (
+        plugin.handle(
+            {"type": "reset"},
+            out,
+            pending_audio,
+            pending_requests,
+            pending_dropped,
+            cancelled,
+        )
+        is True
+    )
+
+    # Every per-session container, including the tombstone ledger, is empty.
+    assert pending_audio == {}
+    assert pending_requests == {}
+    assert pending_dropped == {}
+    assert len(cancelled) == 0
+
+    messages = json_messages(out.getvalue())
+    assert len(messages) == 1
+    ready = messages[0]
+    assert ready["type"] == "ready"
+    assert ready["protocol_version"] == PROTOCOL_VERSION
+    assert ready["abi"] == SIDECAR_ABI
+    assert "reset" in ready["capabilities"]
+    # The provider manifest still advertises every capability, including reset.
+    assert "reset" in ready["manifest"]["capabilities"]
+
+    # The process keeps serving after a reset.
+    out = io.BytesIO()
+    plugin.handle(
+        {
+            "type": "synthesize",
+            "request_id": "r2",
+            "text": "hi",
+            "sample_rate": 16000,
+            "channels": 1,
+        },
+        out,
+    )
+    messages = json_messages(out.getvalue())
+    assert messages[0]["type"] == "audio_start"
+    assert messages[-1] == {"type": "done", "request_id": "r2", "dropped_frames": 0}
 
 
 def test_post_cancel_audio_is_not_rebuffered():

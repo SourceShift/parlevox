@@ -115,6 +115,10 @@ class CancelledTombstones:
     def discard(self, request_id):
         self._ids.pop(request_id, None)
 
+    def clear(self):
+        """Drop every tombstone; ``evicted`` stays monotonic for the process."""
+        self._ids.clear()
+
 
 class Plugin:
     def __init__(self, name="python-fake", stt=None, llm=None, tts=None, vad=None):
@@ -128,8 +132,33 @@ class Plugin:
         return {
             "name": self.name,
             "modality": "tts",
-            "capabilities": ["stt", "llm", "tts", "vad", "streaming", "binary_pcm", "cancel"],
+            "capabilities": [
+                "stt",
+                "llm",
+                "tts",
+                "vad",
+                "streaming",
+                "binary_pcm",
+                "cancel",
+                "reset",
+            ],
             "config_schema": {"type": "object", "properties": {}},
+        }
+
+    def _ready_payload(self):
+        """The one `ready` shape used by both `hello` and `reset`.
+
+        Keeping the acknowledgement in one helper means the initial handshake
+        and a pool reset cannot drift: both carry the top-level capability list
+        that tells the client this process is safe to reuse.
+        """
+        return {
+            "type": "ready",
+            "protocol_version": PROTOCOL_VERSION,
+            "abi": SIDECAR_ABI,
+            "plugin": self.name,
+            "manifest": self.manifest(),
+            "capabilities": ["reset"],
         }
 
     # -- wire helpers -------------------------------------------------
@@ -254,16 +283,19 @@ class Plugin:
             if abi != SIDECAR_ABI:
                 self._send_error(out, "", "protocol", f"unsupported abi {abi!r}")
                 return True
-            self._send(
-                out,
-                {
-                    "type": "ready",
-                    "protocol_version": PROTOCOL_VERSION,
-                    "abi": SIDECAR_ABI,
-                    "plugin": self.name,
-                    "manifest": self.manifest(),
-                },
-            )
+            self._send(out, self._ready_payload())
+            return True
+
+        if kind == "reset":
+            # A reset is a session boundary: every per-request container and
+            # the cancellation ledger start empty, and the process keeps
+            # serving. The acknowledgement has the same shape as the handshake
+            # so the client can validate it identically.
+            pending_audio.clear()
+            pending_requests.clear()
+            pending_dropped.clear()
+            cancelled.clear()
+            self._send(out, self._ready_payload())
             return True
 
         if kind == "synthesize":

@@ -32,6 +32,9 @@ pub enum Incoming {
     Audio(AudioFrame),
 }
 
+/// One-shot channel the router uses to answer a waiting [`SidecarClient::reset`].
+type ResetWaiter = tokio::sync::oneshot::Sender<Result<(), ParlevoxError>>;
+
 struct Inner {
     writer: Mutex<ChildStdin>,
     child: Mutex<Child>,
@@ -39,7 +42,13 @@ struct Inner {
     alive: Arc<AtomicBool>,
     next_id: AtomicU64,
     manifest: Option<ProviderManifest>,
+    capabilities: Vec<String>,
+    pid: Option<u32>,
     shutdown_timeout_ms: u64,
+    reset_timeout_ms: u64,
+    /// Installed immediately before a `reset` frame is written and taken
+    /// exactly once by the router, so a stray `ready` is harmless.
+    reset_ack: Arc<StdMutex<Option<ResetWaiter>>>,
 }
 
 /// A live plugin process speaking the framed protocol.
@@ -74,6 +83,7 @@ impl SidecarClient {
         let mut child = command.spawn().map_err(|err| {
             ParlevoxError::Transport(format!("failed to spawn '{}': {err}", config.program))
         })?;
+        let pid = child.id();
         let mut stdin = child
             .stdin
             .take()
@@ -128,13 +138,14 @@ impl SidecarClient {
             Ok(Ok(frame)) => frame,
         };
 
-        let manifest = match ready {
+        let (manifest, capabilities) = match ready {
             Frame::Json(value) => match serde_json::from_value::<PluginEvent>(value) {
                 Ok(PluginEvent::Ready {
                     protocol_version,
                     abi,
                     plugin,
                     manifest,
+                    capabilities,
                 }) => {
                     if protocol_version != PROTOCOL_VERSION {
                         let _ = child.start_kill();
@@ -151,7 +162,10 @@ impl SidecarClient {
                         )));
                     }
                     tracing::debug!(target: "parlevox_sidecar", plugin = %plugin, "plugin ready");
-                    serde_json::from_value::<ProviderManifest>(manifest).ok()
+                    (
+                        serde_json::from_value::<ProviderManifest>(manifest).ok(),
+                        capabilities,
+                    )
                 }
                 Ok(other) => {
                     let _ = child.start_kill();
@@ -180,7 +194,13 @@ impl SidecarClient {
         let routes: Arc<StdMutex<HashMap<String, mpsc::Sender<Incoming>>>> =
             Arc::new(StdMutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(true));
-        spawn_router(stdout, Arc::clone(&routes), Arc::clone(&alive));
+        let reset_ack: Arc<StdMutex<Option<ResetWaiter>>> = Arc::new(StdMutex::new(None));
+        spawn_router(
+            stdout,
+            Arc::clone(&routes),
+            Arc::clone(&alive),
+            Arc::clone(&reset_ack),
+        );
 
         Ok(SidecarClient {
             inner: Arc::new(Inner {
@@ -190,7 +210,11 @@ impl SidecarClient {
                 alive,
                 next_id: AtomicU64::new(0),
                 manifest,
+                capabilities,
+                pid,
                 shutdown_timeout_ms: config.shutdown_timeout_ms,
+                reset_timeout_ms: config.reset_timeout(),
+                reset_ack,
             }),
         })
     }
@@ -198,6 +222,114 @@ impl SidecarClient {
     /// The manifest the plugin announced during `ready`, when parseable.
     pub fn plugin_manifest(&self) -> Option<&ProviderManifest> {
         self.inner.manifest.as_ref()
+    }
+
+    /// OS process id of the plugin, captured at spawn.
+    pub fn pid(&self) -> Option<u32> {
+        self.inner.pid
+    }
+
+    /// Whether the plugin advertised the additive `reset` capability.
+    ///
+    /// A client is only poolable when this is true; a plugin built before the
+    /// capability keeps today's one-process-per-session lifecycle.
+    pub fn supports_reset(&self) -> bool {
+        self.inner
+            .capabilities
+            .iter()
+            .any(|capability| capability == "reset")
+    }
+
+    /// Clear the plugin's per-session state and wait for its `ready`
+    /// acknowledgement.
+    ///
+    /// A reset is only meaningful for an idle client: it fails loudly rather
+    /// than clearing state behind a live request. The acknowledgement is the
+    /// same payload as the initial handshake, validated for protocol version
+    /// and ABI.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport-class error when the caller already reset this
+    /// client concurrently, when the child is dead, when the `reset` frame
+    /// cannot be written, or when no acknowledgement arrives within
+    /// [`SidecarConfig::reset_timeout`]. Returns a protocol-class error when a
+    /// request route is still open or the plugin rejects the reset.
+    pub async fn reset(&self) -> Result<(), ParlevoxError> {
+        if !self.is_alive().await {
+            return Err(ParlevoxError::Transport(
+                "cannot reset a plugin that is not running".into(),
+            ));
+        }
+        let open_routes = self
+            .inner
+            .routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        if open_routes != 0 {
+            return Err(ParlevoxError::Protocol(format!(
+                "cannot reset with {open_routes} request route(s) still open"
+            )));
+        }
+
+        // Encode first: nothing may leave a waiter installed if the frame
+        // cannot even be built.
+        let frame = json_frame(&PluginRequest::Reset)?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut slot = self
+                .inner
+                .reset_ack
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if slot.is_some() {
+                return Err(ParlevoxError::Transport(
+                    "a reset is already awaiting acknowledgement".into(),
+                ));
+            }
+            *slot = Some(tx);
+        }
+
+        let written = {
+            let mut writer = self.inner.writer.lock().await;
+            write_frame(&mut *writer, &frame).await
+        };
+        if let Err(err) = written {
+            self.inner
+                .reset_ack
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            return Err(ParlevoxError::Transport(format!(
+                "reset write failed: {err}"
+            )));
+        }
+
+        match tokio::time::timeout(Duration::from_millis(self.inner.reset_timeout_ms), rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => {
+                self.inner
+                    .reset_ack
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+                Err(ParlevoxError::Transport(
+                    "reset acknowledgement channel closed".into(),
+                ))
+            }
+            Err(_) => {
+                self.inner
+                    .reset_ack
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+                Err(ParlevoxError::Transport(format!(
+                    "reset acknowledgement timed out after {} ms",
+                    self.inner.reset_timeout_ms
+                )))
+            }
+        }
     }
 
     /// Unique request id for a modality prefix.
@@ -430,6 +562,7 @@ fn spawn_router(
     mut stdout: ChildStdout,
     routes: Arc<StdMutex<HashMap<String, mpsc::Sender<Incoming>>>>,
     alive: Arc<AtomicBool>,
+    reset_ack: Arc<StdMutex<Option<ResetWaiter>>>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -439,6 +572,58 @@ fn spawn_router(
                         tracing::warn!(target: "parlevox_sidecar", "dropping unknown control event");
                         continue;
                     };
+                    // `reset` is answered by an ordinary `ready`. Resolve a
+                    // waiting reset exactly once; a stray `ready` with no
+                    // waiter stays harmless. The initial handshake runs before
+                    // this router exists, so it can never be stolen.
+                    if let PluginEvent::Ready {
+                        protocol_version,
+                        abi,
+                        ..
+                    } = &event
+                    {
+                        let waiter = reset_ack
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .take();
+                        if let Some(waiter) = waiter {
+                            let result = if *protocol_version != PROTOCOL_VERSION {
+                                Err(ParlevoxError::Protocol(format!(
+                                    "reset acknowledged protocol version {protocol_version}, \
+                                     expected {PROTOCOL_VERSION}"
+                                )))
+                            } else if abi != SIDECAR_ABI {
+                                Err(ParlevoxError::Protocol(format!(
+                                    "reset acknowledged abi '{abi}', expected '{SIDECAR_ABI}'"
+                                )))
+                            } else {
+                                Ok(())
+                            };
+                            let _ = waiter.send(result);
+                        }
+                        continue;
+                    }
+                    // A session-level error (empty request id) rejects a
+                    // waiting reset. Other errors keep their route.
+                    if let PluginEvent::Error {
+                        request_id,
+                        message,
+                        ..
+                    } = &event
+                    {
+                        if request_id.is_empty() {
+                            let waiter = reset_ack
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .take();
+                            if let Some(waiter) = waiter {
+                                let _ = waiter.send(Err(ParlevoxError::Protocol(format!(
+                                    "plugin rejected reset: {message}"
+                                ))));
+                            }
+                            continue;
+                        }
+                    }
                     let terminal = event.is_terminal();
                     let request_id = event.request_id().map(str::to_string);
                     if let Some(request_id) = request_id {
@@ -448,10 +633,15 @@ fn spawn_router(
                             .get(&request_id)
                             .cloned();
                         if let Some(sender) = sender {
-                            let _ = sender.send(Incoming::Event(event)).await;
+                            // Remove a terminal route before handing the event
+                            // to its consumer: a caller that releases a
+                            // process right after the turn then cannot race a
+                            // stale route and mistake a clean process for a
+                            // dirty one.
                             if terminal {
                                 routes.lock().expect("routes poisoned").remove(&request_id);
                             }
+                            let _ = sender.send(Incoming::Event(event)).await;
                         }
                     }
                 }
@@ -481,5 +671,14 @@ fn spawn_router(
         }
         alive.store(false, Ordering::SeqCst);
         routes.lock().expect("routes poisoned").clear();
+        let waiter = reset_ack
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(waiter) = waiter {
+            let _ = waiter.send(Err(ParlevoxError::Transport(
+                "plugin stream closed before acknowledging reset".into(),
+            )));
+        }
     });
 }
