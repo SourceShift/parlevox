@@ -18,6 +18,7 @@ when full, and every eviction is counted (:class:`CancelledTombstones`). A late
 rejected as an unknown request rather than executed.
 """
 
+import inspect
 import sys
 from collections import OrderedDict, deque
 
@@ -46,6 +47,31 @@ PENDING_AUDIO_OVERFLOW_POLICY = "drop_oldest"
 #: Capacity of the cancelled-request tombstone ledger, in ids. Oldest entries
 #: are evicted first once the ledger is full; evictions are counted.
 MAX_CANCELLED = 256
+
+
+def _accepts_history(provider):
+    """Whether ``provider.generate`` can accept a ``history`` keyword.
+
+    Providers written before structured history implement only
+    ``generate(self, prompt)``. Introspection is used instead of catching
+    ``TypeError`` around the call so a genuine error raised *inside* the
+    provider is still reported as an error rather than silently retried.
+    A callable that cannot be inspected is treated as one-argument.
+    """
+    try:
+        parameters = inspect.signature(provider.generate).parameters
+    except (TypeError, ValueError):
+        return False
+    history = parameters.get("history")
+    if history is not None and history.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    ):
+        return True
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
 
 
 class CancelledTombstones:
@@ -314,8 +340,17 @@ class Plugin:
 
     def _generate(self, message, out):
         request_id = message["request_id"]
+        prompt = message.get("prompt", "")
+        # Prior turns, oldest first, are already structured messages on the
+        # wire. A provider that implements only ``generate(self, prompt)``
+        # cannot receive them; introspect rather than raising a TypeError, so
+        # such a plugin keeps working on later turns too.
+        history = message.get("history") or []
         try:
-            deltas = list(self.llm.generate(message.get("prompt", "")))
+            if history and _accepts_history(self.llm):
+                deltas = list(self.llm.generate(prompt, history=history))
+            else:
+                deltas = list(self.llm.generate(prompt))
         except ValueError as err:
             self._send_error(out, request_id, "protocol", str(err))
             return True

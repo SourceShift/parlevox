@@ -22,6 +22,7 @@ use parlevox_providers::{
 };
 use tokio_util::sync::CancellationToken;
 
+use crate::context::{ChatContext, ContextStats};
 use crate::events::{
     EventPushOutcome, EventQueue, EventQueueStats, SessionEvent, MIN_EVENT_CAPACITY,
 };
@@ -40,6 +41,11 @@ pub struct SessionConfig {
     pub event_capacity: usize,
     /// Explicit overflow policy for droppable events.
     pub event_overflow_policy: OverflowPolicy,
+    /// Hard cap on the number of messages retained across turns.
+    pub context_messages: usize,
+    /// Hard cap on `text.chars().count()` retained across turns. This is a
+    /// transport-safe estimate, not a model token budget.
+    pub context_chars: usize,
     /// Test hook: trigger a barge-in after this many reply deltas.
     pub barge_in_after_deltas: Option<usize>,
 }
@@ -53,6 +59,8 @@ impl Default for SessionConfig {
             output_ring_capacity: 64,
             event_capacity: 256,
             event_overflow_policy: OverflowPolicy::DropOldest,
+            context_messages: 16,
+            context_chars: 8_192,
             barge_in_after_deltas: None,
         }
     }
@@ -74,6 +82,11 @@ pub struct TurnReport {
     pub sidecar_dropped_frames: u64,
     pub input_dropped_frames: u64,
     pub interrupted: bool,
+    /// Message depth of the bounded conversation context at turn end.
+    pub context_messages: usize,
+    /// Context messages evicted during this turn, as a delta from the depth
+    /// captured at turn start.
+    pub context_evicted_messages: u64,
 }
 
 /// Counters captured when a turn starts, so per-turn drops are deltas from a
@@ -83,6 +96,7 @@ struct TurnBaseline {
     output: RingStats,
     input_dropped: u64,
     events_dropped: u64,
+    context_evicted_messages: u64,
 }
 
 pub struct Session {
@@ -95,6 +109,7 @@ pub struct Session {
     cancel: CancellationToken,
     generation: u64,
     events: EventQueue,
+    context: ChatContext,
 }
 
 impl Session {
@@ -102,9 +117,10 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// Returns a protocol-class error when a provider manifest is invalid or
-    /// when `event_capacity` is below [`MIN_EVENT_CAPACITY`], which is the
-    /// minimum needed to reserve the terminal slot plus streaming headroom.
+    /// Returns a protocol-class error when a provider manifest is invalid, when
+    /// `event_capacity` is below [`MIN_EVENT_CAPACITY`] (the minimum needed to
+    /// reserve the terminal slot plus streaming headroom), or when
+    /// `context_messages` / `context_chars` cannot hold one turn.
     pub fn new(config: SessionConfig, providers: Providers) -> Result<Self, ParlevoxError> {
         for manifest in [
             providers.stt.manifest(),
@@ -122,10 +138,12 @@ impl Session {
                 config.event_capacity
             )));
         }
-        // Every audio and event path is bounded and uses an explicit policy.
+        // Every audio, event, and context path is bounded by an explicit
+        // capacity; the context's own constructor validates its two bounds.
         let input = AudioRing::new(config.input_ring_capacity, OverflowPolicy::DropOldest);
         let output = AudioRing::new(config.output_ring_capacity, OverflowPolicy::DropOldest);
         let events = EventQueue::new(config.event_capacity, config.event_overflow_policy);
+        let context = ChatContext::new(config.context_messages, config.context_chars)?;
         Ok(Session {
             config,
             machine: TurnMachine::new(),
@@ -136,6 +154,7 @@ impl Session {
             cancel: CancellationToken::new(),
             generation: 0,
             events,
+            context,
         })
     }
 
@@ -157,6 +176,11 @@ impl Session {
 
     pub fn output_stats(&self) -> RingStats {
         self.output.stats()
+    }
+
+    /// Depth and cumulative loss counters for the bounded conversation context.
+    pub fn context_stats(&self) -> ContextStats {
+        self.context.stats()
     }
 
     pub fn provider_manifests(&self) -> Vec<ProviderManifest> {
@@ -249,6 +273,7 @@ impl Session {
             output: self.output.stats(),
             input_dropped: self.input.stats().dropped,
             events_dropped: self.events.dropped(),
+            context_evicted_messages: self.context.stats().evicted_messages,
         };
 
         // Bounded input path: one frame carrying the utterance. The outcome is
@@ -338,12 +363,19 @@ impl Session {
             text: transcript.clone(),
         })?;
 
+        // The committed utterance becomes the next request's prompt. Snapshot
+        // the prior turns *before* recording it so the current utterance
+        // appears exactly once: as `prompt`, never duplicated inside `history`.
+        let history = self.context.messages();
+        self.context.push_user(transcript.clone());
+
         // 3. Streaming completion.
         let llm_provider = Arc::clone(&self.providers.llm);
         let mut llm = match llm_provider
             .generate(
                 GenerateRequest {
                     prompt: transcript.clone(),
+                    history,
                 },
                 token.clone(),
             )
@@ -448,6 +480,16 @@ impl Session {
 
         // 5. Close the turn.
         self.apply(TurnEvent::ReplyFinished)?;
+        // Only a turn that ran to completion records an assistant message. An
+        // interrupted or failed turn keeps the already-committed user message
+        // but must not teach the model a reply the caller never heard.
+        self.context.push_assistant(reply.clone());
+        let context_messages = self.context.len();
+        let context_evicted_messages = self
+            .context
+            .stats()
+            .evicted_messages
+            .saturating_sub(baseline.context_evicted_messages);
         let output_dropped = self.output.stats();
         let dropped_frames = output_dropped
             .dropped
@@ -490,6 +532,8 @@ impl Session {
             sidecar_dropped_frames,
             input_dropped_frames,
             interrupted: false,
+            context_messages,
+            context_evicted_messages,
         })
     }
 
@@ -587,6 +631,14 @@ impl Session {
             .events
             .dropped()
             .saturating_sub(baseline.events_dropped);
+        // An interrupted turn keeps the user message it already committed (if
+        // the transcript had been final) and adds no assistant message.
+        let context_messages = self.context.len();
+        let context_evicted_messages = self
+            .context
+            .stats()
+            .evicted_messages
+            .saturating_sub(baseline.context_evicted_messages);
 
         if turn != 0 {
             self.emit(SessionEvent::TurnDone {
@@ -611,6 +663,8 @@ impl Session {
             sidecar_dropped_frames,
             input_dropped_frames,
             interrupted: true,
+            context_messages,
+            context_evicted_messages,
         })
     }
 }
@@ -643,9 +697,9 @@ mod tests {
     use crate::registry::{ProviderNames, ProviderRegistry};
     use parlevox_core::ErrorClass;
     use parlevox_providers::{
-        cancelable_stream, AudioChunk, FakeLlm, FakeStt, FakeTts, FakeVad, Modality,
-        ProviderStream, SttProvider, SynthesizeRequest, TranscriptChunk, TtsProvider, FAKE_REPLY,
-        FAKE_SAMPLE_RATE, FAKE_TRANSCRIPT, FAKE_TTS_FRAMES,
+        cancelable_stream, AudioChunk, ChatMessage, FakeLlm, FakeStt, FakeTts, FakeVad, Modality,
+        ProviderStream, Role, SttProvider, SynthesizeRequest, TranscriptChunk, TtsProvider,
+        FAKE_REPLY, FAKE_SAMPLE_RATE, FAKE_TRANSCRIPT, FAKE_TTS_FRAMES,
     };
 
     /// TTS double that reports a fixed sidecar drop count exactly once, proving
@@ -778,6 +832,99 @@ mod tests {
         let (_, first) = run_fake(SessionConfig::default()).await;
         let (_, second) = run_fake(SessionConfig::default()).await;
         assert_eq!(first.unwrap(), second.unwrap());
+    }
+
+    fn session_with_llm(config: SessionConfig, llm: Arc<FakeLlm>) -> Session {
+        let mut registry = ProviderRegistry::new();
+        registry.register_stt(Arc::new(FakeStt::new())).unwrap();
+        registry.register_llm(llm).unwrap();
+        registry.register_tts(Arc::new(FakeTts::new())).unwrap();
+        registry.register_vad(Arc::new(FakeVad::new())).unwrap();
+        let names = ProviderNames {
+            stt: "fake-stt".into(),
+            llm: "fake-llm".into(),
+            tts: "fake-tts".into(),
+            vad: "fake-vad".into(),
+        };
+        let providers = registry.resolve(&names).unwrap();
+        Session::new(config, providers).unwrap()
+    }
+
+    #[tokio::test]
+    async fn two_turn_request_carries_prior_history_without_duplicating_the_prompt() {
+        let llm = Arc::new(FakeLlm::new());
+        let mut session = session_with_llm(SessionConfig::default(), Arc::clone(&llm));
+        let utterance = demo_utterance(FAKE_SAMPLE_RATE, 1, 40);
+
+        let first = session.run_turn(utterance.clone()).await.unwrap();
+        assert_eq!(first.context_messages, 2);
+        let second = session.run_turn(utterance).await.unwrap();
+        assert_eq!(second.context_messages, 4);
+
+        let request = llm.last_request().expect("second request was recorded");
+        assert_eq!(request.prompt, FAKE_TRANSCRIPT);
+        // Exactly the prior user + assistant turn. The current utterance is
+        // the prompt, so it must not appear as a third history entry.
+        assert_eq!(
+            request.history,
+            vec![
+                ChatMessage {
+                    role: Role::User,
+                    text: FAKE_TRANSCRIPT.into(),
+                },
+                ChatMessage {
+                    role: Role::Assistant,
+                    text: FAKE_REPLY.into(),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_turn_keeps_the_user_message_but_records_no_assistant() {
+        let llm = Arc::new(FakeLlm::new());
+        let config = SessionConfig {
+            barge_in_after_deltas: Some(2),
+            ..SessionConfig::default()
+        };
+        let mut session = session_with_llm(config, Arc::clone(&llm));
+        let utterance = demo_utterance(FAKE_SAMPLE_RATE, 1, 40);
+
+        let report = session.run_turn(utterance.clone()).await.unwrap();
+        assert!(report.interrupted);
+        assert_eq!(report.context_messages, 1);
+        assert_eq!(session.context_stats().messages, 1);
+
+        // The next request sees the committed user turn and no assistant.
+        let _ = session.run_turn(utterance).await.unwrap();
+        let request = llm.last_request().expect("request was recorded");
+        assert_eq!(
+            request.history,
+            vec![ChatMessage {
+                role: Role::User,
+                text: FAKE_TRANSCRIPT.into(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn report_counts_context_depth_and_evictions_per_turn() {
+        let config = SessionConfig {
+            context_messages: 2,
+            ..SessionConfig::default()
+        };
+        let (mut session, first) = run_fake(config).await;
+        let first = first.unwrap();
+        assert_eq!(first.context_messages, 2);
+        assert_eq!(first.context_evicted_messages, 0);
+
+        let second = session
+            .run_turn(demo_utterance(FAKE_SAMPLE_RATE, 1, 40))
+            .await
+            .unwrap();
+        // Turn two evicts the prior user and assistant to keep the depth at 2.
+        assert_eq!(second.context_messages, 2);
+        assert_eq!(second.context_evicted_messages, 2);
     }
 
     #[tokio::test]

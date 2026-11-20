@@ -10,6 +10,7 @@ use std::pin::Pin;
 use async_trait::async_trait;
 use futures_core::Stream;
 use parlevox_core::{AudioFrame, ParlevoxError, Timestamp};
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::manifest::ProviderManifest;
@@ -58,9 +59,44 @@ pub struct TranscriptChunk {
     pub is_final: bool,
 }
 
+/// Who authored one conversation message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    System,
+    User,
+    Assistant,
+}
+
+/// One message in the bounded conversation history.
+///
+/// The wire form is `{"role": "user", "text": "..."}`; `Role` serialises
+/// lowercase because that is the shape the sidecar plugin consumes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: Role,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerateRequest {
     pub prompt: String,
+    /// Prior turns, oldest first. Empty on the first turn.
+    ///
+    /// The current utterance is `prompt` and is deliberately *not* repeated in
+    /// `history`, so a model never sees it twice.
+    pub history: Vec<ChatMessage>,
+}
+
+impl GenerateRequest {
+    /// Build a request with no prior history.
+    #[must_use]
+    pub fn new(prompt: impl Into<String>) -> Self {
+        GenerateRequest {
+            prompt: prompt.into(),
+            history: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

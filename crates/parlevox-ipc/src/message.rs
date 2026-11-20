@@ -10,6 +10,7 @@
 use serde::{Deserialize, Serialize};
 
 use parlevox_core::ErrorClass;
+use parlevox_providers::ChatMessage;
 
 /// Wire version. Bump for any breaking change to the message shapes below.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -81,7 +82,17 @@ pub enum PluginRequest {
         channels: u16,
     },
     /// Ask for a streamed completion.
-    Generate { request_id: String, prompt: String },
+    Generate {
+        request_id: String,
+        prompt: String,
+        /// Prior turns, oldest first, never including the current `prompt`.
+        ///
+        /// Older plugins ignore unknown fields and older core builds omit the
+        /// field entirely, so `#[serde(default)]` keeps both directions
+        /// compatible: a missing history decodes as an empty list.
+        #[serde(default)]
+        history: Vec<ChatMessage>,
+    },
     /// Ask for streamed audio for `text`.
     Synthesize {
         request_id: String,
@@ -135,7 +146,8 @@ pub enum PluginEvent {
         protocol_version: u32,
         abi: String,
         plugin: String,
-        /// Free-form manifest so `parlevox-ipc` does not depend on providers.
+        /// Free-form manifest: kept as JSON so the wire layer does not pin the
+        /// provider crate's manifest shape.
         manifest: serde_json::Value,
     },
     /// A partial transcript.
@@ -211,6 +223,45 @@ impl PluginEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parlevox_providers::Role;
+
+    #[test]
+    fn generate_history_roundtrips_and_legacy_frames_default_to_empty() {
+        let request = PluginRequest::Generate {
+            request_id: "r1".into(),
+            prompt: "now".into(),
+            history: vec![
+                ChatMessage {
+                    role: Role::User,
+                    text: "before".into(),
+                },
+                ChatMessage {
+                    role: Role::Assistant,
+                    text: "earlier reply".into(),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"role\":\"user\""));
+        assert!(json.contains("\"history\":["));
+        assert_eq!(
+            serde_json::from_str::<PluginRequest>(&json).unwrap(),
+            request
+        );
+
+        // A frame from a core build that predates `history` still decodes.
+        let legacy: PluginRequest =
+            serde_json::from_str(r#"{"type":"generate","request_id":"r1","prompt":"now"}"#)
+                .unwrap();
+        assert_eq!(
+            legacy,
+            PluginRequest::Generate {
+                request_id: "r1".into(),
+                prompt: "now".into(),
+                history: Vec::new(),
+            }
+        );
+    }
 
     #[test]
     fn hello_and_ready_roundtrip() {

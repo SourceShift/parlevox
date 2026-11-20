@@ -55,8 +55,15 @@ class LlmProvider(ABC):
         """Provider manifest dict."""
 
     @abstractmethod
-    def generate(self, prompt):
-        """Yield reply deltas as strings."""
+    def generate(self, prompt, history=()):
+        """Yield reply deltas as strings.
+
+        ``history`` is an optional oldest-first sequence of
+        ``{"role": str, "text": str}`` dicts for turns before ``prompt``. The
+        plugin passes it only when non-empty and this signature accepts it, so
+        a third-party provider may keep the one-argument
+        ``generate(self, prompt)`` form.
+        """
 
 
 class TtsProvider(ABC):
@@ -104,9 +111,11 @@ class FakeLlm(LlmProvider):
     def manifest(self):
         return self._manifest
 
-    def generate(self, prompt):
+    def generate(self, prompt, history=()):
         if not prompt.strip():
             raise ValueError("prompt must not be empty")
+        # `history` is accepted for parity with the Rust fake but deliberately
+        # does not change the fixed single-turn deltas.
         for delta in FAKE_LLM_DELTAS:
             yield delta
 

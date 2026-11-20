@@ -56,8 +56,8 @@ sidecar is started only when a session resolves a provider that lives there.
 | Crate | Owns | Key types |
 |---|---|---|
 | `parlevox-core` | Audio frame, clock, bounded ring, FSM, error classes | `AudioFrame`, `MonoClock`, `AudioRing`, `OverflowPolicy`, `TurnMachine`, `TurnState`, `ErrorClass` |
-| `parlevox-providers` | Streaming traits + manifests + deterministic fakes | `SttProvider`, `LlmProvider`, `TtsProvider`, `VadProvider`, `ProviderManifest`, `Fake*` |
-| `parlevox-runtime` | One session: FSM owner, rings, event handoff, provider selection, barge-in | `Session`, `SessionConfig`, `SessionEvent`, `EventQueue`, `ProviderRegistry`, `TurnReport` |
+| `parlevox-providers` | Streaming traits + manifests + deterministic fakes | `SttProvider`, `LlmProvider`, `TtsProvider`, `VadProvider`, `ProviderManifest`, `ChatMessage`, `Role`, `Fake*` |
+| `parlevox-runtime` | One session: FSM owner, rings, event handoff, provider selection, barge-in, bounded context | `Session`, `SessionConfig`, `SessionEvent`, `EventQueue`, `ProviderRegistry`, `TurnReport`, `ChatContext`, `ContextStats` |
 | `parlevox-ipc` | The framed wire protocol — used **only** by the sidecar path | `Frame`, `AudioHeader`, `read_frame`, `write_frame`, `MAX_FRAME_BYTES` |
 | `parlevox-sidecar` | Process supervision and the adapter from plugin → provider trait | `SidecarClient`, `SidecarSupervisor`, `SidecarStt/Llm/Tts`, `RestartPolicy` |
 | `parlevox-cli` | Argument parsing and the one-turn demo, in a library so tests drive the same path | `run_args`, `demo_fake`, `demo_sidecar` |
@@ -134,7 +134,7 @@ dimension. This is the honest scorecard against the shipped tree:
 | 2 | Concurrency & isolation | Supervised plugin processes, multiplexed by `request_id` | **Partial** — supervision + restart backoff + id-multiplexed client exist; no warm pool, one plugin process per session |
 | 3 | Turn-taking | Rust-owned FSM with composable strategies | **Partial** — explicit FSM and barge-in are real; strategy list and adaptive endpointing are not |
 | 4 | Provider abstraction | One small interface per modality + versioned manifest | **Implemented** — traits, `ProviderManifest`, registry lookup |
-| 5 | State & context | Rust-owned `ChatContext`, bounded policy | **Deferred** — no context object yet; the skeleton is single-turn |
+| 5 | State & context | Rust-owned `ChatContext`, bounded policy | **Implemented** — `ChatContext`/`ContextStats` bound by message count and character budget; eviction prefers non-system messages and all loss is counted. The char budget is an estimate, not a token count |
 | 6 | Failure handling | Non-fatal/fatal taxonomy, no replay after commit | **Partial** — `ErrorClass` + `is_recoverable`; no fallback provider chain |
 | 7 | Observability | OTel turn span + boundary cost meters | **Deferred** — counters only (`dropped_*`, `EventQueueStats`); no traces |
 | 8 | Extensibility cost | New provider = one interface + manifest, no core edits | **Implemented** — register/select by name |

@@ -293,6 +293,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "parlevox-core",
+ "parlevox-providers",
  "proptest",
  "serde",
  "serde_json",

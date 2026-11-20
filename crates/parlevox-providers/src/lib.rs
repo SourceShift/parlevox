@@ -22,6 +22,6 @@ pub use fakes::{
 pub use manifest::{Modality, ProviderManifest};
 pub use stream::cancelable_stream;
 pub use traits::{
-    AudioChunk, GenerateRequest, LlmProvider, ProviderStream, SttProvider, SynthesizeRequest,
-    TranscriptChunk, TtsProvider, VadEvent, VadProvider,
+    AudioChunk, ChatMessage, GenerateRequest, LlmProvider, ProviderStream, Role, SttProvider,
+    SynthesizeRequest, TranscriptChunk, TtsProvider, VadEvent, VadProvider,
 };

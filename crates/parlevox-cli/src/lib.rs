@@ -137,7 +137,8 @@ async fn run_and_render(mut session: Session) -> Result<(), ParlevoxError> {
             println!(
                 "summary turn={} transcript={:?} reply={:?} audio_frames={} \
                  dropped_frames={} dropped_ms={} dropped_events={} \
-                 sidecar_dropped_frames={} interrupted={}",
+                 sidecar_dropped_frames={} interrupted={} \
+                 context_messages={} context_evicted_messages={}",
                 report.turn,
                 report.transcript,
                 report.reply,
@@ -146,7 +147,9 @@ async fn run_and_render(mut session: Session) -> Result<(), ParlevoxError> {
                 report.dropped_ms,
                 report.dropped_events,
                 report.sidecar_dropped_frames,
-                report.interrupted
+                report.interrupted,
+                report.context_messages,
+                report.context_evicted_messages
             );
             Ok(())
         }
