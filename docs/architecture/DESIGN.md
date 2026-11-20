@@ -157,7 +157,11 @@ A Python-only provider implements `parlevox_sdk.Plugin` and is reached through
 the sidecar adapter, which presents it to the runtime as the same trait. The
 plugin host bounds each in-flight request's pending audio, purges it on
 `cancel`, and acknowledges only after the local stream is torn down; the
-process survives a cancel and serves the next request.
+process survives a cancel and serves the next request. The SDK directory is
+resolved at run time in this order: `PARLEVOX_PYTHON_SDK` (a hard error when
+set but invalid), then `sdks/python` relative to the executable (including the
+installed `<prefix>/lib/parlevox` layout), then a documented build-tree
+fallback; when nothing matches, the error lists every path tried.
 
 ## 7. Running it
 

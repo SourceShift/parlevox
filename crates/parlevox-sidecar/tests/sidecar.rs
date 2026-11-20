@@ -48,7 +48,7 @@ async fn hung_plugin_times_out_during_handshake() {
 #[tokio::test]
 async fn cancel_ends_the_stream_without_killing_the_process() {
     let client = Arc::new(
-        SidecarClient::spawn(SidecarConfig::python_sdk())
+        SidecarClient::spawn(SidecarConfig::python_sdk().expect("resolve the bundled SDK"))
             .await
             .unwrap(),
     );
@@ -110,7 +110,7 @@ async fn transcribe_overflow_reports_dropped_frames_in_done() {
     }
 
     let client = Arc::new(
-        SidecarClient::spawn(SidecarConfig::python_sdk())
+        SidecarClient::spawn(SidecarConfig::python_sdk().expect("resolve the bundled SDK"))
             .await
             .unwrap(),
     );
@@ -165,7 +165,7 @@ async fn sidecar_stt_captures_the_plugin_dropped_frames() {
     }
 
     let client = Arc::new(
-        SidecarClient::spawn(SidecarConfig::python_sdk())
+        SidecarClient::spawn(SidecarConfig::python_sdk().expect("resolve the bundled SDK"))
             .await
             .unwrap(),
     );
@@ -210,7 +210,10 @@ async fn supervisor_restarts_a_dead_plugin() {
         base_backoff_ms: 20,
         max_backoff_ms: 100,
     };
-    let mut supervisor = SidecarSupervisor::new(SidecarConfig::python_sdk(), policy);
+    let mut supervisor = SidecarSupervisor::new(
+        SidecarConfig::python_sdk().expect("resolve the bundled SDK"),
+        policy,
+    );
 
     let first = supervisor.ensure().await.unwrap();
     assert!(first.is_alive().await);
