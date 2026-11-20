@@ -8,7 +8,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use parlevox_sidecar::{PoolConfig, SidecarClient, SidecarConfig, SidecarPool};
+use parlevox_core::ParlevoxError;
+use parlevox_sidecar::{PoolConfig, SidecarConfig, SidecarPool};
 
 fn python() -> String {
     std::env::var("PARLEVOX_PYTHON").unwrap_or_else(|_| "python3".into())
@@ -213,10 +214,19 @@ async fn pool_replaces_a_dead_idle_process() {
 
     let lease = pool.acquire().await.unwrap();
     let old_pid = pid(&lease);
-    let handle: Arc<SidecarClient> = Arc::clone(lease.client());
+    // A clean release pools the process; no client clone may outlive the lease.
     lease.release().await.unwrap();
 
-    handle.kill().await;
+    // Kill the now-idle process out of band so the acquire probe must observe
+    // the death. SIGKILL leaves an unreaped zombie, which `kill -0` still
+    // reports as alive; wait a beat, then let the failed probe and its
+    // `client.kill()` reap the child instead of polling for exit.
+    let signalled = std::process::Command::new("kill")
+        .args(["-9", &old_pid.to_string()])
+        .status()
+        .expect("send SIGKILL to the idle process");
+    assert!(signalled.success(), "SIGKILL must reach the idle process");
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let fresh = pool.acquire().await.unwrap();
     assert_ne!(pid(&fresh), old_pid);
@@ -226,6 +236,97 @@ async fn pool_replaces_a_dead_idle_process() {
     );
 
     fresh.release().await.unwrap();
+    pool.shutdown().await;
+}
+
+#[tokio::test]
+async fn release_refuses_while_a_client_handle_is_alive() {
+    if !python_available() {
+        eprintln!("skipping release-refusal test: no Python interpreter");
+        return;
+    }
+
+    let pool = Arc::new(SidecarPool::new(
+        scripted("ack"),
+        PoolConfig::default().with_max_idle(1),
+    ));
+
+    let lease = pool.acquire().await.unwrap();
+    let first_pid = pid(&lease);
+    // An adapter handle outlives the lease: the process may still be in use, so
+    // the release must refuse rather than pool it.
+    let handle = Arc::clone(lease.client());
+
+    let err = lease
+        .release()
+        .await
+        .expect_err("an outstanding client handle must refuse the release");
+    assert!(
+        matches!(&err, ParlevoxError::Protocol(_)),
+        "a live handle is a protocol violation, got {err:?}"
+    );
+    let rendered = err.to_string();
+    assert!(
+        rendered.starts_with("protocol violation:"),
+        "the refusal must be protocol-class: {rendered}"
+    );
+    assert!(
+        rendered.contains("1 handle(s)") && rendered.contains("client()"),
+        "the refusal must name the live handles and the fix: {rendered}"
+    );
+
+    // The chosen fate: the refused process is killed, never pooled, and counted
+    // exactly once while no other counter moves.
+    wait_until_process_exits(first_pid).await;
+    let stats = pool.stats();
+    assert_eq!(stats.release_refused, 1);
+    assert_eq!(stats.shutdown, 0);
+    assert_eq!(stats.reset_failures, 0);
+    assert_eq!(stats.reused, 0);
+    assert_eq!(stats.spawned, 1);
+
+    // Dropping the stray handle leaves the pool empty, so the next lease is a
+    // fresh process rather than the refused one.
+    drop(handle);
+    let next = pool.acquire().await.unwrap();
+    assert_ne!(
+        pid(&next),
+        first_pid,
+        "the refused process must not be pooled"
+    );
+    assert_eq!(pool.stats().spawned, 2);
+
+    next.release().await.unwrap();
+    pool.shutdown().await;
+}
+
+#[tokio::test]
+async fn release_with_no_outstanding_clone_still_pools() {
+    if !python_available() {
+        eprintln!("skipping clean-release test: no Python interpreter");
+        return;
+    }
+
+    let pool = Arc::new(SidecarPool::new(
+        scripted("ack"),
+        PoolConfig::default().with_max_idle(1),
+    ));
+
+    let lease = pool.acquire().await.unwrap();
+    let first_pid = pid(&lease);
+    lease
+        .release()
+        .await
+        .expect("a clean release pools the process");
+    assert_eq!(pool.stats().release_refused, 0);
+
+    let reacquired = pool.acquire().await.unwrap();
+    assert_eq!(pid(&reacquired), first_pid, "a clean release is reused");
+    let stats = pool.stats();
+    assert_eq!(stats.reused, 1);
+    assert_eq!(stats.release_refused, 0);
+
+    reacquired.release().await.unwrap();
     pool.shutdown().await;
 }
 
