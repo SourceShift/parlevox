@@ -113,6 +113,10 @@ pub struct SidecarConfig {
     pub env: Vec<(String, String)>,
     pub handshake_timeout_ms: u64,
     pub shutdown_timeout_ms: u64,
+    /// Timeout for a `reset` acknowledgement. `None` inherits
+    /// [`Self::handshake_timeout_ms`], so a caller that only tunes the
+    /// handshake gets the same bound for a reset.
+    pub reset_timeout_ms: Option<u64>,
 }
 
 impl SidecarConfig {
@@ -178,6 +182,7 @@ impl SidecarConfig {
             env: vec![("PYTHONPATH".into(), python_path)],
             handshake_timeout_ms: 5_000,
             shutdown_timeout_ms: 2_000,
+            reset_timeout_ms: None,
         }
     }
 
@@ -190,7 +195,22 @@ impl SidecarConfig {
             env: Vec::new(),
             handshake_timeout_ms: 5_000,
             shutdown_timeout_ms: 2_000,
+            reset_timeout_ms: None,
         }
+    }
+
+    /// Bound how long a `reset` acknowledgement may take. By default a reset
+    /// inherits [`Self::handshake_timeout_ms`].
+    #[must_use = "builder methods return a modified config; chain or assign the result"]
+    pub fn with_reset_timeout_ms(mut self, ms: u64) -> Self {
+        self.reset_timeout_ms = Some(ms);
+        self
+    }
+
+    /// Effective reset timeout: the explicit override or the handshake bound.
+    #[must_use]
+    pub fn reset_timeout(&self) -> u64 {
+        self.reset_timeout_ms.unwrap_or(self.handshake_timeout_ms)
     }
 
     #[must_use = "builder methods return a modified config; chain or assign the result"]

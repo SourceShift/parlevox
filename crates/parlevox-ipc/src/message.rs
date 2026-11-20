@@ -110,6 +110,11 @@ pub enum PluginRequest {
     AudioEnd { request_id: String },
     /// Cancel an in-flight request without killing the process.
     Cancel { request_id: String },
+    /// Clear every pending request and cancellation tombstone, then answer
+    /// with `ready`. Additive: a plugin that does not advertise the `reset`
+    /// capability can ignore it, and the client never sends it to such a
+    /// plugin.
+    Reset,
     /// Graceful process shutdown.
     Shutdown,
 }
@@ -118,7 +123,7 @@ impl PluginRequest {
     /// The request this message opens or controls, when it has one.
     pub fn request_id(&self) -> Option<&str> {
         match self {
-            PluginRequest::Hello { .. } | PluginRequest::Shutdown => None,
+            PluginRequest::Hello { .. } | PluginRequest::Reset | PluginRequest::Shutdown => None,
             PluginRequest::AudioEnd { request_id }
             | PluginRequest::Cancel { request_id }
             | PluginRequest::Transcribe { request_id, .. }
@@ -149,6 +154,11 @@ pub enum PluginEvent {
         /// Free-form manifest: kept as JSON so the wire layer does not pin the
         /// provider crate's manifest shape.
         manifest: serde_json::Value,
+        /// Named session-level capabilities, e.g. `"reset"`. Additive: a
+        /// plugin that predates the field omits it and decodes as empty, so it
+        /// is never pooled.
+        #[serde(default)]
+        capabilities: Vec<String>,
     },
     /// A partial transcript.
     Partial { request_id: String, text: String },
@@ -279,10 +289,40 @@ mod tests {
             abi: SIDECAR_ABI.into(),
             plugin: "fake".into(),
             manifest: serde_json::json!({"name": "fake", "modality": "tts"}),
+            capabilities: vec!["reset".into()],
         };
         let json = serde_json::to_string(&ready).unwrap();
         assert!(json.contains("\"type\":\"ready\""));
+        assert!(json.contains("\"capabilities\":[\"reset\"]"));
         assert_eq!(serde_json::from_str::<PluginEvent>(&json).unwrap(), ready);
+    }
+
+    #[test]
+    fn reset_roundtrips_without_a_request_id() {
+        let reset = PluginRequest::Reset;
+        let json = serde_json::to_string(&reset).unwrap();
+        assert_eq!(json, r#"{"type":"reset"}"#);
+        assert_eq!(serde_json::from_str::<PluginRequest>(&json).unwrap(), reset);
+        assert_eq!(reset.request_id(), None);
+        assert!(!reset.needs_audio_end());
+    }
+
+    #[test]
+    fn legacy_ready_without_capabilities_decodes_as_empty() {
+        // A plugin built before the additive field still completes a
+        // handshake; an empty capability list means the client must never
+        // pool it.
+        let legacy: PluginEvent = serde_json::from_str(
+            r#"{"type":"ready","protocol_version":1,"abi":"parlevox-sidecar/1",
+                "plugin":"old","manifest":{"name":"old","modality":"tts"}}"#,
+        )
+        .unwrap();
+        match legacy {
+            PluginEvent::Ready { capabilities, .. } => {
+                assert!(capabilities.is_empty());
+            }
+            other => panic!("expected ready, got {other:?}"),
+        }
     }
 
     #[test]

@@ -19,6 +19,82 @@ use parlevox_sidecar::{
     resolve_sdk_path, SdkSearch, SidecarClient, SidecarConfig, SidecarLlm, SidecarStt, SidecarTts,
 };
 
+/// Build a session whose STT, LLM and TTS are served by `client` over the
+/// framed protocol; VAD stays in process because it is a deterministic fake.
+///
+/// This is the single construction path shared by the differential parity test
+/// and the pool reuse test, so a change to provider wiring cannot make those
+/// tests disagree about what a session is.
+///
+/// # Errors
+///
+/// Returns a protocol-class error when a server-backed provider's manifest is
+/// invalid or the requested names cannot be resolved, and any error from
+/// session configuration.
+pub fn sidecar_session(client: Arc<SidecarClient>) -> Result<Session, ParlevoxError> {
+    let stt = Arc::new(SidecarStt::new(Arc::clone(&client)));
+    let llm = Arc::new(SidecarLlm::new(Arc::clone(&client)));
+    let tts = Arc::new(SidecarTts::new(Arc::clone(&client)));
+    let mut registry = ProviderRegistry::new();
+    registry.register_stt(stt.clone())?;
+    registry.register_llm(llm.clone())?;
+    registry.register_tts(tts.clone())?;
+    registry.register_vad(Arc::new(FakeVad::new()))?;
+
+    let names = ProviderNames {
+        stt: stt.manifest().name.clone(),
+        llm: llm.manifest().name.clone(),
+        tts: tts.manifest().name.clone(),
+        vad: "fake-vad".into(),
+    };
+    let providers = registry.resolve(&names)?;
+    Session::new(SessionConfig::default(), providers)
+}
+
+/// Canonical, timestamp-free projection of an event trace.
+///
+/// Audio timestamps are session-epoch-relative, so they are normalized away;
+/// kind, turn, text, PCM samples, sample rate, channels and every drop counter
+/// are preserved. Two runs are interchangeable exactly when their projections
+/// are equal.
+#[must_use]
+pub fn project_events(events: &[SessionEvent]) -> Vec<String> {
+    events
+        .iter()
+        .map(|event| match event {
+            SessionEvent::TurnStarted { turn } => format!("TurnStarted turn={turn}"),
+            SessionEvent::TranscriptFinal { turn, text } => {
+                format!("TranscriptFinal turn={turn} text={text:?}")
+            }
+            SessionEvent::ReplyDelta { turn, text } => {
+                format!("ReplyDelta turn={turn} text={text:?}")
+            }
+            SessionEvent::AudioOut { turn, frame } => format!(
+                "AudioOut turn={turn} rate={} channels={} pcm={:?}",
+                frame.sample_rate, frame.channels, frame.pcm
+            ),
+            SessionEvent::TurnDone {
+                turn,
+                audio_frames,
+                dropped_frames,
+                dropped_ms,
+                dropped_events,
+                sidecar_dropped_frames,
+                interrupted,
+            } => format!(
+                "TurnDone turn={turn} audio_frames={audio_frames} \
+                 dropped_frames={dropped_frames} dropped_ms={dropped_ms} \
+                 dropped_events={dropped_events} \
+                 sidecar_dropped_frames={sidecar_dropped_frames} \
+                 interrupted={interrupted}"
+            ),
+            SessionEvent::Failed { class, message } => {
+                format!("Failed class={class:?} message={message:?}")
+            }
+        })
+        .collect()
+}
+
 /// Parse process arguments and run the matching demo.
 ///
 /// # Errors
