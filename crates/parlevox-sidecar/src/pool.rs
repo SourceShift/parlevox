@@ -49,17 +49,20 @@ impl Default for PoolConfig {
 }
 
 impl PoolConfig {
+    /// Build a configuration with an explicit idle cap and age ceiling.
     #[must_use]
     pub fn new(max_idle: usize, max_age: Duration) -> Self {
         PoolConfig { max_idle, max_age }
     }
 
+    /// Return this configuration with a different [`PoolConfig::max_idle`].
     #[must_use = "builder methods return a modified config; chain or assign the result"]
     pub fn with_max_idle(mut self, max_idle: usize) -> Self {
         self.max_idle = max_idle;
         self
     }
 
+    /// Return this configuration with a different [`PoolConfig::max_age`].
     #[must_use = "builder methods return a modified config; chain or assign the result"]
     pub fn with_max_age(mut self, max_age: Duration) -> Self {
         self.max_age = max_age;
@@ -71,19 +74,38 @@ impl PoolConfig {
 ///
 /// `since` is measured from release, not spawn: the age ceiling is about how
 /// long a handshaken process has been parked, not how old the process is.
+#[derive(Debug)]
 pub struct IdleEntry<T> {
+    /// The idle client itself.
     pub client: T,
+    /// The instant the client became idle, used to enforce the age ceiling.
     pub since: Instant,
 }
 
 impl<T> IdleEntry<T> {
+    /// Pair a client with the instant it became idle.
     #[must_use]
     pub fn new(client: T, since: Instant) -> Self {
         IdleEntry { client, since }
     }
 }
 
+/// What [`IdleQueue::push`] did with an offered entry.
+///
+/// Both fields carry clients the caller must shut down; neither is retained by
+/// the queue.
+#[derive(Debug)]
+#[must_use = "the outcome carries clients the caller must shut down"]
+pub struct PushOutcome<T> {
+    /// Entries displaced to stay within the idle cap. At most one.
+    pub displaced: Vec<T>,
+    /// The offered entry, returned unchanged when the queue refuses it because
+    /// pooling is disabled or it is already past the age ceiling.
+    pub refused: Option<IdleEntry<T>>,
+}
+
 /// What [`IdleQueue::take`] found.
+#[must_use = "the outcome carries clients the caller must shut down"]
 pub struct TakeOutcome<T> {
     /// The oldest live entry, when one exists.
     pub entry: Option<IdleEntry<T>>,
@@ -105,6 +127,7 @@ pub struct IdleQueue<T> {
 }
 
 impl<T> IdleQueue<T> {
+    /// Create an empty queue bounded by an idle cap and an age ceiling.
     #[must_use]
     pub fn new(max_idle: usize, max_age: Duration) -> Self {
         IdleQueue {
@@ -114,11 +137,13 @@ impl<T> IdleQueue<T> {
         }
     }
 
+    /// Number of entries currently parked in the queue.
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    /// Whether the queue currently parks no entries.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -126,27 +151,42 @@ impl<T> IdleQueue<T> {
 
     /// Offer `entry` to the queue at `now`.
     ///
-    /// Returns the clients the caller must shut down: the entry itself when it
-    /// is already at or past the age ceiling or pooling is disabled, otherwise
-    /// at most the single oldest entry displaced by the idle cap.
-    pub fn push(&mut self, entry: IdleEntry<T>, now: Instant) -> Vec<T> {
+    /// This is the single home of the refusal rule: an entry is refused when
+    /// pooling is disabled or it is already at or past the age ceiling. An
+    /// accepted entry may still displace the oldest one to respect the idle
+    /// cap. Every client the queue did not retain is returned for the caller to
+    /// shut down.
+    #[must_use = "the outcome carries clients the caller must shut down"]
+    pub fn push(&mut self, entry: IdleEntry<T>, now: Instant) -> PushOutcome<T> {
         if self.max_idle == 0 || now.saturating_duration_since(entry.since) >= self.max_age {
-            return vec![entry.client];
+            return PushOutcome {
+                displaced: Vec::new(),
+                refused: Some(entry),
+            };
         }
         if self.entries.len() >= self.max_idle {
-            let mut evicted = Vec::with_capacity(1);
-            if let Some(displaced) = self.entries.pop_front() {
-                evicted.push(displaced.client);
-            }
+            let displaced: Vec<T> = self
+                .entries
+                .pop_front()
+                .map(|entry| entry.client)
+                .into_iter()
+                .collect();
             self.entries.push_back(entry);
-            return evicted;
+            return PushOutcome {
+                displaced,
+                refused: None,
+            };
         }
         self.entries.push_back(entry);
-        Vec::new()
+        PushOutcome {
+            displaced: Vec::new(),
+            refused: None,
+        }
     }
 
     /// Take the oldest live entry at `now`, dropping (and returning) every
     /// aged-out entry so an expired process is never handed out.
+    #[must_use = "the outcome carries the entry and every expired client"]
     pub fn take(&mut self, now: Instant) -> TakeOutcome<T> {
         let mut expired = Vec::new();
         while let Some(front) = self.entries.front() {
@@ -164,6 +204,7 @@ impl<T> IdleQueue<T> {
     }
 
     /// Remove every entry; the caller owns shutting them down.
+    #[must_use = "the caller owns shutting down the drained entries"]
     pub fn drain(&mut self) -> Vec<IdleEntry<T>> {
         self.entries.drain(..).collect()
     }
@@ -182,6 +223,7 @@ pub struct PoolStats {
 
 /// A point-in-time copy of [`PoolStats`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PoolStatsSnapshot {
     /// Fresh processes spawned because no idle entry was usable.
     pub spawned: u64,
@@ -195,12 +237,13 @@ pub struct PoolStatsSnapshot {
     /// reached. A release refused by configuration is not counted here.
     pub evicted: u64,
     /// Processes shut down without being pooled: a non-reset-capable release,
-    /// a release refused by [`PoolConfig`] (`max_idle == 0` or `max_age == 0`),
-    /// or [`SidecarPool::shutdown`].
+    /// a release the configuration refuses (an idle cap or age ceiling of
+    /// zero), or [`SidecarPool::shutdown`].
     pub shutdown: u64,
 }
 
 impl PoolStats {
+    /// Read every counter as a point-in-time snapshot.
     #[must_use]
     pub fn snapshot(&self) -> PoolStatsSnapshot {
         PoolStatsSnapshot {
@@ -224,17 +267,17 @@ impl PoolStats {
 /// handle back to the pool so [`PoolLease::release`] can return the process.
 pub struct SidecarPool {
     config: SidecarConfig,
-    pool_config: PoolConfig,
     queue: Mutex<IdleQueue<Arc<SidecarClient>>>,
     stats: PoolStats,
 }
 
 impl SidecarPool {
+    /// Create an empty pool that will spawn processes from `config` and bound
+    /// its idle set with `pool_config`.
     #[must_use]
     pub fn new(config: SidecarConfig, pool_config: PoolConfig) -> Self {
         SidecarPool {
             config,
-            pool_config,
             queue: Mutex::new(IdleQueue::new(pool_config.max_idle, pool_config.max_age)),
             stats: PoolStats::default(),
         }
@@ -315,25 +358,24 @@ impl SidecarPool {
         }
         match client.reset().await {
             Ok(()) => {
-                if self.pool_config.max_idle == 0 || self.pool_config.max_age.is_zero() {
+                let now = Instant::now();
+                let outcome = {
+                    let mut queue = self.queue.lock().await;
+                    queue.push(IdleEntry::new(client, now), now)
+                };
+                for victim in outcome.displaced {
+                    PoolStats::bump(&self.stats.evicted);
+                    if victim.shutdown().await.is_err() {
+                        victim.kill().await;
+                    }
+                }
+                if let Some(entry) = outcome.refused {
                     // The configuration refuses this release, so the process is
                     // shut down without ever being pooled. That is the
                     // documented meaning of `shutdown`, not a cap displacement.
                     PoolStats::bump(&self.stats.shutdown);
-                    if client.shutdown().await.is_err() {
-                        client.kill().await;
-                    }
-                    return Ok(());
-                }
-                let now = Instant::now();
-                let displaced = {
-                    let mut queue = self.queue.lock().await;
-                    queue.push(IdleEntry::new(client, now), now)
-                };
-                for victim in displaced {
-                    PoolStats::bump(&self.stats.evicted);
-                    if victim.shutdown().await.is_err() {
-                        victim.kill().await;
+                    if entry.client.shutdown().await.is_err() {
+                        entry.client.kill().await;
                     }
                 }
                 Ok(())
@@ -438,11 +480,15 @@ mod tests {
 
         for index in 0..32u32 {
             let now = base + Duration::from_millis(u64::from(index));
-            let evicted = queue.push(entry(index, now), now);
+            let outcome = queue.push(entry(index, now), now);
             assert!(
-                evicted.len() <= 1,
+                outcome.displaced.len() <= 1,
                 "one push displaced {} entries",
-                evicted.len()
+                outcome.displaced.len()
+            );
+            assert!(
+                outcome.refused.is_none(),
+                "a live entry must not be refused"
             );
             largest = largest.max(queue.len());
         }
@@ -460,9 +506,10 @@ mod tests {
     fn push_evicts_the_oldest_entry_when_the_cap_is_reached() {
         let mut queue = IdleQueue::new(1, Duration::from_secs(60));
         let base = Instant::now();
-        assert!(queue.push(entry(1, base), base).is_empty());
-        let evicted = queue.push(entry(2, base), base);
-        assert_eq!(evicted, vec![1]);
+        assert!(queue.push(entry(1, base), base).displaced.is_empty());
+        let outcome = queue.push(entry(2, base), base);
+        assert_eq!(outcome.displaced, vec![1]);
+        assert!(outcome.refused.is_none());
         assert_eq!(queue.len(), 1);
     }
 
@@ -470,7 +517,7 @@ mod tests {
     fn take_never_hands_out_an_expired_entry() {
         let mut queue = IdleQueue::new(4, Duration::from_millis(10));
         let base = Instant::now();
-        queue.push(entry(1, base), base);
+        assert!(queue.push(entry(1, base), base).refused.is_none());
 
         let outcome = queue.take(base + Duration::from_millis(11));
         assert!(outcome.entry.is_none());
@@ -482,8 +529,11 @@ mod tests {
     fn take_returns_live_entries_in_release_order() {
         let mut queue = IdleQueue::new(4, Duration::from_secs(60));
         let base = Instant::now();
-        queue.push(entry(1, base), base);
-        queue.push(entry(2, base + Duration::from_millis(1)), base);
+        assert!(queue.push(entry(1, base), base).refused.is_none());
+        assert!(queue
+            .push(entry(2, base + Duration::from_millis(1)), base)
+            .refused
+            .is_none());
 
         let now = base + Duration::from_millis(2);
         assert_eq!(queue.take(now).entry.map(|e| e.client), Some(1));
@@ -495,13 +545,14 @@ mod tests {
     fn push_shuts_down_an_already_expired_entry_and_a_disabled_pool() {
         let base = Instant::now();
         let mut zero_age = IdleQueue::new(4, Duration::from_millis(1));
-        assert_eq!(
-            zero_age.push(entry(7, base), base + Duration::from_millis(2)),
-            vec![7]
-        );
+        let refused = zero_age.push(entry(7, base), base + Duration::from_millis(2));
+        assert!(refused.displaced.is_empty());
+        assert_eq!(refused.refused.map(|entry| entry.client), Some(7));
 
         let mut disabled = IdleQueue::new(0, Duration::from_secs(60));
-        assert_eq!(disabled.push(entry(8, base), base), vec![8]);
+        let refused = disabled.push(entry(8, base), base);
+        assert!(refused.displaced.is_empty());
+        assert_eq!(refused.refused.map(|entry| entry.client), Some(8));
         assert!(disabled.is_empty());
     }
 
@@ -509,8 +560,8 @@ mod tests {
     fn drain_removes_every_entry() {
         let mut queue = IdleQueue::new(4, Duration::from_secs(60));
         let base = Instant::now();
-        queue.push(entry(1, base), base);
-        queue.push(entry(2, base), base);
+        assert!(queue.push(entry(1, base), base).refused.is_none());
+        assert!(queue.push(entry(2, base), base).refused.is_none());
         assert_eq!(queue.drain().len(), 2);
         assert!(queue.is_empty());
     }

@@ -15,8 +15,8 @@ pub use config::{
     resolve_sdk_path, sdk_is_available, SdkLookupError, SdkSearch, SidecarConfig, SDK_ENV_VAR,
 };
 pub use pool::{
-    IdleEntry, IdleQueue, PoolConfig, PoolLease, PoolStats, PoolStatsSnapshot, SidecarPool,
-    TakeOutcome,
+    IdleEntry, IdleQueue, PoolConfig, PoolLease, PoolStats, PoolStatsSnapshot, PushOutcome,
+    SidecarPool, TakeOutcome,
 };
 pub use provider::{SidecarLlm, SidecarStt, SidecarTts};
 pub use supervisor::{RestartPolicy, SidecarSupervisor};
