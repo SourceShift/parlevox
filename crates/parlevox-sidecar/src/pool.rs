@@ -216,6 +216,7 @@ pub struct PoolStats {
     spawned: AtomicU64,
     reused: AtomicU64,
     reset_failures: AtomicU64,
+    release_refused: AtomicU64,
     expired: AtomicU64,
     evicted: AtomicU64,
     shutdown: AtomicU64,
@@ -231,6 +232,9 @@ pub struct PoolStatsSnapshot {
     pub reused: u64,
     /// Probe or release resets that failed; each such process was killed.
     pub reset_failures: u64,
+    /// Releases refused because a [`PoolLease::client`] clone was still alive
+    /// when the lease was released. Each such process was killed, never pooled.
+    pub release_refused: u64,
     /// Idle entries dropped because they were past `max_age`.
     pub expired: u64,
     /// Idle entries displaced because the [`PoolConfig::max_idle`] cap was
@@ -250,6 +254,7 @@ impl PoolStats {
             spawned: self.spawned.load(Ordering::Relaxed),
             reused: self.reused.load(Ordering::Relaxed),
             reset_failures: self.reset_failures.load(Ordering::Relaxed),
+            release_refused: self.release_refused.load(Ordering::Relaxed),
             expired: self.expired.load(Ordering::Relaxed),
             evicted: self.evicted.load(Ordering::Relaxed),
             shutdown: self.shutdown.load(Ordering::Relaxed),
@@ -423,20 +428,57 @@ impl PoolLease {
     /// or killed and counted exactly as an uninterrupted release would. The
     /// caller then observes no `Result`, but no process is leaked.
     ///
+    /// A lease is exclusive: every clone returned by [`PoolLease::client`] must
+    /// be dropped before this is called. If any live clone remains, the release
+    /// is refused rather than pooling a process the caller may still be using.
+    /// The refused process is killed, never pooled, and counted in
+    /// [`PoolStatsSnapshot::release_refused`]; `Drop` cannot kill it a second
+    /// time because the lease is already marked released.
+    ///
     /// # Errors
     ///
-    /// Returns a protocol-class error when a request route is still open, or a
-    /// transport-class error when the process is dead or does not answer. A
-    /// failed release kills and counts the process rather than pooling it.
-    /// Returns a transport-class error when called outside a Tokio runtime or
-    /// when the detached release task cannot be joined.
+    /// Returns a protocol-class error when a [`PoolLease::client`] clone is
+    /// still alive at release time, naming the outstanding handles and the
+    /// `client()` fix; that process is killed and counted in
+    /// [`PoolStatsSnapshot::release_refused`]. Returns a protocol-class error
+    /// when a request route is still open, or a transport-class error when the
+    /// process is dead or does not answer. A failed release kills and counts the
+    /// process rather than pooling it. Returns a transport-class error when
+    /// called outside a Tokio runtime or when the detached release task cannot
+    /// be joined.
     pub async fn release(mut self) -> Result<(), ParlevoxError> {
+        // Resolve the runtime before touching the client: a caller outside
+        // Tokio still receives the transport error it always has, rather than a
+        // refusal whose kill could not be spawned.
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|_| ParlevoxError::Transport("release requires a Tokio runtime".into()))?;
+
+        // Check the live handle count before cloning. This method's own clone
+        // for the detached task is made only after the decision below, so it
+        // cannot inflate the count.
+        let live = Arc::strong_count(&self.client);
+        if live > 1 {
+            // Refuse the release and kill the process instead of pooling it:
+            // the caller still holds a handle into a process it handed back, so
+            // the pool cannot trust the process's state. Mark the lease released
+            // first so `Drop` cannot spawn a second, uncounted kill.
+            self.released = true;
+            PoolStats::bump(&self.pool.stats.release_refused);
+            let client = Arc::clone(&self.client);
+            runtime.spawn(async move {
+                client.kill().await;
+            });
+            return Err(ParlevoxError::Protocol(format!(
+                "lease released while {} handle(s) to the sidecar client were still \
+                 alive; drop every clone returned by `client()` before calling `release()`",
+                live - 1
+            )));
+        }
+
         // Take ownership before spawning: the task must outlive this future so
         // dropping the future detaches the release instead of aborting it.
         let pool = Arc::clone(&self.pool);
         let client = Arc::clone(&self.client);
-        let runtime = tokio::runtime::Handle::try_current()
-            .map_err(|_| ParlevoxError::Transport("release requires a Tokio runtime".into()))?;
         let detached = runtime.spawn(async move { pool.release_client(client).await });
         // Only mark the lease handed over once the task exists; if anything
         // above failed, `Drop` still owns the process and kills it.
