@@ -34,8 +34,8 @@ pub struct PoolConfig {
     /// Maximum number of idle processes kept alive. `0` disables pooling, so
     /// every release shuts its process down.
     pub max_idle: usize,
-    /// Maximum time a process may sit idle before it is shut down instead of
-    /// handed out.
+    /// Maximum time a process may sit idle. Age is checked at lease time: a
+    /// process older than this is shut down rather than handed out.
     pub max_age: Duration,
 }
 
@@ -191,10 +191,12 @@ pub struct PoolStatsSnapshot {
     pub reset_failures: u64,
     /// Idle entries dropped because they were past `max_age`.
     pub expired: u64,
-    /// Idle entries displaced because the idle cap was reached.
+    /// Idle entries displaced because the [`PoolConfig::max_idle`] cap was
+    /// reached. A release refused by configuration is not counted here.
     pub evicted: u64,
-    /// Processes shut down without being pooled (non-reset-capable release or
-    /// pool shutdown).
+    /// Processes shut down without being pooled: a non-reset-capable release,
+    /// a release refused by [`PoolConfig`] (`max_idle == 0` or `max_age == 0`),
+    /// or [`SidecarPool::shutdown`].
     pub shutdown: u64,
 }
 
@@ -222,6 +224,7 @@ impl PoolStats {
 /// handle back to the pool so [`PoolLease::release`] can return the process.
 pub struct SidecarPool {
     config: SidecarConfig,
+    pool_config: PoolConfig,
     queue: Mutex<IdleQueue<Arc<SidecarClient>>>,
     stats: PoolStats,
 }
@@ -231,6 +234,7 @@ impl SidecarPool {
     pub fn new(config: SidecarConfig, pool_config: PoolConfig) -> Self {
         SidecarPool {
             config,
+            pool_config,
             queue: Mutex::new(IdleQueue::new(pool_config.max_idle, pool_config.max_age)),
             stats: PoolStats::default(),
         }
@@ -311,6 +315,16 @@ impl SidecarPool {
         }
         match client.reset().await {
             Ok(()) => {
+                if self.pool_config.max_idle == 0 || self.pool_config.max_age.is_zero() {
+                    // The configuration refuses this release, so the process is
+                    // shut down without ever being pooled. That is the
+                    // documented meaning of `shutdown`, not a cap displacement.
+                    PoolStats::bump(&self.stats.shutdown);
+                    if client.shutdown().await.is_err() {
+                        client.kill().await;
+                    }
+                    return Ok(());
+                }
                 let now = Instant::now();
                 let displaced = {
                     let mut queue = self.queue.lock().await;
