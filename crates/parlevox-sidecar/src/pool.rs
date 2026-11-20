@@ -15,6 +15,11 @@
 //! pooled returns, so a plugin that accumulates state across `reset` calls is
 //! replaced instead of being reused forever.
 //!
+//! The two bounds read `0` in opposite ways, deliberately: a `max_idle` of `0`
+//! disables pooling, so every release shuts its process down, while a
+//! `max_reuses` of `0` means **unlimited**, so no process is ever retired for
+//! its reuse count.
+//!
 //! Reset runs twice per reuse: once on release, so only a process that proved
 //! it can clear itself enters the idle queue, and once on acquire, which is the
 //! only authoritative liveness and cleanliness check before handover. That is
@@ -34,9 +39,11 @@ use crate::config::SidecarConfig;
 
 /// Idle-process bounds for a [`SidecarPool`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PoolConfig {
     /// Maximum number of idle processes kept alive. `0` disables pooling, so
-    /// every release shuts its process down.
+    /// every release shuts its process down. That is the opposite of
+    /// [`PoolConfig::max_reuses`], where `0` means unlimited.
     pub max_idle: usize,
     /// Maximum time a process may sit idle. Age is checked at lease time: a
     /// process older than this is shut down rather than handed out.
@@ -87,7 +94,9 @@ impl PoolConfig {
 
     /// Return this configuration with a different [`PoolConfig::max_reuses`].
     ///
-    /// `0` means unlimited, the opposite of [`PoolConfig::max_idle`]'s `0`.
+    /// `0` means unlimited, so the process is never retired for its reuse
+    /// count. That is the opposite of [`PoolConfig::max_idle`], where `0`
+    /// disables pooling instead.
     #[must_use = "builder methods return a modified config; chain or assign the result"]
     pub fn with_max_reuses(mut self, max_reuses: u64) -> Self {
         self.max_reuses = max_reuses;
@@ -100,6 +109,7 @@ impl PoolConfig {
 /// `since` is measured from release, not spawn: the age ceiling is about how
 /// long a handshaken process has been parked, not how old the process is.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct IdleEntry<T> {
     /// The idle client itself.
     pub client: T,
@@ -137,10 +147,14 @@ impl<T> IdleEntry<T> {
 #[non_exhaustive]
 pub enum RefusalReason {
     /// Pooling is disabled (`max_idle == 0`) or the entry is already at or past
-    /// the age ceiling. This keeps the historical `shutdown` fate.
+    /// the age ceiling. This keeps the historical `shutdown` fate. A zero
+    /// *reuse* ceiling is not this variant: `max_reuses == 0` means unlimited,
+    /// so the retirement check never fires.
     Configuration,
     /// The process has served [`PoolConfig::max_reuses`] pooled returns, so it
-    /// is retired rather than pooled again.
+    /// is retired rather than pooled again. Only a nonzero ceiling retires:
+    /// `max_reuses == 0` means unlimited, the opposite of `max_idle == 0`,
+    /// which disables pooling.
     Retirement,
 }
 
@@ -150,6 +164,7 @@ pub enum RefusalReason {
 /// the queue.
 #[derive(Debug)]
 #[must_use = "the outcome carries clients the caller must shut down"]
+#[non_exhaustive]
 pub struct PushOutcome<T> {
     /// Entries displaced to stay within the idle cap. At most one.
     pub displaced: Vec<T>,
@@ -172,6 +187,7 @@ impl<T> PushOutcome<T> {
 
 /// What [`IdleQueue::take`] found.
 #[must_use = "the outcome carries clients the caller must shut down"]
+#[non_exhaustive]
 pub struct TakeOutcome<T> {
     /// The oldest live entry, when one exists.
     pub entry: Option<IdleEntry<T>>,
@@ -190,6 +206,9 @@ pub struct IdleQueue<T> {
     entries: VecDeque<IdleEntry<T>>,
     max_idle: usize,
     max_age: Duration,
+    /// Per-process reuse ceiling. `0` means unlimited: a process is never
+    /// retired for its reuse count. This is the opposite of `max_idle`, where
+    /// `0` disables pooling instead.
     max_reuses: u64,
 }
 
@@ -197,7 +216,9 @@ impl<T> IdleQueue<T> {
     /// Create an empty queue bounded by an idle cap and an age ceiling.
     ///
     /// The reuse ceiling defaults to `0`, meaning unlimited; use
-    /// [`IdleQueue::with_max_reuses`] to bound it.
+    /// [`IdleQueue::with_max_reuses`] to bound it. Note the opposing senses:
+    /// `max_idle == 0` disables pooling, while `max_reuses == 0` means no
+    /// process is ever retired for its reuse count.
     #[must_use]
     pub fn new(max_idle: usize, max_age: Duration) -> Self {
         IdleQueue {
@@ -208,7 +229,9 @@ impl<T> IdleQueue<T> {
         }
     }
 
-    /// Return this queue with a per-process reuse ceiling. `0` means unlimited.
+    /// Return this queue with a per-process reuse ceiling. `0` means unlimited
+    /// (never retired for its reuse count), unlike an idle cap of `0`, which
+    /// disables pooling.
     #[must_use = "builder methods return a modified queue; chain or assign the result"]
     pub fn with_max_reuses(mut self, max_reuses: u64) -> Self {
         self.max_reuses = max_reuses;
