@@ -136,7 +136,7 @@ dimension. This is the honest scorecard against the shipped tree:
 | 4 | Provider abstraction | One small interface per modality + versioned manifest | **Implemented** — traits, `ProviderManifest`, registry lookup |
 | 5 | State & context | Rust-owned `ChatContext`, bounded policy | **Implemented** — `ChatContext`/`ContextStats` bound by message count and character budget; eviction prefers non-system messages and all loss is counted. The char budget is an estimate, not a token count |
 | 6 | Failure handling | Non-fatal/fatal taxonomy, no replay after commit | **Partial** — `ErrorClass` + `is_recoverable`; no fallback provider chain |
-| 7 | Observability | OTel turn span + boundary cost meters | **Deferred** — counters only (`dropped_*`, `EventQueueStats`); no traces |
+| 7 | Observability | OTel turn span + boundary cost meters | **Implemented** — the opt-in `otel` feature emits one MonoClock-timed `turn` span with `vad`, `stt`, `llm`, `tts` and `playout` children and boundary-cost attributes; exporter/collector wiring is caller-supplied |
 | 8 | Extensibility cost | New provider = one interface + manifest, no core edits | **Implemented** — register/select by name |
 | 9 | Deployment & scale | Warm pools sized by provider concurrency and p95 latency | **Deferred** |
 | 10 | Language boundary | Rust owns lifecycle; length-prefixed binary frames with explicit cancel | **Implemented** — `parlevox-ipc` + `parlevox-sidecar` |
@@ -187,4 +187,10 @@ What remains open:
   and loss accounting", which records this as deliberate for v0.1).
 - Half-duplex turn model (see §3 and the ADR's "Non-goals for v0").
 - No warm plugin pool: one plugin process per session (dimension 2, partial).
-- No turn spans or traces; observability is counters only (dimension 7).
+- Turn spans exist but are opt-in: `cargo build -p parlevox-runtime --features otel`
+  emits one `turn` root span with `vad`, `stt`, `llm`, `tts` and `playout`
+  children plus MonoClock-derived boundary-cost attributes, and the default
+  build still carries no OpenTelemetry dependency. There is no OTLP exporter
+  configuration, no collector wiring, and no OTel metrics in v0 — the caller
+  installs a tracer or passes one to `Session::with_tracer` (dimension 7 is
+  implemented for spans, not for an export pipeline).
