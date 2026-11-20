@@ -4,6 +4,8 @@
 //! instead of racing timers. The fakes never touch the network, the
 //! filesystem, or a Python interpreter.
 
+use std::sync::{Arc, Mutex};
+
 use async_trait::async_trait;
 use parlevox_core::ParlevoxError;
 use tokio_util::sync::CancellationToken;
@@ -122,6 +124,10 @@ impl SttProvider for FakeStt {
 #[derive(Debug, Clone)]
 pub struct FakeLlm {
     manifest: ProviderManifest,
+    /// The last request this fake served, for assertions. `Arc` so clones of
+    /// the fake (the runtime holds one behind `Arc<dyn LlmProvider>`) share the
+    /// same cell. The lock is taken and released without an `await` in between.
+    last_request: Arc<Mutex<Option<GenerateRequest>>>,
 }
 
 impl Default for FakeLlm {
@@ -136,7 +142,19 @@ impl FakeLlm {
             manifest: ProviderManifest::new("fake-llm", Modality::Llm)
                 .with_capability("streaming")
                 .with_capability("cancel"),
+            last_request: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// The most recent request this fake served, if any.
+    ///
+    /// Tests use this to assert what history the runtime passed without
+    /// changing the fake's deterministic delta output.
+    pub fn last_request(&self) -> Option<GenerateRequest> {
+        self.last_request
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -152,6 +170,13 @@ impl LlmProvider for FakeLlm {
         cancel: CancellationToken,
     ) -> Result<ProviderStream<String>, ParlevoxError> {
         require_non_empty("prompt", &request.prompt)?;
+        {
+            let mut slot = self
+                .last_request
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *slot = Some(request.clone());
+        }
         let items = FAKE_LLM_DELTAS
             .iter()
             .map(|delta| Ok((*delta).to_string()))
@@ -304,9 +329,7 @@ mod tests {
         let llm = FakeLlm::new();
         let deltas = collect(
             llm.generate(
-                GenerateRequest {
-                    prompt: FAKE_TRANSCRIPT.into(),
-                },
+                GenerateRequest::new(FAKE_TRANSCRIPT),
                 CancellationToken::new(),
             )
             .await
@@ -315,6 +338,31 @@ mod tests {
         .await;
         assert_eq!(deltas, FAKE_LLM_DELTAS.to_vec());
         assert_eq!(deltas.concat(), FAKE_REPLY);
+        assert_eq!(
+            llm.last_request(),
+            Some(GenerateRequest::new(FAKE_TRANSCRIPT))
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_llm_records_history_for_assertions() {
+        let llm = FakeLlm::new();
+        let request = GenerateRequest {
+            prompt: "next".into(),
+            history: vec![crate::ChatMessage {
+                role: crate::Role::User,
+                text: "prior".into(),
+            }],
+        };
+        // Drain the stream so the request is recorded exactly as sent.
+        let deltas = collect(
+            llm.generate(request.clone(), CancellationToken::new())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(deltas, FAKE_LLM_DELTAS.to_vec());
+        assert_eq!(llm.last_request(), Some(request));
     }
 
     #[test]
@@ -401,12 +449,7 @@ mod tests {
         let llm = FakeLlm::new();
         let cancel = CancellationToken::new();
         let mut stream = llm
-            .generate(
-                GenerateRequest {
-                    prompt: "hi".into(),
-                },
-                cancel.clone(),
-            )
+            .generate(GenerateRequest::new("hi"), cancel.clone())
             .await
             .unwrap();
         assert_eq!(stream.next().await.unwrap().unwrap(), FAKE_LLM_DELTAS[0]);

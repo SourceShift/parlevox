@@ -8,6 +8,7 @@ from parlevox_sdk.plugin import (
     MAX_PENDING_AUDIO_FRAMES,
     CancelledTombstones,
     Plugin,
+    _accepts_history,
 )
 from parlevox_sdk.protocol import (
     KIND_AUDIO,
@@ -92,6 +93,120 @@ def test_cancel_is_acknowledged_and_plugin_keeps_serving():
         header, pcm = decode_audio(payload)
         assert header["request_id"] == "r2"
         assert len(pcm) % 2 == 0
+
+
+class RecordingLlm:
+    """Records how the plugin called it, including structured history."""
+
+    def __init__(self):
+        self.calls = []
+
+    def generate(self, prompt, history=()):
+        self.calls.append((prompt, list(history)))
+        return ["ok"]
+
+
+class OneArgLlm:
+    """A third-party provider that predates the optional history argument."""
+
+    def __init__(self):
+        self.prompts = []
+
+    def generate(self, prompt):
+        self.prompts.append(prompt)
+        return ["ok"]
+
+
+class KwargsLlm:
+    """Accepts history only through ``**kwargs``."""
+
+    def __init__(self):
+        self.kwargs = []
+
+    def generate(self, prompt, **kwargs):
+        self.kwargs.append(kwargs)
+        return ["ok"]
+
+
+class OpaqueLlm:
+    """A provider whose callable cannot be introspected."""
+
+    generate = object()
+
+
+def test_history_acceptance_follows_the_callable_signature():
+    assert _accepts_history(RecordingLlm()) is True
+    assert _accepts_history(KwargsLlm()) is True
+    assert _accepts_history(OneArgLlm()) is False
+    # Uninspectable callables are treated as one-argument rather than crashing.
+    assert _accepts_history(OpaqueLlm()) is False
+
+    class PositionalStar:
+        def generate(self, prompt, *history):
+            return ["ok"]
+
+    # A variadic positional parameter cannot be supplied by keyword.
+    assert _accepts_history(PositionalStar()) is False
+
+
+def generate_messages(plugin, message):
+    out = io.BytesIO()
+    plugin.handle(message, out)
+    return [decode_json(payload) for kind, payload in read_all(out.getvalue()) if kind == KIND_JSON]
+
+
+def test_generate_forwards_structured_history_when_present():
+    llm = RecordingLlm()
+    plugin = Plugin(llm=llm)
+    history = [
+        {"role": "user", "text": "first"},
+        {"role": "assistant", "text": "reply"},
+    ]
+
+    messages = generate_messages(
+        plugin,
+        {"type": "generate", "request_id": "r1", "prompt": "next", "history": history},
+    )
+
+    assert llm.calls == [("next", history)]
+    assert [m["text"] for m in messages if m["type"] == "delta"] == ["ok"]
+    assert messages[-1] == {"type": "done", "request_id": "r1", "dropped_frames": 0}
+
+
+def test_generate_keeps_one_argument_providers_working():
+    llm = OneArgLlm()
+    plugin = Plugin(llm=llm)
+
+    # No history key at all: the legacy wire shape.
+    messages = generate_messages(
+        plugin, {"type": "generate", "request_id": "r1", "prompt": "next"}
+    )
+    assert [m["text"] for m in messages if m["type"] == "delta"] == ["ok"]
+
+    # An explicit empty history is treated the same way.
+    messages = generate_messages(
+        plugin,
+        {"type": "generate", "request_id": "r2", "prompt": "next", "history": []},
+    )
+    assert [m["text"] for m in messages if m["type"] == "delta"] == ["ok"]
+    assert messages[-1] == {"type": "done", "request_id": "r2", "dropped_frames": 0}
+
+    # Turn two: history is non-empty, but this provider cannot accept it.
+    # It must still serve the turn instead of raising a TypeError that the
+    # plugin would misreport as a transient failure.
+    messages = generate_messages(
+        plugin,
+        {
+            "type": "generate",
+            "request_id": "r3",
+            "prompt": "next",
+            "history": [{"role": "user", "text": "first"}],
+        },
+    )
+    assert [m["text"] for m in messages if m["type"] == "delta"] == ["ok"]
+    assert messages[-1] == {"type": "done", "request_id": "r3", "dropped_frames": 0}
+    assert not any(message["type"] == "error" for message in messages)
+    assert llm.prompts == ["next", "next", "next"]
 
 
 def test_unknown_message_is_a_protocol_error_event():

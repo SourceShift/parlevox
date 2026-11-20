@@ -116,9 +116,8 @@ Tests are hermetic: no network, no API keys, no installed Python package.
 
 The remaining gaps are listed in [`DESIGN.md` §8](docs/architecture/DESIGN.md):
 producer credits (slow the producer instead of dropping), a full-duplex turn
-model, a warm plugin pool, and OTel turn spans. Beyond those: a Rust-owned
-`ChatContext` for multi-turn sessions, composable turn-taking strategies, and
-early-start/pipelined decoding.
+model, a warm plugin pool, and OTel turn spans. Beyond those: composable
+turn-taking strategies and early-start/pipelined decoding.
 
 ## License
 

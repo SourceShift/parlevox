@@ -13,6 +13,7 @@ categories.workspace = true
 
 [dependencies]
 parlevox-core = { version = "0.1.0", path = "../parlevox-core" }
+parlevox-providers = { version = "0.1.0", path = "../parlevox-providers" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

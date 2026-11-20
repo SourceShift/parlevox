@@ -128,8 +128,10 @@ jobs:
             return 1
           }
 
-          # core -> ipc -> providers -> runtime -> sidecar -> cli.
-          for crate in parlevox-core parlevox-ipc parlevox-providers \
+          # core -> providers -> ipc -> runtime -> sidecar -> cli.
+          # ipc depends on providers (it carries ChatMessage on the wire), so
+          # providers must already be published before ipc resolves.
+          for crate in parlevox-core parlevox-providers parlevox-ipc \
                        parlevox-runtime parlevox-sidecar parlevox-cli; do
             version=$(version_of "$crate")
             if cargo search "$crate" --limit 1 2>/dev/null \

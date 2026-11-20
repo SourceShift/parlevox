@@ -40,6 +40,30 @@ requirement for the default turn.
    overflow policy and dropped-frame/dropped-ms counters; duration measurement
    uses one monotonic clock per session.
 
+## Addendum — bounded conversation context
+
+Multi-turn history is Rust-owned and bounded, not delegated to a provider or
+persisted between sessions. `ChatContext` enforces two simultaneous limits: a
+message count and a character budget over `text.chars().count()`. On overflow it
+evicts the oldest non-system message first and only then the oldest system
+message, so a system prompt survives ordinary turn churn. A single incoming
+message larger than the whole character budget is truncated on a `char`
+boundary rather than dropped. Evicted messages, evicted characters, and
+truncated characters are cumulative, reported counters; nothing is discarded
+silently.
+
+The character budget is an **estimate**, deliberately not a model token count.
+Exact accounting requires a tokenizer and a model-specific vocabulary, both out
+of scope here, so the budget is a transport-safe proxy. It bounds the history
+that reaches the provider; it does not promise a prompt length in tokens.
+
+The current utterance is the request `prompt` and is never duplicated in the
+`history` field. Only a turn that completes normally commits an assistant
+message; interrupted and failed turns keep any already-committed user message
+but teach the model no reply the caller did not hear. The sidecar carries the
+same structured messages and refuses an oversized request with a protocol error
+instead of truncating it.
+
 ## Backpressure and loss accounting
 
 v0.1 is **drop-not-throttle** by design. Credit-based or adaptive backpressure

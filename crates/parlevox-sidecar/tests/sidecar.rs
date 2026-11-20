@@ -78,6 +78,7 @@ async fn cancel_ends_the_stream_without_killing_the_process() {
             PluginRequest::Generate {
                 request_id: client.new_request_id("llm"),
                 prompt: "hello".into(),
+                history: Vec::new(),
             },
             Vec::new(),
             None,
@@ -224,6 +225,7 @@ async fn supervisor_restarts_a_dead_plugin() {
             PluginRequest::Generate {
                 request_id: second.new_request_id("llm"),
                 prompt: "hello".into(),
+                history: Vec::new(),
             },
             Vec::new(),
             None,
