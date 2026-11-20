@@ -76,6 +76,11 @@ cargo run -q -p parlevox-cli -- demo --fake
 PYTHONPATH=sdks/python cargo run -q -p parlevox-cli -- demo --sidecar
 ```
 
+Two deterministic turns can also share one warm pool: `demo --sidecar --pool`
+leases a single `reset`-capable plugin process for both turns, prints the same
+stdout as `demo --sidecar`, and reports the pool counters on stderr. Pooling
+needs a process, so `demo --fake --pool` is rejected.
+
 Expected output: two `AudioOut` frames and a `TurnDone` line carrying
 `dropped_frames`, `dropped_ms`, `dropped_events` and `interrupted`.
 
@@ -98,7 +103,7 @@ Tests are hermetic: no network, no API keys, no installed Python package.
 | `crates/parlevox-runtime` | One session: FSM owner, rings, bounded event handoff, provider selection, barge-in |
 | `crates/parlevox-ipc` | Length-prefixed binary framing used **only** by the sidecar |
 | `crates/parlevox-sidecar` | Process supervision and plugin→trait adapters |
-| `crates/parlevox-cli` | `demo --fake` / `demo --sidecar` |
+| `crates/parlevox-cli` | `demo --fake` / `demo --sidecar` / `demo --sidecar --pool` |
 | `sdks/python/parlevox_sdk` | Reference Python plugin SDK and sidecar entry point |
 
 ## Design docs

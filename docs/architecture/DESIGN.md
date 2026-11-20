@@ -154,7 +154,7 @@ dimension. This is the honest scorecard against the shipped tree:
 | # | Dimension | Adopted direction | v0 status |
 |---|---|---|---|
 | 1 | Transport & audio path | Typed frames over a bounded, lag-counted ring | **Implemented** — `AudioRing`, `RingStats`, `dropped_ms` |
-| 2 | Concurrency & isolation | Supervised plugin processes, multiplexed by `request_id` | **Partial** — supervision + restart backoff + id-multiplexed client exist; an opt-in bounded warm pool reuses a `reset`-capable process across sessions, while the default still spawns one plugin process per session |
+| 2 | Concurrency & isolation | Supervised plugin processes, multiplexed by `request_id` | **Partial** — supervision + restart backoff + id-multiplexed client exist; an opt-in bounded warm pool reuses a `reset`-capable process across sessions (`demo --sidecar --pool` runs two turns through one process and reports the pool counters on stderr), while the default still spawns one plugin process per session |
 | 3 | Turn-taking | Rust-owned FSM with composable strategies | **Partial** — explicit FSM and barge-in are real; strategy list and adaptive endpointing are not |
 | 4 | Provider abstraction | One small interface per modality + versioned manifest | **Implemented** — traits, `ProviderManifest`, registry lookup |
 | 5 | State & context | Rust-owned `ChatContext`, bounded policy | **Implemented** — `ChatContext`/`ContextStats` bound by message count and character budget; eviction prefers non-system messages and all loss is counted. The char budget is an estimate, not a token count |

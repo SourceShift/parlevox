@@ -89,3 +89,26 @@ async fn pool_reuses_one_process_for_two_sessions() {
 
     assert_eq!(baseline_report.transcript, FAKE_TRANSCRIPT);
 }
+
+/// `--pool` only means something when there is a plugin process to pool.
+///
+/// The fakes spawn no process, so the combination must be refused by name
+/// rather than silently ignored or misread as an unknown argument.
+#[test]
+fn demo_fake_pool_is_rejected() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_parlevox"))
+        .args(["demo", "--fake", "--pool"])
+        .output()
+        .expect("run the parlevox binary");
+
+    assert!(
+        !output.status.success(),
+        "demo --fake --pool must fail, stdout was: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("demo --fake --pool"),
+        "stderr must name the rejected combination, was: {stderr}"
+    );
+}
