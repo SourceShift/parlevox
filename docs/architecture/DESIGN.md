@@ -69,13 +69,16 @@ returns the process on release; the pool performs the additive `reset`
 handshake on return, keeps at most `PoolConfig::max_idle` processes idle, and
 checks age at lease time: a process idle longer than `max_age` is shut down
 then and never handed out. A process that has served `max_reuses` pooled
-returns is retired at its next release instead of being pooled again (`0`
-means unlimited). The pool also kills and counts a process whose acquire-time
-probe reset fails rather than handing it out dirty. Without a
-pool — including `demo --sidecar` and every existing test — the session spawns
-a fresh process and reaps it, exactly as before. `PROTOCOL_VERSION` and
-`SIDECAR_ABI` are unchanged: `reset` is an additive control message and a
-plugin that does not advertise the `reset` capability is never pooled.
+returns is retired at its next release instead of being pooled again. The two
+bounds read `0` in opposite ways: `max_idle == 0` disables pooling, so every
+release shuts its process down, while `max_reuses == 0` means unlimited, so no
+process is ever retired for its reuse count. The pool also kills and counts a
+process whose acquire-time probe reset fails rather than handing it out dirty.
+Without a pool — including `demo --sidecar` and every existing test — the
+session spawns a fresh process and reaps it, exactly as before.
+`PROTOCOL_VERSION` and `SIDECAR_ABI` are unchanged: `reset` is an additive
+control message and a plugin that does not advertise the `reset` capability is
+never pooled.
 
 ## 3. One turn
 
