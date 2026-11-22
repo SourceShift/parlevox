@@ -9,6 +9,7 @@
 //! The fakes here are the hot-path default: they make `demo --fake` and the
 //! runtime tests deterministic and Python-free.
 
+pub mod breaker;
 pub mod fakes;
 pub mod fallback;
 pub mod manifest;
@@ -16,6 +17,7 @@ pub mod retry;
 pub mod stream;
 pub mod traits;
 
+pub use breaker::{BreakerPolicy, BreakerStats, CircuitBreakingLlm};
 pub use fakes::{
     FakeLlm, FakeStt, FakeTts, FakeVad, ProviderCall, ProviderCallLog, FAKE_CHANNELS,
     FAKE_FRAME_MS, FAKE_FRAME_SAMPLES, FAKE_LLM_DELTAS, FAKE_PARTIAL_TRANSCRIPT, FAKE_REPLY,
