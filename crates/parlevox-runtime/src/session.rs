@@ -4,14 +4,16 @@
 //! input and output [`AudioRing`]s, and the resolved providers. A turn drives
 //! VAD → STT → LLM → TTS in sequence, emitting typed events as work completes.
 //!
-//! Barge-in is deterministic: [`Session::request_barge_in`] cancels the turn's
-//! [`CancellationToken`] and increments the generation id. Every provider call
-//! in the turn holds that token, so an in-flight stream observes cancellation
-//! on its next poll instead of racing a timer. Items from an older generation
-//! are never emitted.
+//! Barge-in is deterministic: [`Session::request_barge_in`] or a
+//! [`BargeInHandle`] cloned from the session cancels the current turn's
+//! [`CancellationToken`]. The in-session path also increments the generation
+//! id. Every provider call in the turn holds that token, so an in-flight stream
+//! observes cancellation on its next poll instead of racing a timer. Items from
+//! an older generation are never emitted.
 
 use std::future::{poll_fn, Future};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Poll;
 
 use futures_util::{FutureExt, StreamExt};
@@ -291,6 +293,95 @@ enum ReadyItem {
     Tts(Option<Result<AudioChunk, ParlevoxError>>),
 }
 
+/// Why an in-flight turn stopped before its reply completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterruptCause {
+    /// The caller asked to stop, either through [`Session::request_barge_in`]
+    /// or through a [`BargeInHandle`].
+    User,
+    /// A provider surfaced `Cancelled` without a user request.
+    Upstream,
+}
+
+/// The barge-in signal shared between a [`Session`] and every
+/// [`BargeInHandle`] cloned out of it.
+///
+/// It owns the token slot for the *current* turn plus a "barge-in requested"
+/// flag. The session is the only writer of the token slot: `drive_turn`
+/// installs a fresh token (and clears the flag) before the first await. A
+/// handle only reads the slot to cancel it. Cancelling a token is synchronous,
+/// so the mutex guard is never held across an await.
+#[derive(Debug)]
+struct BargeInControl {
+    token: Mutex<CancellationToken>,
+    requested: AtomicBool,
+}
+
+impl BargeInControl {
+    fn new() -> Self {
+        BargeInControl {
+            token: Mutex::new(CancellationToken::new()),
+            requested: AtomicBool::new(false),
+        }
+    }
+
+    /// Install the token for a new turn and clear any request left over from
+    /// the previous one, so a handle used between turns never poisons this one.
+    fn install(&self, token: CancellationToken) {
+        {
+            let mut slot = self.token.lock().unwrap_or_else(PoisonError::into_inner);
+            *slot = token;
+        }
+        self.requested.store(false, Ordering::Release);
+    }
+
+    /// Record the request and cancel the currently installed token. With no
+    /// live turn the installed token is a dead one, so the cancel is a no-op.
+    fn request(&self) {
+        self.requested.store(true, Ordering::Release);
+        let token = {
+            let slot = self.token.lock().unwrap_or_else(PoisonError::into_inner);
+            slot.clone()
+        };
+        token.cancel();
+    }
+
+    /// True while the current turn's barge-in request has not been consumed.
+    fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+
+    /// Forget the request once the turn body has unwound.
+    fn clear_request(&self) {
+        self.requested.store(false, Ordering::Release);
+    }
+}
+
+/// A clone-able, task-safe barge-in signal for the session's live turn.
+///
+/// Obtained from [`Session::barge_in_handle`]. It shares the session's token
+/// slot and request flag, so a handle obtained before the first turn stays
+/// valid across turns. [`Self::barge_in`] signals intent only: it applies no
+/// [`TurnEvent`] and reads no turn state, so it can be called from another task
+/// while [`Session::run_turn`] holds the session exclusively.
+#[derive(Debug, Clone)]
+pub struct BargeInHandle {
+    control: Arc<BargeInControl>,
+}
+
+impl BargeInHandle {
+    /// Ask the live turn to stop.
+    ///
+    /// Sets the shared "barge-in requested" flag and cancels the token the
+    /// session installed for the current turn. When no turn is live the token
+    /// is stale and cancelling it is a no-op; the next turn clears the flag when
+    /// it installs its token. The turn body observes the flag when it unwinds
+    /// and rests the machine in `Listening`.
+    pub fn barge_in(&self) {
+        self.control.request();
+    }
+}
+
 pub struct Session {
     config: SessionConfig,
     machine: TurnMachine,
@@ -301,7 +392,9 @@ pub struct Session {
     /// [`Session::credits`]. The turn loop never reads it.
     output_credits: CreditHandle,
     providers: Providers,
-    cancel: CancellationToken,
+    /// Shared barge-in slot. [`Session`] installs each turn's token here; a
+    /// [`BargeInHandle`] cancels the installed token from another task.
+    barge_in: Arc<BargeInControl>,
     generation: u64,
     events: EventQueue,
     context: ChatContext,
@@ -421,7 +514,7 @@ impl Session {
             output,
             output_credits,
             providers,
-            cancel: CancellationToken::new(),
+            barge_in: Arc::new(BargeInControl::new()),
             generation: 0,
             events,
             context,
@@ -462,6 +555,18 @@ impl Session {
     /// pushing and draining with dropping, not throttling.
     pub fn credits(&self) -> SessionCredits {
         SessionCredits::from_handle(self.output_credits.clone())
+    }
+
+    /// A task-safe handle that can signal a barge-in while a turn is in flight.
+    ///
+    /// The handle shares the session's current-turn token and request flag, so
+    /// it stays valid across turns. It signals intent only; the turn body
+    /// performs every state transition.
+    #[must_use]
+    pub fn barge_in_handle(&self) -> BargeInHandle {
+        BargeInHandle {
+            control: Arc::clone(&self.barge_in),
+        }
     }
 
     /// Cumulative granted and cancelled credit waits for the playout ring.
@@ -544,8 +649,11 @@ impl Session {
 
     /// Cancel the in-flight turn. Returns `true` when a turn was interrupted.
     ///
-    /// The generation id advances and the token fires, so provider streams
-    /// stop on their next poll rather than being killed from outside.
+    /// The generation id advances and the token fires, so provider streams stop
+    /// on their next poll rather than being killed from outside. The machine
+    /// enters `Interrupted` here and is *not* returned to `Listening`: the turn
+    /// body applies `ResumeListening` when it unwinds, so `Interrupted` is
+    /// observable between the signal and the cleanup.
     ///
     /// # Errors
     ///
@@ -558,9 +666,8 @@ impl Session {
             return Ok(false);
         }
         self.machine.apply(TurnEvent::BargeIn)?;
+        self.barge_in.request();
         self.generation += 1;
-        self.cancel.cancel();
-        self.machine.apply(TurnEvent::ResumeListening)?;
         Ok(true)
     }
 
@@ -614,7 +721,10 @@ impl Session {
         }
 
         let token = CancellationToken::new();
-        self.cancel = token.clone();
+        // Publish this turn's token and clear the previous turn's barge-in
+        // request before the first await. The install's lock guard is dropped
+        // before any await; only the synchronous cancel path re-locks.
+        self.barge_in.install(token.clone());
         self.generation += 1;
         let generation = self.generation;
         // A previous turn may have been interrupted with sentences still queued.
@@ -1561,7 +1671,27 @@ impl Session {
         Err(err)
     }
 
-    fn ensure_listening_after_interrupt(&mut self) -> Result<(), ParlevoxError> {
+    /// The single place the unwind transitions the machine after a turn stops
+    /// early.
+    ///
+    /// A cancel before a turn opened (`UserSpeaking`) has no barge-in to apply,
+    /// so it rests via [`TurnMachine::abort`]. An upstream cancel is not a user
+    /// barge-in at all, so it also rests straight to `Listening`. Only a user
+    /// request from `Thinking`/`Speaking` walks through `Interrupted`; a user
+    /// request whose state is already `Interrupted` (the in-session
+    /// [`Session::request_barge_in`] path) just completes the cleanup.
+    fn ensure_listening_after_interrupt(
+        &mut self,
+        cause: InterruptCause,
+    ) -> Result<(), ParlevoxError> {
+        if self.machine.state() == TurnState::UserSpeaking {
+            self.machine.abort()?;
+            return Ok(());
+        }
+        if cause == InterruptCause::Upstream {
+            self.machine.abort()?;
+            return Ok(());
+        }
         match self.machine.state() {
             TurnState::Thinking | TurnState::Speaking => {
                 self.machine.apply(TurnEvent::BargeIn)?;
@@ -1569,9 +1699,6 @@ impl Session {
             }
             TurnState::Interrupted => {
                 self.machine.apply(TurnEvent::ResumeListening)?;
-            }
-            TurnState::UserSpeaking => {
-                self.machine.apply(TurnEvent::UserStoppedSpeaking)?;
             }
             _ => {}
         }
@@ -1586,7 +1713,19 @@ impl Session {
         reply: &str,
         baseline: TurnBaseline,
     ) -> Result<TurnReport, ParlevoxError> {
-        self.ensure_listening_after_interrupt()?;
+        // Read the cause before the next turn clears the flag: a request means
+        // the caller asked to stop; anything else means a provider cancelled
+        // on its own.
+        let cause = if self.barge_in.is_requested() {
+            InterruptCause::User
+        } else {
+            InterruptCause::Upstream
+        };
+        self.ensure_listening_after_interrupt(cause)?;
+        // The request belongs to the turn that just unwound. Clearing it here
+        // keeps the flag honest for a handle used between turns; `drive_turn`
+        // also clears it when it installs the next token.
+        self.barge_in.clear_request();
         // Drain any telemetry the adapters collected before the interruption
         // so it cannot leak into a later turn. A turn that never saw a `Done`
         // reports zero.
