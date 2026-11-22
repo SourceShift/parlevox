@@ -1,10 +1,12 @@
-//! Optional OpenTelemetry tracing for one turn.
+//! Optional OpenTelemetry tracing and metrics for one turn.
 //!
 //! Enabled only by the `otel` cargo feature. The runtime never installs a
 //! subscriber or exporter itself: it asks the OpenTelemetry *facade* for a
 //! tracer (or accepts an injected one through
-//! [`crate::Session::with_tracer`]), so a library consumer decides where spans
-//! go.
+//! [`crate::Session::with_tracer`]) and, separately, accepts a caller-supplied
+//! `Meter` through [`crate::Session::with_meter`], so a library consumer
+//! decides where spans and metrics go. Without a meter, no metric instrument
+//! exists and nothing is recorded.
 //!
 //! Timing authority is the session's [`MonoClock`]. Wall-clock time appears in
 //! exactly one place — the UNIX export anchor captured at session construction —
@@ -22,12 +24,105 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use opentelemetry::global::BoxedTracer;
+use opentelemetry::metrics::{Counter, Histogram, Meter};
 use opentelemetry::trace::{Span, SpanKind, Status, TraceContextExt, Tracer};
 use opentelemetry::{Context, KeyValue};
 use parlevox_core::{DurationMs, ErrorClass, MonoClock, ParlevoxError, RingStats, Timestamp};
 
 use crate::events::EventQueueStats;
 use crate::session::TurnReport;
+
+/// The fixed metric set, created once per session from a caller-supplied
+/// [`Meter`].
+///
+/// A session without a meter holds no instruments and records nothing, so the
+/// opt-out is a single `Option` check. Every value comes from the existing turn
+/// path: the [`TurnReport`] counters, the [`MonoClock`] boundaries the spans
+/// already measure, and the playout ring's depth at turn end.
+pub(crate) struct TurnMetrics {
+    turns: Counter<u64>,
+    turn_duration: Histogram<f64>,
+    stage_duration: Histogram<f64>,
+    frames_dropped: Counter<u64>,
+    sidecar_frames_dropped: Counter<u64>,
+    playout_depth: Histogram<u64>,
+}
+
+impl TurnMetrics {
+    /// Build the six instruments. Called once per session, never per turn.
+    pub(crate) fn new(meter: &Meter) -> Self {
+        TurnMetrics {
+            turns: meter
+                .u64_counter("parlevox.turns")
+                .with_unit("{turn}")
+                .build(),
+            turn_duration: meter
+                .f64_histogram("parlevox.turn.duration")
+                .with_unit("ms")
+                .build(),
+            stage_duration: meter
+                .f64_histogram("parlevox.turn.stage.duration")
+                .with_unit("ms")
+                .build(),
+            frames_dropped: meter
+                .u64_counter("parlevox.frames.dropped")
+                .with_unit("{frame}")
+                .build(),
+            sidecar_frames_dropped: meter
+                .u64_counter("parlevox.sidecar.frames.dropped")
+                .with_unit("{frame}")
+                .build(),
+            playout_depth: meter
+                .u64_histogram("parlevox.playout.depth")
+                .with_unit("{frame}")
+                .build(),
+        }
+    }
+
+    /// Record the turn outcome, its duration, and the drop/depth figures from
+    /// the report.
+    ///
+    /// The drop counters and the sidecar counter come from the [`TurnReport`],
+    /// which is the single source of truth for those counts; a failed turn has
+    /// no report, so only the outcome, duration, and playout depth are emitted.
+    pub(crate) fn record_turn(
+        &self,
+        outcome: &'static str,
+        duration: DurationMs,
+        report: Option<&TurnReport>,
+        playout_depth: u64,
+    ) {
+        let outcome_attribute = [KeyValue::new("outcome", outcome)];
+        self.turns.add(1, &outcome_attribute);
+        self.turn_duration
+            .record(duration.as_secs_f64() * 1000.0, &outcome_attribute);
+        if let Some(report) = report {
+            self.frames_dropped.add(
+                report.input_dropped_frames,
+                &[KeyValue::new("direction", "input")],
+            );
+            self.frames_dropped.add(
+                report.dropped_frames,
+                &[KeyValue::new("direction", "output")],
+            );
+            self.frames_dropped.add(
+                report.dropped_events,
+                &[KeyValue::new("direction", "events")],
+            );
+            self.sidecar_frames_dropped
+                .add(report.sidecar_dropped_frames, &[]);
+        }
+        self.playout_depth.record(playout_depth, &[]);
+    }
+
+    /// Record one stage's duration in milliseconds.
+    pub(crate) fn record_stage(&self, stage: &'static str, duration: DurationMs) {
+        self.stage_duration.record(
+            duration.as_secs_f64() * 1000.0,
+            &[KeyValue::new("stage", stage)],
+        );
+    }
+}
 
 /// The single wall-clock capture per session, paired with the monotonic clock
 /// it anchors.
@@ -73,13 +168,20 @@ pub(crate) struct TurnTrace {
     /// The committed turn index, once known. `None` until the turn reaches
     /// `FinalTranscript` (or the turn ends and its outcome supplies it).
     turn: Option<u64>,
+    /// Caller-supplied instruments. `None` when the session has no meter, in
+    /// which case the turn records no metrics.
+    metrics: Option<Arc<TurnMetrics>>,
 }
 
 impl TurnTrace {
     /// Start the root `turn` span. The turn index is not known yet: a turn can
     /// fail before it commits one, so [`TurnTrace::record_turn`] records it
     /// once the state machine reports it.
-    pub(crate) fn start(tracer: &Arc<BoxedTracer>, clock: &TraceClock) -> Self {
+    pub(crate) fn start(
+        tracer: &Arc<BoxedTracer>,
+        clock: &TraceClock,
+        metrics: Option<Arc<TurnMetrics>>,
+    ) -> Self {
         let started = clock.now();
         let span = tracer
             .span_builder("turn")
@@ -93,6 +195,7 @@ impl TurnTrace {
             started,
             ended: false,
             turn: None,
+            metrics,
         }
     }
 
@@ -135,9 +238,11 @@ impl TurnTrace {
             .start_with_context(self.tracer.as_ref(), &self.cx);
         StageSpan {
             span,
+            stage: name,
             clock: self.clock,
             started,
             ended: false,
+            metrics: self.metrics.as_ref().map(Arc::clone),
         }
     }
 
@@ -151,7 +256,11 @@ impl TurnTrace {
     ///
     /// Boundary attributes come from the existing [`TurnReport`] counters plus
     /// text lengths; no second source of truth is introduced.
-    pub(crate) fn finish(&mut self, result: &Result<TurnReport, ParlevoxError>) {
+    pub(crate) fn finish(
+        &mut self,
+        result: &Result<TurnReport, ParlevoxError>,
+        playout_depth: u64,
+    ) {
         if self.ended {
             return;
         }
@@ -180,11 +289,20 @@ impl TurnTrace {
             }
         }
         let ended = self.clock.now();
-        span.set_attribute(KeyValue::new(
-            "duration.monotonic_ms",
-            millis(ended.since(self.started)),
-        ));
+        let duration = ended.since(self.started);
+        span.set_attribute(KeyValue::new("duration.monotonic_ms", millis(duration)));
         span.end_with_timestamp(self.clock.to_system_time(ended));
+
+        // Turn metrics are emitted here, the single site where the outcome and
+        // the final report are both known.
+        if let Some(metrics) = &self.metrics {
+            let outcome = match result {
+                Ok(report) if report.interrupted => "interrupted",
+                Ok(_) => "ok",
+                Err(_) => "failed",
+            };
+            metrics.record_turn(outcome, duration, result.as_ref().ok(), playout_depth);
+        }
     }
 }
 
@@ -209,9 +327,13 @@ impl Drop for TurnTrace {
 /// span and never falls back to OpenTelemetry's wall clock.
 pub(crate) struct StageSpan {
     span: opentelemetry::global::BoxedSpan,
+    /// The stage name, reused as the metric's `stage` attribute.
+    stage: &'static str,
     clock: TraceClock,
     started: Timestamp,
     ended: bool,
+    /// Caller-supplied instruments. `None` when the session has no meter.
+    metrics: Option<Arc<TurnMetrics>>,
 }
 
 impl StageSpan {
@@ -231,12 +353,17 @@ impl StageSpan {
         }
         self.ended = true;
         let ended = self.clock.now();
-        self.span.set_attribute(KeyValue::new(
-            "stage.duration_ms",
-            millis(ended.since(self.started)),
-        ));
+        let duration = ended.since(self.started);
+        self.span
+            .set_attribute(KeyValue::new("stage.duration_ms", millis(duration)));
         self.span
             .end_with_timestamp(self.clock.to_system_time(ended));
+        // `finish` is the single idempotent close path shared by `end()` and
+        // `Drop`, so a stage that ran records exactly one histogram point and a
+        // stage that never started records none.
+        if let Some(metrics) = &self.metrics {
+            metrics.record_stage(self.stage, duration);
+        }
     }
 }
 

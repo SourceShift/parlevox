@@ -34,8 +34,8 @@ futures-core = "0.3"
 futures-util = "0.3"
 anyhow = "1"
 proptest = "1"
-opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
-opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry = { version = "0.33", default-features = false, features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "metrics", "testing"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

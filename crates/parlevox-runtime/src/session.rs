@@ -34,7 +34,9 @@ use crate::events::{
 use crate::pipeline::{PipelineStats, SentenceQueue, SentenceSplitter};
 use crate::registry::Providers;
 #[cfg(feature = "otel")]
-use crate::telemetry::{counter, millis, to_u64, StageSpan, TraceClock, TurnTrace};
+use crate::telemetry::{counter, millis, to_u64, StageSpan, TraceClock, TurnMetrics, TurnTrace};
+#[cfg(feature = "otel")]
+use opentelemetry::metrics::Meter;
 #[cfg(feature = "otel")]
 use opentelemetry::KeyValue;
 #[cfg(feature = "otel")]
@@ -516,6 +518,10 @@ pub struct Session {
     /// One wall-clock export anchor plus the session's monotonic clock.
     #[cfg(feature = "otel")]
     trace_clock: TraceClock,
+    /// Caller-supplied metric instruments. `None` until [`Session::with_meter`],
+    /// so the default OTel path records no metrics.
+    #[cfg(feature = "otel")]
+    metrics: Option<Arc<TurnMetrics>>,
 }
 
 impl Session {
@@ -567,6 +573,21 @@ impl Session {
     {
         let tracer = opentelemetry::global::BoxedTracer::new(Box::new(tracer));
         Self::assemble(config, providers, Arc::new(tracer))
+    }
+
+    /// Attach a caller-supplied [`Meter`], enabling the fixed turn, stage and
+    /// drop metric set for this session.
+    ///
+    /// Metrics stay opt-in: a session built with [`Session::new`] or
+    /// [`Session::with_tracer`] records none, and this is the only way to
+    /// install them. The six instruments are created once here, not per turn.
+    /// Without a meter no instrument exists and the opt-out costs one `Option`
+    /// check.
+    #[cfg(feature = "otel")]
+    #[must_use]
+    pub fn with_meter(mut self, meter: Meter) -> Self {
+        self.metrics = Some(Arc::new(TurnMetrics::new(&meter)));
+        self
     }
 
     fn assemble(
@@ -630,6 +651,8 @@ impl Session {
             tracer,
             #[cfg(feature = "otel")]
             trace_clock: TraceClock::new(clock),
+            #[cfg(feature = "otel")]
+            metrics: None,
         })
     }
 
@@ -805,7 +828,11 @@ impl Session {
     pub async fn run_turn(&mut self, utterance: AudioChunk) -> Result<TurnReport, ParlevoxError> {
         #[cfg(feature = "otel")]
         {
-            let mut trace = TurnTrace::start(&self.tracer, &self.trace_clock);
+            let mut trace = TurnTrace::start(
+                &self.tracer,
+                &self.trace_clock,
+                self.metrics.as_ref().map(Arc::clone),
+            );
             let result = self.drive_turn(utterance, &mut trace).await;
             // A turn that fails before `FinalTranscript` has no commit and so
             // no report id; carry the id the next commit will report instead.
@@ -816,12 +843,11 @@ impl Session {
             // Sample the bounded handoffs after the turn body has finished and
             // before the span closes, so the values match what a caller reads
             // from the session immediately after `run_turn`.
-            trace.record_boundaries(
-                &self.input.stats(),
-                &self.output.stats(),
-                &self.events.stats(),
-            );
-            trace.finish(&result);
+            let input = self.input.stats();
+            let output = self.output.stats();
+            let events = self.events.stats();
+            trace.record_boundaries(&input, &output, &events);
+            trace.finish(&result, to_u64(output.depth));
             result
         }
         #[cfg(not(feature = "otel"))]
