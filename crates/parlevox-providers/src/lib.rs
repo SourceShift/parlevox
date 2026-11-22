@@ -12,6 +12,7 @@
 pub mod fakes;
 pub mod fallback;
 pub mod manifest;
+pub mod retry;
 pub mod stream;
 pub mod traits;
 
@@ -24,6 +25,7 @@ pub use fallback::{
     FallbackLlm, FallbackStats, FallbackStatsSnapshot, FallbackStt, FallbackTts, FallbackVad,
 };
 pub use manifest::{Modality, ProviderManifest};
+pub use retry::{RetryPolicy, RetryStats, RetryingLlm};
 pub use stream::cancelable_stream;
 pub use traits::{
     AudioChunk, ChatMessage, GenerateRequest, LlmProvider, ProviderStream, Role, SttProvider,
