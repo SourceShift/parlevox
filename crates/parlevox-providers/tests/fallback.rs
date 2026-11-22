@@ -1,9 +1,9 @@
 //! Integration tests for the provider fallback chains.
 //!
-//! The doubles below implement the real [`LlmProvider`] / [`TtsProvider`]
-//! traits, record their name in a shared call log, and script their failures
-//! so every test can prove *which* provider ran — not merely which error came
-//! back.
+//! The doubles below implement the real [`LlmProvider`] / [`TtsProvider`] /
+//! [`SttProvider`] traits, record their name in a shared call log, and script
+//! their failures so every test can prove *which* provider ran — not merely
+//! which error came back.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,13 +12,14 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use parlevox_core::{ErrorClass, ParlevoxError};
 use parlevox_providers::{
-    AudioChunk, FallbackLlm, FallbackTts, GenerateRequest, LlmProvider, Modality, ProviderManifest,
-    ProviderStream, SynthesizeRequest, TtsProvider,
+    AudioChunk, FallbackLlm, FallbackStt, FallbackTts, GenerateRequest, LlmProvider, Modality,
+    ProviderManifest, ProviderStream, SttProvider, SynthesizeRequest, TranscriptChunk, TtsProvider,
 };
 use tokio_util::sync::CancellationToken;
 
 type ErrFactory = fn() -> ParlevoxError;
 type CallLog = Arc<Mutex<Vec<&'static str>>>;
+type AudioLog = Arc<Mutex<Vec<AudioChunk>>>;
 
 fn transient_error() -> ParlevoxError {
     ParlevoxError::provider("scripted", "temporary failure")
@@ -176,6 +177,87 @@ impl TtsProvider for ScriptedTts {
     }
 }
 
+struct ScriptedStt {
+    name: &'static str,
+    manifest: ProviderManifest,
+    script: Script<TranscriptChunk>,
+    calls: CallLog,
+    audio: AudioLog,
+    dropped: AtomicU64,
+}
+
+impl ScriptedStt {
+    fn scripted(
+        name: &'static str,
+        script: Script<TranscriptChunk>,
+        calls: &CallLog,
+        audio: &AudioLog,
+        dropped: u64,
+    ) -> Arc<dyn SttProvider> {
+        Arc::new(ScriptedStt {
+            name,
+            manifest: ProviderManifest::new(name, Modality::Stt),
+            script,
+            calls: Arc::clone(calls),
+            audio: Arc::clone(audio),
+            dropped: AtomicU64::new(dropped),
+        })
+    }
+}
+
+#[async_trait]
+impl SttProvider for ScriptedStt {
+    fn manifest(&self) -> &ProviderManifest {
+        &self.manifest
+    }
+
+    async fn transcribe(
+        &self,
+        audio: AudioChunk,
+        _cancel: CancellationToken,
+    ) -> Result<ProviderStream<TranscriptChunk>, ParlevoxError> {
+        record(&self.calls, self.name);
+        self.audio
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(audio);
+        match &self.script {
+            Script::FailStart(make) => Err(make()),
+            Script::Items(items) => {
+                let items = items
+                    .iter()
+                    .map(|result| match result {
+                        Ok(item) => Ok(item.clone()),
+                        Err(make) => Err(make()),
+                    })
+                    .collect::<Vec<_>>();
+                Ok(Box::pin(futures_util::stream::iter(items)))
+            }
+        }
+    }
+
+    fn take_sidecar_dropped_frames(&self) -> u64 {
+        self.dropped.swap(0, Ordering::Relaxed)
+    }
+}
+
+/// A fresh sink that records the [`AudioChunk`] each attempt receives.
+fn recording_audio() -> AudioLog {
+    Arc::new(Mutex::new(Vec::new()))
+}
+
+/// The single utterance recorded by one attempt.
+///
+/// Panics if the attempt was invoked more than once, which would make the
+/// "same audio to every attempt" claim meaningless.
+fn recorded_audio(log: &AudioLog) -> AudioChunk {
+    let mut audio = log
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(audio.len(), 1, "each attempt transcribes exactly one chunk");
+    audio.remove(0)
+}
+
 async fn drain_llm(mut stream: ProviderStream<String>) -> (Vec<String>, Option<ParlevoxError>) {
     let mut items = Vec::new();
     while let Some(result) = stream.next().await {
@@ -198,6 +280,33 @@ async fn drain_tts(
         }
     }
     (items, None)
+}
+
+async fn drain_stt(
+    mut stream: ProviderStream<TranscriptChunk>,
+) -> (Vec<TranscriptChunk>, Option<ParlevoxError>) {
+    let mut items = Vec::new();
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(item) => items.push(item),
+            Err(error) => return (items, Some(error)),
+        }
+    }
+    (items, None)
+}
+
+fn final_chunk(text: &str) -> TranscriptChunk {
+    TranscriptChunk {
+        text: text.to_owned(),
+        is_final: true,
+    }
+}
+
+fn partial_chunk(text: &str) -> TranscriptChunk {
+    TranscriptChunk {
+        text: text.to_owned(),
+        is_final: false,
+    }
 }
 
 fn generate_request() -> GenerateRequest {
@@ -667,4 +776,202 @@ async fn empty_tts_chain_is_rejected_at_construction() {
         Err(error) => error,
     };
     assert_eq!(error.class(), ErrorClass::Protocol);
+}
+
+fn primary_capacity_error() -> ParlevoxError {
+    ParlevoxError::Capacity("primary queue full".into())
+}
+
+fn secondary_capacity_error() -> ParlevoxError {
+    ParlevoxError::Capacity("secondary queue full".into())
+}
+
+#[tokio::test]
+async fn stt_transient_before_commit_switches_to_next_provider() {
+    // Arrange
+    let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
+    let audio = recording_audio();
+    let primary = ScriptedStt::scripted(
+        "primary",
+        Script::FailStart(transient_error),
+        &calls,
+        &audio,
+        0,
+    );
+    let backup = ScriptedStt::scripted(
+        "backup",
+        Script::Items(vec![Ok(final_chunk("second"))]),
+        &calls,
+        &audio,
+        0,
+    );
+    let chain = FallbackStt::new(vec![primary, backup]).expect("chain is non-empty");
+
+    // Act
+    let stream = chain
+        .transcribe(chunk(1), CancellationToken::new())
+        .await
+        .expect("chain returns a stream");
+    let (items, error) = drain_stt(stream).await;
+
+    // Assert
+    assert_eq!(items, vec![final_chunk("second")]);
+    assert!(error.is_none());
+    assert_eq!(recorded_calls(&calls), vec!["primary", "backup"]);
+    let stats = chain.stats();
+    assert_eq!(stats.switched, 1);
+    assert_eq!(stats.exhausted, 0);
+}
+
+#[tokio::test]
+async fn stt_partial_then_transient_error_does_not_switch() {
+    // Arrange
+    let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
+    let audio = recording_audio();
+    let primary = ScriptedStt::scripted(
+        "primary",
+        Script::Items(vec![Ok(partial_chunk("hel")), Err(transient_error)]),
+        &calls,
+        &audio,
+        0,
+    );
+    let backup = ScriptedStt::scripted(
+        "backup",
+        Script::Items(vec![Ok(final_chunk("second"))]),
+        &calls,
+        &audio,
+        0,
+    );
+    let chain = FallbackStt::new(vec![primary, backup]).expect("chain is non-empty");
+
+    // Act
+    let stream = chain
+        .transcribe(chunk(1), CancellationToken::new())
+        .await
+        .expect("chain returns a stream");
+    let (items, error) = drain_stt(stream).await;
+
+    // Assert: the partial is delivered, then the committed provider's error;
+    // the chain never starts the backup.
+    assert_eq!(items, vec![partial_chunk("hel")]);
+    let error = error.expect("the committed provider's error is surfaced");
+    assert_eq!(error.class(), ErrorClass::Transient);
+    assert_eq!(chain.stats().switched, 0);
+    assert!(recorded_calls(&calls).iter().all(|name| *name != "backup"));
+}
+
+#[tokio::test]
+async fn stt_cancelled_error_does_not_switch() {
+    // Arrange
+    let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
+    let audio = recording_audio();
+    let primary = ScriptedStt::scripted(
+        "primary",
+        Script::FailStart(cancelled_error),
+        &calls,
+        &audio,
+        0,
+    );
+    let backup = ScriptedStt::scripted(
+        "backup",
+        Script::Items(vec![Ok(final_chunk("second"))]),
+        &calls,
+        &audio,
+        0,
+    );
+    let chain = FallbackStt::new(vec![primary, backup]).expect("chain is non-empty");
+
+    // Act
+    let stream = chain
+        .transcribe(chunk(1), CancellationToken::new())
+        .await
+        .expect("chain returns a stream");
+    let (items, error) = drain_stt(stream).await;
+
+    // Assert
+    assert!(items.is_empty());
+    let error = error.expect("cancellation is surfaced");
+    assert_eq!(error.class(), ErrorClass::Cancelled);
+    assert_eq!(recorded_calls(&calls), vec!["primary"]);
+    assert_eq!(chain.stats().switched, 0);
+}
+
+#[tokio::test]
+async fn stt_exhaustion_counts_switch_and_exhaustion() {
+    // Arrange: the two failures carry distinguishable messages so the surfaced
+    // error can be proven to be the secondary's, not merely class-equal.
+    let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
+    let audio = recording_audio();
+    let primary = ScriptedStt::scripted(
+        "primary",
+        Script::FailStart(primary_capacity_error),
+        &calls,
+        &audio,
+        0,
+    );
+    let backup = ScriptedStt::scripted(
+        "backup",
+        Script::FailStart(secondary_capacity_error),
+        &calls,
+        &audio,
+        0,
+    );
+    let chain = FallbackStt::new(vec![primary, backup]).expect("chain is non-empty");
+
+    // Act
+    let stream = chain
+        .transcribe(chunk(1), CancellationToken::new())
+        .await
+        .expect("chain returns a stream");
+    let (items, error) = drain_stt(stream).await;
+
+    // Assert
+    assert!(items.is_empty());
+    let error = error.expect("the last error is surfaced");
+    assert!(
+        matches!(&error, ParlevoxError::Capacity(msg) if msg == "secondary queue full"),
+        "exhaustion must surface the secondary's error, got {error:?}"
+    );
+    let stats = chain.stats();
+    assert_eq!(stats.switched, 1);
+    assert_eq!(stats.exhausted, 1);
+}
+
+#[tokio::test]
+async fn stt_switch_hands_the_same_audio_to_every_attempt() {
+    // Arrange
+    let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
+    let primary_audio = recording_audio();
+    let secondary_audio = recording_audio();
+    let sent = AudioChunk::new(24_000, 2, vec![11, -22, 333, -4_444]);
+    let primary = ScriptedStt::scripted(
+        "primary",
+        Script::FailStart(transient_error),
+        &calls,
+        &primary_audio,
+        0,
+    );
+    let backup = ScriptedStt::scripted(
+        "backup",
+        Script::Items(vec![Ok(final_chunk("second"))]),
+        &calls,
+        &secondary_audio,
+        0,
+    );
+    let chain = FallbackStt::new(vec![primary, backup]).expect("chain is non-empty");
+
+    // Act
+    let stream = chain
+        .transcribe(sent.clone(), CancellationToken::new())
+        .await
+        .expect("chain returns a stream");
+    let (_items, error) = drain_stt(stream).await;
+    assert!(error.is_none());
+
+    // Assert: both attempts saw the full, byte-identical utterance.
+    let primary_seen = recorded_audio(&primary_audio);
+    let secondary_seen = recorded_audio(&secondary_audio);
+    assert_eq!(primary_seen, sent);
+    assert_eq!(secondary_seen, sent);
+    assert_eq!(secondary_seen.pcm, primary_seen.pcm);
 }
