@@ -142,6 +142,33 @@ slack-test-and-register and the ring's slack-test-and-wake are each one critical
 section, so a pop either sees the registered waker or its opened slack is seen by
 the waiter, never neither.
 
+## Amendment (2026-11-22): opt-in speculative LLM start
+
+This amendment is additive and narrows one bullet of "Non-goals for v0"
+without rewriting it: the default turn is still half-duplex, and **early-start
+synthesis remains unimplemented**. What changed is that generation, not
+synthesis, may now begin from a partial transcript when a session opts in.
+
+`SessionConfig::speculative_start` (default `None`) starts exactly one LLM
+request on the first non-final STT chunk that reaches `min_partial_chars`. The
+request runs on a child of the turn's cancellation token, so a barge-in still
+reaches it. The stream is held unpolled while the rest of STT drains, and a
+`Drop` guard cancels the child token on every path that does not adopt it.
+
+Adoption is a byte-exact trimmed-prefix test: the final must extend the exact
+partial the model saw. Every character of the prompt was therefore spoken by
+the user, so the worst case is an under-specified prompt and never injected
+text. A divergent final cancels the speculation, counts the abandonment, and
+runs the ordinary path. With the flag unset, partials are discarded exactly as
+before — same provider calls, same order, same events, same spans — which is
+why the opt-in does not reopen the non-goal for the default path.
+
+The turn machine was corrected alongside it: `Speaking` is entered on the first
+emitted audio frame, a text-only reply finishes through
+`(Thinking, ReplyFinished) -> Listening`, `TurnMachine::abort` closes a failed
+turn, and a barge-in reaches the session from another task through a clone-able
+`BargeInHandle` while `Interrupted` lasts until the turn body unwinds.
+
 ## Alternatives considered
 
 ### Python core
