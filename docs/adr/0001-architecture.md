@@ -112,6 +112,36 @@ The contract is uniform across paths:
    counted. A late frame for a live tombstone stays a silent no-op; one for an
    evicted id is rejected as an unknown request rather than executed.
 
+## Amendment (2026-11-20): opt-in playout credit signal
+
+This amendment is additive. It does not change the v0.1 drop-not-throttle
+decision recorded above, and no original text in this ADR is rewritten.
+
+The playout ring can now, **only when a session opts in**, publish a
+`CreditHandle` alongside its existing counters. The handle exposes a
+`CreditSnapshot { capacity, depth, slack }`, cumulative `granted`/`cancelled`
+counters, and — in `parlevox-runtime` — a cancellable cooperative wait. The ring
+itself is unchanged in policy: it still uses `DropOldest`, every eviction and
+rejection still moves the same `dropped` counter and dropped-duration ledger,
+and `AudioRing::new` remains credit-free so the input ring and every
+non-opted-in caller pay nothing.
+
+The wait is chosen, never imposed. A caller must explicitly obtain the handle
+and await it against its own cancellation token; `run_turn` neither constructs
+`SessionCredits` nor awaits a credit wait, so both playout push/pop sites remain
+exactly the drop-not-throttle path they were. This is why the amendment does not
+reintroduce the blocking this ADR rejected: the producer or consumer must opt in
+by taking the handle and awaiting a cancellable wait, while every existing turn
+path still drops and counts instead of ever waiting on a slow consumer.
+
+The signal is **single-waiter**: the ring keeps one waker slot behind a mutex,
+and a second concurrent wait replaces the first waiter rather than queueing. It
+is capacity information for one cooperating consumer, not a fan-out mechanism.
+The same mutex makes the handshake lost-wakeup free — the waiter's
+slack-test-and-register and the ring's slack-test-and-wake are each one critical
+section, so a pop either sees the registered waker or its opened slack is seen by
+the waiter, never neither.
+
 ## Alternatives considered
 
 ### Python core

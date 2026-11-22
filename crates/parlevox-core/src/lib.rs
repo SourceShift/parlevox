@@ -12,7 +12,10 @@ pub mod clock;
 pub mod error;
 pub mod turn;
 
-pub use audio::{AudioFrame, AudioRing, OverflowPolicy, PushOutcome, RingStats};
+pub use audio::{
+    AudioFrame, AudioRing, CreditHandle, CreditSnapshot, CreditStats, CreditWait, OverflowPolicy,
+    PushOutcome, RingStats,
+};
 pub use clock::{DurationMs, MonoClock, Timestamp};
 pub use error::{ErrorClass, ParlevoxError};
 pub use turn::{TurnEvent, TurnMachine, TurnState};
