@@ -10,12 +10,14 @@
 //! on its next poll instead of racing a timer. Items from an older generation
 //! are never emitted.
 
+use std::future::{poll_fn, Future};
 use std::sync::Arc;
+use std::task::Poll;
 
 use futures_util::{FutureExt, StreamExt};
 use parlevox_core::{
-    AudioRing, MonoClock, OverflowPolicy, ParlevoxError, PushOutcome, RingStats, TurnEvent,
-    TurnMachine, TurnState,
+    AudioRing, CreditHandle, CreditSnapshot, CreditStats, CreditWait, MonoClock, OverflowPolicy,
+    ParlevoxError, PushOutcome, RingStats, TurnEvent, TurnMachine, TurnState,
 };
 use parlevox_providers::{
     AudioChunk, ChatMessage, GenerateRequest, ProviderManifest, ProviderStream, SynthesizeRequest,
@@ -87,6 +89,83 @@ impl Default for SessionConfig {
             pipeline_queue_capacity: 8,
             pipeline_max_sentence_chars: 240,
         }
+    }
+}
+
+/// Opt-in, non-blocking view of the playout ring's capacity pressure.
+///
+/// Obtained from [`Session::credits`]. It is additive and outside the turn
+/// loop: `run_turn` never constructs this type and never awaits [`Self::wait`],
+/// so every playout path keeps dropping rather than throttling.
+///
+/// # Single waiter
+///
+/// The ring holds one waker slot. This is a capacity signal for one cooperating
+/// consumer, not a queue: a second concurrent [`Self::wait`] replaces the first
+/// waiter's waker, and only the most recent registration is guaranteed to be
+/// woken. Callers that need fan-out should observe the snapshot themselves.
+#[derive(Clone)]
+pub struct SessionCredits {
+    handle: CreditHandle,
+}
+
+impl std::fmt::Debug for SessionCredits {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionCredits")
+            .field("snapshot", &self.snapshot())
+            .finish()
+    }
+}
+
+impl SessionCredits {
+    /// Wrap a ring's credit handle directly.
+    ///
+    /// A session exposes its playout handle through [`Session::credits`]. This
+    /// constructor lets a caller drive the wait against a ring it owns itself;
+    /// `run_turn` never calls it.
+    pub fn from_handle(handle: CreditHandle) -> Self {
+        SessionCredits { handle }
+    }
+
+    /// Current capacity, depth, and slack. Reading it never consumes or
+    /// mutates ring state.
+    pub fn snapshot(&self) -> CreditSnapshot {
+        self.handle.snapshot()
+    }
+
+    /// Cumulative granted and cancelled wait outcomes.
+    pub fn stats(&self) -> CreditStats {
+        self.handle.stats()
+    }
+
+    /// Wait until the playout ring has slack or `token` fires.
+    ///
+    /// Resolves [`CreditWait::Granted`] as soon as `slack > 0`, or
+    /// [`CreditWait::Cancelled`] when the token fires first. The slack test and
+    /// the waker registration are one atomic step under the same lock `pop`
+    /// holds while it checks slack and takes the waker, so a concurrent pop
+    /// either observes this waiter or makes its slack visible here — there is no
+    /// check-then-register window to lose a wakeup.
+    ///
+    /// No lock is held across an await, and the wait is cancellation-safe:
+    /// dropping the future leaves the ring and the counters untouched, because
+    /// counters move only on resolution. Only one waiter per ring is supported;
+    /// see the [type-level note](Self#single-waiter).
+    #[must_use = "a credit wait must be awaited or its signal is ignored"]
+    pub async fn wait(&self, token: &CancellationToken) -> CreditWait {
+        let mut cancelled = std::pin::pin!(token.cancelled());
+        poll_fn(|cx| {
+            if cancelled.as_mut().poll(cx).is_ready() {
+                self.handle.record_cancelled();
+                return Poll::Ready(CreditWait::Cancelled);
+            }
+            if self.handle.register_or_grant(cx.waker()) {
+                self.handle.record_granted();
+                return Poll::Ready(CreditWait::Granted);
+            }
+            Poll::Pending
+        })
+        .await
     }
 }
 
@@ -213,6 +292,9 @@ pub struct Session {
     clock: MonoClock,
     input: AudioRing,
     output: AudioRing,
+    /// Credit mirror of the playout ring, exposed only through
+    /// [`Session::credits`]. The turn loop never reads it.
+    output_credits: CreditHandle,
     providers: Providers,
     cancel: CancellationToken,
     generation: u64,
@@ -315,7 +397,8 @@ impl Session {
         // Every audio, event, and context path is bounded by an explicit
         // capacity; the context's own constructor validates its two bounds.
         let input = AudioRing::new(config.input_ring_capacity, OverflowPolicy::DropOldest);
-        let output = AudioRing::new(config.output_ring_capacity, OverflowPolicy::DropOldest);
+        let (output, output_credits) =
+            AudioRing::new_with_credits(config.output_ring_capacity, OverflowPolicy::DropOldest);
         let events = EventQueue::new(config.event_capacity, config.event_overflow_policy);
         let context = ChatContext::new(config.context_messages, config.context_chars)?;
         let pipeline = SentenceQueue::new(config.pipeline_queue_capacity);
@@ -326,6 +409,7 @@ impl Session {
             clock,
             input,
             output,
+            output_credits,
             providers,
             cancel: CancellationToken::new(),
             generation: 0,
@@ -357,6 +441,20 @@ impl Session {
 
     pub fn output_stats(&self) -> RingStats {
         self.output.stats()
+    }
+
+    /// Opt-in credit view of the playout ring.
+    ///
+    /// The handle is a non-blocking snapshot plus a cancellable cooperative
+    /// wait. `run_turn` never constructs or awaits it; every playout path keeps
+    /// pushing and draining with dropping, not throttling.
+    pub fn credits(&self) -> SessionCredits {
+        SessionCredits::from_handle(self.output_credits.clone())
+    }
+
+    /// Cumulative granted and cancelled credit waits for the playout ring.
+    pub fn credit_stats(&self) -> CreditStats {
+        self.output_credits.stats()
     }
 
     /// Depth and cumulative loss counters for the bounded conversation context.

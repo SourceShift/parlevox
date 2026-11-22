@@ -16,6 +16,7 @@ mod telemetry;
 
 pub use context::{ChatContext, ContextStats};
 pub use events::{EventPushOutcome, EventQueue, EventQueueStats, SessionEvent};
+pub use parlevox_core::{CreditHandle, CreditSnapshot, CreditStats, CreditWait};
 pub use pipeline::{PipelineStats, SentenceQueue, SentenceSplitter};
 pub use registry::{ProviderNames, ProviderRegistry, Providers};
-pub use session::{demo_utterance, Session, SessionConfig, TurnReport};
+pub use session::{demo_utterance, Session, SessionConfig, SessionCredits, TurnReport};

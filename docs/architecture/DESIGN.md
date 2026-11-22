@@ -214,9 +214,13 @@ round-trip.
 
 What remains open:
 
-- Producers cannot observe backpressure — there are no credits; overflow is
-  handled by dropping, not by slowing the producer (see ADR §"Backpressure
-  and loss accounting", which records this as deliberate for v0.1).
+- Producers can optionally observe playout capacity, but overflow is still
+  handled by dropping rather than by slowing the producer. The playout ring
+  publishes a non-blocking `CreditSnapshot` (capacity, depth, slack) with
+  cumulative `granted`/`cancelled` counters, and a caller may explicitly await
+  a cancellation-aware `SessionCredits::wait`. The turn loop never awaits it, so
+  drop-not-throttle remains the default (see ADR §"Backpressure and loss
+  accounting" and its 2026-11-20 amendment).
 - Half-duplex turn model by default (see §3 and the ADR's "Non-goals for v0").
   Reply-side `pipelined_tts` exists behind an opt-in flag; early-start STT
   (synthesis before the final transcript) remains unimplemented. The pipelined
