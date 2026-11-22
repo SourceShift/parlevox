@@ -248,6 +248,12 @@ What remains open:
   build still carries no OpenTelemetry dependency. With `pipelined_tts` on,
   the `llm` and per-sentence `tts` spans honestly overlap; the span timeline is
   not serialized to preserve the sequential shape. There is no OTLP exporter
-  configuration, no collector wiring, and no OTel metrics in v0 — the caller
-  installs a tracer or passes one to `Session::with_tracer` (dimension 7 is
-  implemented for spans, not for an export pipeline).
+  configuration and no collector wiring: the caller installs a tracer or passes
+  one to `Session::with_tracer`. A fixed six-instrument metric set —
+  `parlevox.turns`, `parlevox.turn.duration`, `parlevox.turn.stage.duration`,
+  `parlevox.frames.dropped`, `parlevox.sidecar.frames.dropped`, and
+  `parlevox.playout.depth` — is emitted only when the caller supplies a `Meter`
+  through `Session::with_meter`; with no meter the path records nothing. There
+  are still no production metric exporters, exemplars, or
+  views/aggregation tuning (dimension 7 is implemented for spans and a
+  caller-supplied meter, not for an export pipeline).
