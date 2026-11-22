@@ -1,9 +1,9 @@
 //! Integration tests for the provider fallback chains.
 //!
 //! The doubles below implement the real [`LlmProvider`] / [`TtsProvider`] /
-//! [`SttProvider`] traits, record their name in a shared call log, and script
-//! their failures so every test can prove *which* provider ran — not merely
-//! which error came back.
+//! [`SttProvider`] / [`VadProvider`] traits, record their name in a shared call
+//! log, and script their failures so every test can prove *which* provider ran
+//! — not merely which error came back.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,8 +12,9 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use parlevox_core::{ErrorClass, ParlevoxError};
 use parlevox_providers::{
-    AudioChunk, FallbackLlm, FallbackStt, FallbackTts, GenerateRequest, LlmProvider, Modality,
-    ProviderManifest, ProviderStream, SttProvider, SynthesizeRequest, TranscriptChunk, TtsProvider,
+    AudioChunk, FallbackLlm, FallbackStt, FallbackTts, FallbackVad, GenerateRequest, LlmProvider,
+    Modality, ProviderManifest, ProviderStream, SttProvider, SynthesizeRequest, TranscriptChunk,
+    TtsProvider, VadEvent, VadProvider, VadTransition,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -241,6 +242,63 @@ impl SttProvider for ScriptedStt {
     }
 }
 
+struct ScriptedVad {
+    name: &'static str,
+    manifest: ProviderManifest,
+    script: Script<VadTransition>,
+    calls: CallLog,
+    audio: AudioLog,
+}
+
+impl ScriptedVad {
+    fn scripted(
+        name: &'static str,
+        script: Script<VadTransition>,
+        calls: &CallLog,
+        audio: &AudioLog,
+    ) -> Arc<dyn VadProvider> {
+        Arc::new(ScriptedVad {
+            name,
+            manifest: ProviderManifest::new(name, Modality::Vad),
+            script,
+            calls: Arc::clone(calls),
+            audio: Arc::clone(audio),
+        })
+    }
+}
+
+#[async_trait]
+impl VadProvider for ScriptedVad {
+    fn manifest(&self) -> &ProviderManifest {
+        &self.manifest
+    }
+
+    async fn analyze(
+        &self,
+        audio: AudioChunk,
+        _cancel: CancellationToken,
+    ) -> Result<ProviderStream<VadTransition>, ParlevoxError> {
+        record(&self.calls, self.name);
+        self.audio
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(audio);
+        match &self.script {
+            Script::FailStart(make) => Err(make()),
+            Script::Items(items) => {
+                let items = items
+                    .iter()
+                    .map(|result| match result {
+                        Ok(item) => Ok(*item),
+                        Err(make) => Err(make()),
+                    })
+                    .collect::<Vec<_>>();
+                Ok(Box::pin(futures_util::stream::iter(items)))
+            }
+        }
+    }
+}
+
 /// A fresh sink that records the [`AudioChunk`] each attempt receives.
 fn recording_audio() -> AudioLog {
     Arc::new(Mutex::new(Vec::new()))
@@ -293,6 +351,26 @@ async fn drain_stt(
         }
     }
     (items, None)
+}
+
+async fn drain_vad(
+    mut stream: ProviderStream<VadTransition>,
+) -> (Vec<VadTransition>, Option<ParlevoxError>) {
+    let mut items = Vec::new();
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(item) => items.push(item),
+            Err(error) => return (items, Some(error)),
+        }
+    }
+    (items, None)
+}
+
+fn transition(event: VadEvent, timestamp_ms: u64) -> VadTransition {
+    VadTransition {
+        event,
+        timestamp_ms,
+    }
 }
 
 fn final_chunk(text: &str) -> TranscriptChunk {
@@ -966,6 +1044,208 @@ async fn stt_switch_hands_the_same_audio_to_every_attempt() {
         .await
         .expect("chain returns a stream");
     let (_items, error) = drain_stt(stream).await;
+    assert!(error.is_none());
+
+    // Assert: both attempts saw the full, byte-identical utterance.
+    let primary_seen = recorded_audio(&primary_audio);
+    let secondary_seen = recorded_audio(&secondary_audio);
+    assert_eq!(primary_seen, sent);
+    assert_eq!(secondary_seen, sent);
+    assert_eq!(secondary_seen.pcm, primary_seen.pcm);
+}
+
+#[tokio::test]
+async fn vad_transient_before_commit_switches_to_next_provider() {
+    // Arrange
+    let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
+    let audio = recording_audio();
+    let primary = ScriptedVad::scripted(
+        "primary",
+        Script::FailStart(transient_error),
+        &calls,
+        &audio,
+    );
+    let backup = ScriptedVad::scripted(
+        "backup",
+        Script::Items(vec![
+            Ok(transition(VadEvent::SpeechStart, 0)),
+            Ok(transition(VadEvent::SpeechEnd, 40)),
+        ]),
+        &calls,
+        &audio,
+    );
+    let chain = FallbackVad::new(vec![primary, backup]).expect("chain is non-empty");
+
+    // Act
+    let stream = chain
+        .analyze(chunk(1), CancellationToken::new())
+        .await
+        .expect("chain returns a stream");
+    let (items, error) = drain_vad(stream).await;
+
+    // Assert: the secondary's transitions are delivered whole, and the switch
+    // is counted as exactly one provider abandoned before commit.
+    assert_eq!(
+        items,
+        vec![
+            transition(VadEvent::SpeechStart, 0),
+            transition(VadEvent::SpeechEnd, 40),
+        ]
+    );
+    assert!(error.is_none());
+    assert_eq!(recorded_calls(&calls), vec!["primary", "backup"]);
+    let stats = chain.stats();
+    assert_eq!(stats.switched, 1);
+    assert_eq!(stats.exhausted, 0);
+}
+
+#[tokio::test]
+async fn vad_transition_then_transient_error_does_not_switch() {
+    // Arrange: the primary emits one transition (so it has committed) and only
+    // then fails transiently.
+    let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
+    let audio = recording_audio();
+    let primary = ScriptedVad::scripted(
+        "primary",
+        Script::Items(vec![
+            Ok(transition(VadEvent::SpeechStart, 0)),
+            Err(transient_error),
+        ]),
+        &calls,
+        &audio,
+    );
+    let backup = ScriptedVad::scripted(
+        "backup",
+        Script::Items(vec![Ok(transition(VadEvent::SpeechEnd, 40))]),
+        &calls,
+        &audio,
+    );
+    let chain = FallbackVad::new(vec![primary, backup]).expect("chain is non-empty");
+
+    // Act
+    let stream = chain
+        .analyze(chunk(1), CancellationToken::new())
+        .await
+        .expect("chain returns a stream");
+    let (items, error) = drain_vad(stream).await;
+
+    // Assert
+    assert_eq!(items, vec![transition(VadEvent::SpeechStart, 0)]);
+    let error = error.expect("the committed provider's error is surfaced");
+    assert_eq!(error.class(), ErrorClass::Transient);
+    assert_eq!(chain.stats().switched, 0);
+    assert!(recorded_calls(&calls).iter().all(|name| *name != "backup"));
+}
+
+#[tokio::test]
+async fn vad_cancelled_error_does_not_switch() {
+    // Arrange
+    let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
+    let primary_audio = recording_audio();
+    let secondary_audio = recording_audio();
+    let primary = ScriptedVad::scripted(
+        "primary",
+        Script::FailStart(cancelled_error),
+        &calls,
+        &primary_audio,
+    );
+    let backup = ScriptedVad::scripted(
+        "backup",
+        Script::Items(vec![Ok(transition(VadEvent::SpeechStart, 0))]),
+        &calls,
+        &secondary_audio,
+    );
+    let chain = FallbackVad::new(vec![primary, backup]).expect("chain is non-empty");
+
+    // Act
+    let stream = chain
+        .analyze(chunk(1), CancellationToken::new())
+        .await
+        .expect("chain returns a stream");
+    let (items, error) = drain_vad(stream).await;
+
+    // Assert: cancellation is surfaced and the caller's stop is honoured — the
+    // next provider is never started and never sees the audio.
+    assert!(items.is_empty());
+    let error = error.expect("cancellation is surfaced");
+    assert_eq!(error.class(), ErrorClass::Cancelled);
+    assert_eq!(recorded_calls(&calls), vec!["primary"]);
+    assert_eq!(chain.stats().switched, 0);
+    assert!(
+        secondary_audio
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty(),
+        "the secondary must not analyse audio after a cancellation"
+    );
+}
+
+#[tokio::test]
+async fn vad_exhaustion_counts_switch_and_exhaustion() {
+    // Arrange: the two failures carry distinguishable messages so the surfaced
+    // error can be proven to be the secondary's, not merely class-equal.
+    let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
+    let audio = recording_audio();
+    let primary = ScriptedVad::scripted(
+        "primary",
+        Script::FailStart(primary_capacity_error),
+        &calls,
+        &audio,
+    );
+    let backup = ScriptedVad::scripted(
+        "backup",
+        Script::FailStart(secondary_capacity_error),
+        &calls,
+        &audio,
+    );
+    let chain = FallbackVad::new(vec![primary, backup]).expect("chain is non-empty");
+
+    // Act
+    let stream = chain
+        .analyze(chunk(1), CancellationToken::new())
+        .await
+        .expect("chain returns a stream");
+    let (items, error) = drain_vad(stream).await;
+
+    // Assert
+    assert!(items.is_empty());
+    let error = error.expect("the last error is surfaced");
+    assert!(
+        matches!(&error, ParlevoxError::Capacity(msg) if msg == "secondary queue full"),
+        "exhaustion must surface the secondary's error, got {error:?}"
+    );
+    let stats = chain.stats();
+    assert_eq!(stats.switched, 1);
+    assert_eq!(stats.exhausted, 1);
+}
+
+#[tokio::test]
+async fn vad_switch_hands_the_same_audio_to_every_attempt() {
+    // Arrange
+    let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
+    let primary_audio = recording_audio();
+    let secondary_audio = recording_audio();
+    let sent = AudioChunk::new(24_000, 2, vec![11, -22, 333, -4_444]);
+    let primary = ScriptedVad::scripted(
+        "primary",
+        Script::FailStart(transient_error),
+        &calls,
+        &primary_audio,
+    );
+    let backup = ScriptedVad::scripted(
+        "backup",
+        Script::Items(vec![Ok(transition(VadEvent::SpeechStart, 0))]),
+        &calls,
+        &secondary_audio,
+    );
+    let chain = FallbackVad::new(vec![primary, backup]).expect("chain is non-empty");
+
+    // Act
+    let stream = chain
+        .analyze(sent.clone(), CancellationToken::new())
+        .await
+        .expect("chain returns a stream");
+    let (_items, error) = drain_vad(stream).await;
     assert!(error.is_none());
 
     // Assert: both attempts saw the full, byte-identical utterance.

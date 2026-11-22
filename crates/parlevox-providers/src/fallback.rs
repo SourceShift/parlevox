@@ -1,14 +1,16 @@
 //! Ordered provider fallback chains that never replay after commit.
 //!
-//! [`FallbackLlm`], [`FallbackTts`] and [`FallbackStt`] compose an ordered list
-//! of providers into one provider of the same modality. A request goes to the
-//! first provider; the chain moves to the next only when the current provider
-//! fails *before* it has yielded a single item and the failure is classed
-//! [`ErrorClass::Transient`] or [`ErrorClass::Capacity`].
+//! [`FallbackLlm`], [`FallbackTts`], [`FallbackStt`] and [`FallbackVad`]
+//! compose an ordered list of providers into one provider of the same
+//! modality. A request goes to the first provider; the chain moves to the next
+//! only when the current provider fails *before* it has yielded a single item
+//! and the failure is classed [`ErrorClass::Transient`] or
+//! [`ErrorClass::Capacity`].
 //!
-//! For [`FallbackStt`] the request is the utterance [`AudioChunk`]. It is
-//! cloned per attempt, so a provider that fails before committing never
-//! consumes the audio: a switched attempt transcribes byte-identical input.
+//! For [`FallbackStt`] and [`FallbackVad`] the request is the analysed
+//! [`AudioChunk`]. It is cloned per attempt, so a provider that fails before
+//! committing never consumes the audio: a switched attempt transcribes or
+//! analyses byte-identical input.
 //!
 //! # The no-fallback-after-commit law
 //!
@@ -54,7 +56,7 @@ use tokio_util::sync::CancellationToken;
 use crate::manifest::ProviderManifest;
 use crate::traits::{
     AudioChunk, GenerateRequest, LlmProvider, ProviderStream, SttProvider, SynthesizeRequest,
-    TranscriptChunk, TtsProvider,
+    TranscriptChunk, TtsProvider, VadProvider, VadTransition,
 };
 
 /// Monotonic counters accumulated by a fallback chain.
@@ -304,6 +306,83 @@ impl SttProvider for FallbackStt {
     }
 }
 
+/// A VAD provider that tries each provider in turn until one commits.
+///
+/// Build one with [`FallbackVad::new`]. See the [module docs](self) for the
+/// no-fallback-after-commit law and the counter semantics.
+pub struct FallbackVad {
+    primary: VadLink,
+    links: Arc<[VadLink]>,
+    stats: Arc<FallbackStats>,
+}
+
+impl FallbackVad {
+    /// Build a chain from `providers`, tried in order.
+    ///
+    /// The first provider is the chain's primary and defines its manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParlevoxError::Protocol`] when `providers` is empty: a chain
+    /// with no provider can never analyse audio.
+    pub fn new(providers: Vec<Arc<dyn VadProvider>>) -> Result<Self, ParlevoxError> {
+        let mut remaining = providers.into_iter();
+        let Some(first) = remaining.next() else {
+            return Err(ParlevoxError::Protocol(
+                "fallback chain has no providers".into(),
+            ));
+        };
+        let primary = VadLink(first);
+        let mut links = Vec::with_capacity(1 + remaining.len());
+        links.push(primary.clone());
+        links.extend(remaining.map(VadLink));
+        Ok(FallbackVad {
+            primary,
+            links: Arc::from(links),
+            stats: Arc::new(FallbackStats::default()),
+        })
+    }
+
+    /// A point-in-time copy of the chain's counters.
+    #[must_use]
+    pub fn stats(&self) -> FallbackStatsSnapshot {
+        self.stats.snapshot()
+    }
+
+    /// Sum the frames every provider in the chain reported dropping.
+    ///
+    /// [`VadProvider`] has no per-turn loss report, so every link contributes
+    /// zero today; the method exists so a chain adapter has the same shape as
+    /// the other modalities.
+    #[must_use]
+    pub fn take_sidecar_dropped_frames(&self) -> u64 {
+        self.links
+            .iter()
+            .map(ChainLink::take_sidecar_dropped_frames)
+            .sum()
+    }
+}
+
+#[async_trait]
+impl VadProvider for FallbackVad {
+    fn manifest(&self) -> &ProviderManifest {
+        self.primary.manifest()
+    }
+
+    async fn analyze(
+        &self,
+        audio: AudioChunk,
+        cancel: CancellationToken,
+    ) -> Result<ProviderStream<VadTransition>, ParlevoxError> {
+        Ok(Box::pin(ChainStream::new(
+            Arc::clone(&self.links),
+            audio,
+            cancel,
+            Arc::clone(&self.stats),
+        )))
+    }
+}
+
 /// Guard for the no-fallback-after-commit law: once a provider has yielded at
 /// least one item, the chain must never fall back to another provider.
 fn committed(committed: bool) -> bool {
@@ -317,8 +396,9 @@ type StartFuture<T> =
 /// One modality-erased link in a fallback chain.
 ///
 /// This is the single private abstraction that lets one state machine serve
-/// [`FallbackLlm`], [`FallbackTts`] and [`FallbackStt`]; it has exactly three
-/// implementations, [`LlmLink`], [`TtsLink`] and [`SttLink`].
+/// [`FallbackLlm`], [`FallbackTts`], [`FallbackStt`] and [`FallbackVad`]; it
+/// has exactly four implementations, [`LlmLink`], [`TtsLink`], [`SttLink`] and
+/// [`VadLink`].
 trait ChainLink: Send + Sync {
     type Item: Send + 'static;
     type Request: Clone + Send + Unpin + 'static;
@@ -400,6 +480,31 @@ impl ChainLink for SttLink {
     fn start(&self, request: Self::Request, cancel: CancellationToken) -> Self::Start {
         let provider = Arc::clone(&self.0);
         Box::pin(async move { provider.transcribe(request, cancel).await })
+    }
+}
+
+/// [`ChainLink`] adapter over an [`VadProvider`].
+#[derive(Clone)]
+struct VadLink(Arc<dyn VadProvider>);
+
+impl ChainLink for VadLink {
+    type Item = VadTransition;
+    type Request = AudioChunk;
+    type Start = StartFuture<VadTransition>;
+
+    fn manifest(&self) -> &ProviderManifest {
+        self.0.manifest()
+    }
+
+    fn take_sidecar_dropped_frames(&self) -> u64 {
+        // `VadProvider` has no per-turn loss report; analysis never buffers
+        // audio inside the chain.
+        0
+    }
+
+    fn start(&self, request: Self::Request, cancel: CancellationToken) -> Self::Start {
+        let provider = Arc::clone(&self.0);
+        Box::pin(async move { provider.analyze(request, cancel).await })
     }
 }
 
