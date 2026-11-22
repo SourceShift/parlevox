@@ -1,10 +1,14 @@
 //! Ordered provider fallback chains that never replay after commit.
 //!
-//! [`FallbackLlm`] and [`FallbackTts`] compose an ordered list of providers
-//! into one provider of the same modality. A request goes to the first
-//! provider; the chain moves to the next only when the current provider fails
-//! *before* it has yielded a single item and the failure is classed
+//! [`FallbackLlm`], [`FallbackTts`] and [`FallbackStt`] compose an ordered list
+//! of providers into one provider of the same modality. A request goes to the
+//! first provider; the chain moves to the next only when the current provider
+//! fails *before* it has yielded a single item and the failure is classed
 //! [`ErrorClass::Transient`] or [`ErrorClass::Capacity`].
+//!
+//! For [`FallbackStt`] the request is the utterance [`AudioChunk`]. It is
+//! cloned per attempt, so a provider that fails before committing never
+//! consumes the audio: a switched attempt transcribes byte-identical input.
 //!
 //! # The no-fallback-after-commit law
 //!
@@ -49,7 +53,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::manifest::ProviderManifest;
 use crate::traits::{
-    AudioChunk, GenerateRequest, LlmProvider, ProviderStream, SynthesizeRequest, TtsProvider,
+    AudioChunk, GenerateRequest, LlmProvider, ProviderStream, SttProvider, SynthesizeRequest,
+    TranscriptChunk, TtsProvider,
 };
 
 /// Monotonic counters accumulated by a fallback chain.
@@ -228,6 +233,77 @@ impl TtsProvider for FallbackTts {
     }
 }
 
+/// An STT provider that tries each provider in turn until one commits.
+///
+/// Build one with [`FallbackStt::new`]. See the [module docs](self) for the
+/// no-fallback-after-commit law and the counter semantics.
+pub struct FallbackStt {
+    primary: SttLink,
+    links: Arc<[SttLink]>,
+    stats: Arc<FallbackStats>,
+}
+
+impl FallbackStt {
+    /// Build a chain from `providers`, tried in order.
+    ///
+    /// The first provider is the chain's primary and defines its manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParlevoxError::Protocol`] when `providers` is empty: a chain
+    /// with no provider can never transcribe an utterance.
+    pub fn new(providers: Vec<Arc<dyn SttProvider>>) -> Result<Self, ParlevoxError> {
+        let mut remaining = providers.into_iter();
+        let Some(first) = remaining.next() else {
+            return Err(ParlevoxError::Protocol(
+                "fallback chain has no providers".into(),
+            ));
+        };
+        let primary = SttLink(first);
+        let mut links = Vec::with_capacity(1 + remaining.len());
+        links.push(primary.clone());
+        links.extend(remaining.map(SttLink));
+        Ok(FallbackStt {
+            primary,
+            links: Arc::from(links),
+            stats: Arc::new(FallbackStats::default()),
+        })
+    }
+
+    /// A point-in-time copy of the chain's counters.
+    #[must_use]
+    pub fn stats(&self) -> FallbackStatsSnapshot {
+        self.stats.snapshot()
+    }
+}
+
+#[async_trait]
+impl SttProvider for FallbackStt {
+    fn manifest(&self) -> &ProviderManifest {
+        self.primary.manifest()
+    }
+
+    async fn transcribe(
+        &self,
+        audio: AudioChunk,
+        cancel: CancellationToken,
+    ) -> Result<ProviderStream<TranscriptChunk>, ParlevoxError> {
+        Ok(Box::pin(ChainStream::new(
+            Arc::clone(&self.links),
+            audio,
+            cancel,
+            Arc::clone(&self.stats),
+        )))
+    }
+
+    fn take_sidecar_dropped_frames(&self) -> u64 {
+        self.links
+            .iter()
+            .map(|link| link.take_sidecar_dropped_frames())
+            .sum()
+    }
+}
+
 /// Guard for the no-fallback-after-commit law: once a provider has yielded at
 /// least one item, the chain must never fall back to another provider.
 fn committed(committed: bool) -> bool {
@@ -241,8 +317,8 @@ type StartFuture<T> =
 /// One modality-erased link in a fallback chain.
 ///
 /// This is the single private abstraction that lets one state machine serve
-/// both [`FallbackLlm`] and [`FallbackTts`]; it has exactly two
-/// implementations, [`LlmLink`] and [`TtsLink`].
+/// [`FallbackLlm`], [`FallbackTts`] and [`FallbackStt`]; it has exactly three
+/// implementations, [`LlmLink`], [`TtsLink`] and [`SttLink`].
 trait ChainLink: Send + Sync {
     type Item: Send + 'static;
     type Request: Clone + Send + Unpin + 'static;
@@ -301,6 +377,29 @@ impl ChainLink for TtsLink {
     fn start(&self, request: Self::Request, cancel: CancellationToken) -> Self::Start {
         let provider = Arc::clone(&self.0);
         Box::pin(async move { provider.synthesize(request, cancel).await })
+    }
+}
+
+/// [`ChainLink`] adapter over an [`SttProvider`].
+#[derive(Clone)]
+struct SttLink(Arc<dyn SttProvider>);
+
+impl ChainLink for SttLink {
+    type Item = TranscriptChunk;
+    type Request = AudioChunk;
+    type Start = StartFuture<TranscriptChunk>;
+
+    fn manifest(&self) -> &ProviderManifest {
+        self.0.manifest()
+    }
+
+    fn take_sidecar_dropped_frames(&self) -> u64 {
+        self.0.take_sidecar_dropped_frames()
+    }
+
+    fn start(&self, request: Self::Request, cancel: CancellationToken) -> Self::Start {
+        let provider = Arc::clone(&self.0);
+        Box::pin(async move { provider.transcribe(request, cancel).await })
     }
 }
 
