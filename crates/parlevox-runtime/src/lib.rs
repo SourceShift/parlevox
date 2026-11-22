@@ -19,4 +19,6 @@ pub use events::{EventPushOutcome, EventQueue, EventQueueStats, SessionEvent};
 pub use parlevox_core::{CreditHandle, CreditSnapshot, CreditStats, CreditWait};
 pub use pipeline::{PipelineStats, SentenceQueue, SentenceSplitter};
 pub use registry::{ProviderNames, ProviderRegistry, Providers};
-pub use session::{demo_utterance, Session, SessionConfig, SessionCredits, TurnReport};
+pub use session::{
+    demo_utterance, BargeInHandle, Session, SessionConfig, SessionCredits, TurnReport,
+};
