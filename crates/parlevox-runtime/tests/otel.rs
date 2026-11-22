@@ -15,7 +15,7 @@ use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::Value;
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::trace::{SdkTracerProvider, SimpleSpanProcessor, SpanData, SpanExporter};
-use parlevox_core::{ParlevoxError, TurnEvent, TurnState};
+use parlevox_core::{ParlevoxError, TurnState};
 use parlevox_providers::{
     cancelable_stream, AudioChunk, FakeLlm, FakeTts, FakeVad, Modality, ProviderManifest,
     ProviderStream, SttProvider, TranscriptChunk, FAKE_PARTIAL_TRANSCRIPT, FAKE_TRANSCRIPT,
@@ -140,19 +140,16 @@ fn scripted_providers(stt: Arc<ScriptedStt>) -> Providers {
     }
 }
 
-/// A failed attempt leaves the machine in `UserSpeaking` (the utterance was
-/// still in progress when STT failed), exactly as the VAD left it. Move it back
-/// to `Listening` the way a real end-of-speech transition would so the next
-/// attempt starts from the same state a fresh session would.
-fn recover_to_listening(session: &mut Session) {
+/// A failed attempt now closes the turn itself (`Session::fail` calls
+/// `TurnMachine::abort`), even when the failure happens before `FinalTranscript`
+/// while the speaker is still active. The next attempt must therefore start
+/// from `Listening` with no manual repair.
+fn assert_listening_after_failure(session: &Session) {
     assert_eq!(
         session.state(),
-        TurnState::UserSpeaking,
-        "a failed pre-final turn leaves the speaker active"
+        TurnState::Listening,
+        "a failed turn must already be back in Listening"
     );
-    session
-        .apply(TurnEvent::UserStoppedSpeaking)
-        .expect("UserSpeaking -> Listening is a legal transition");
 }
 
 #[tokio::test]
@@ -274,7 +271,7 @@ async fn failed_pre_final_turn_shares_committed_turn_index() {
         session.run_turn(utterance.clone()).await.is_err(),
         "the scripted STT failure must fail the turn"
     );
-    recover_to_listening(&mut session);
+    assert_listening_after_failure(&session);
     let first_success = session
         .run_turn(utterance.clone())
         .await
@@ -286,7 +283,7 @@ async fn failed_pre_final_turn_shares_committed_turn_index() {
         session.run_turn(utterance.clone()).await.is_err(),
         "the second scripted STT failure must fail the turn"
     );
-    recover_to_listening(&mut session);
+    assert_listening_after_failure(&session);
     let second_success = session
         .run_turn(utterance)
         .await
