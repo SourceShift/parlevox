@@ -233,7 +233,12 @@ struct PipelinePhaseState {
     splitter: SentenceSplitter,
     tts: Option<ProviderStream<AudioChunk>>,
     reply: String,
-    reply_started: bool,
+    /// The LLM emitted at least one delta. This is the fact the protocol guard
+    /// needs; it does not imply the machine has entered `Speaking`.
+    saw_reply_delta: bool,
+    /// The machine has applied `ReplyStarted`, which happens only once the
+    /// first audio frame is actually emitted.
+    speaking_entered: bool,
     delta_count: usize,
     llm_done: bool,
     interrupted: bool,
@@ -303,6 +308,11 @@ pub struct Session {
     /// Bounded completed-sentence handoff for the opt-in pipelined mode. Empty
     /// and unused when [`SessionConfig::pipelined_tts`] is false.
     pipeline: SentenceQueue,
+    /// Test-only ordered log of transitions applied through [`Session::apply`].
+    /// Absent from production builds, so the default runtime and the pinned
+    /// demo output carry no recorder.
+    #[cfg(test)]
+    transition_log: Vec<parlevox_core::turn::Transition>,
     /// Facade tracer used by the opt-in `otel` feature. Absent from the
     /// default build, so the default session carries no OpenTelemetry state.
     #[cfg(feature = "otel")]
@@ -416,6 +426,8 @@ impl Session {
             events,
             context,
             pipeline,
+            #[cfg(test)]
+            transition_log: Vec::new(),
             #[cfg(feature = "otel")]
             tracer,
             #[cfg(feature = "otel")]
@@ -492,7 +504,20 @@ impl Session {
         &mut self,
         event: TurnEvent,
     ) -> Result<parlevox_core::turn::Transition, ParlevoxError> {
-        self.machine.apply(event)
+        let transition = self.machine.apply(event)?;
+        #[cfg(test)]
+        self.transition_log.push(transition);
+        Ok(transition)
+    }
+
+    /// Test-only view of the transitions applied through [`Self::apply`].
+    ///
+    /// Transitions driven directly by the session (`request_barge_in`,
+    /// `ensure_listening_after_interrupt`, and `abort`) are intentionally not
+    /// recorded; the recorder exists to prove what a normal turn does.
+    #[cfg(test)]
+    fn transition_log(&self) -> &[parlevox_core::turn::Transition] {
+        &self.transition_log
     }
 
     /// Open the session (Idle → Listening).
@@ -859,7 +884,8 @@ impl Session {
             Err(err) => return self.fail(err),
         };
         let mut reply = String::new();
-        let mut reply_started = false;
+        let mut saw_reply_delta = false;
+        let mut speaking_entered = false;
         let mut delta_count = 0usize;
         let mut interrupted = false;
         loop {
@@ -870,10 +896,7 @@ impl Session {
             match llm.next().await {
                 None => break,
                 Some(Ok(delta)) => {
-                    if !reply_started {
-                        self.apply(TurnEvent::ReplyStarted)?;
-                        reply_started = true;
-                    }
+                    saw_reply_delta = true;
                     #[cfg(feature = "otel")]
                     if delta_count == 0 {
                         trace.set_attribute(KeyValue::new(
@@ -906,7 +929,7 @@ impl Session {
             llm_span.set_attribute(KeyValue::new("reply.deltas", counter(to_u64(delta_count))));
             llm_span.end();
         }
-        if !reply_started && !interrupted {
+        if !saw_reply_delta && !interrupted {
             return self.fail(ParlevoxError::Protocol(
                 "llm produced no reply deltas".into(),
             ));
@@ -972,6 +995,13 @@ impl Session {
                             turn,
                             frame: played,
                         })?;
+                    }
+                    // `Speaking` means the agent's audio is playing, so enter it
+                    // only after a frame was actually emitted. A text-only reply
+                    // never gets here and honestly stays `Thinking`.
+                    if audio_frames > 0 && !speaking_entered {
+                        self.apply(TurnEvent::ReplyStarted)?;
+                        speaking_entered = true;
                     }
                 }
                 Some(Err(ParlevoxError::Cancelled)) => {
@@ -1062,7 +1092,8 @@ impl Session {
             splitter: SentenceSplitter::new(self.config.pipeline_max_sentence_chars)?,
             tts: None,
             reply: String::new(),
-            reply_started: false,
+            saw_reply_delta: false,
+            speaking_entered: false,
             delta_count: 0,
             llm_done: false,
             interrupted: false,
@@ -1265,7 +1296,7 @@ impl Session {
             }
         }
 
-        if !state.reply_started && !state.interrupted {
+        if !state.saw_reply_delta && !state.interrupted {
             return self.fail(ParlevoxError::Protocol(
                 "llm produced no reply deltas".into(),
             ));
@@ -1318,6 +1349,13 @@ impl Session {
                 let frames = self.push_playout_chunk(turn, chunk)?;
                 state.audio_frames = state.audio_frames.saturating_add(frames);
                 state.request_frames = state.request_frames.saturating_add(frames);
+                // Enter `Speaking` only on the first frame the playout ring
+                // actually emits, not when the LLM emits a delta and not when
+                // a chunk is dropped.
+                if frames > 0 && !state.speaking_entered {
+                    self.apply(TurnEvent::ReplyStarted)?;
+                    state.speaking_entered = true;
+                }
             }
             Some(Err(ParlevoxError::Cancelled)) => state.interrupted = true,
             Some(Err(err)) => return self.fail(err),
@@ -1357,10 +1395,7 @@ impl Session {
                 }
             }
             Some(Ok(delta)) => {
-                if !state.reply_started {
-                    self.apply(TurnEvent::ReplyStarted)?;
-                    state.reply_started = true;
-                }
+                state.saw_reply_delta = true;
                 #[cfg(feature = "otel")]
                 if state.delta_count == 0 {
                     trace.set_attribute(KeyValue::new(
@@ -1510,6 +1545,13 @@ impl Session {
         // A failed turn owns no telemetry: drain whatever the adapters recorded
         // so a partial turn cannot bill its sidecar drops to the next one.
         let _ = self.take_sidecar_dropped_frames();
+        // Close the failed turn before reporting it. Without this the machine
+        // can sit in `Thinking`/`Speaking`/`UserSpeaking`, and the next turn's
+        // `FinalTranscript` would be rejected (or, before the correction arm
+        // was removed, silently collapse both turns into one). A closed
+        // session is never reopened, so keep the original error when `abort`
+        // reports `Closed`.
+        let _ = self.machine.abort();
         // If the control lane cannot even carry `Failed`, the queue error is
         // the louder and more accurate failure to report.
         self.emit(SessionEvent::Failed {
@@ -1624,17 +1666,19 @@ pub fn demo_utterance(sample_rate: u32, channels: u16, ms: u64) -> AudioChunk {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     use async_trait::async_trait;
 
     use crate::events::SessionEvent;
     use crate::registry::{ProviderNames, ProviderRegistry};
     use parlevox_core::ErrorClass;
+    use parlevox_providers::traits::VadTransition;
     use parlevox_providers::{
-        cancelable_stream, AudioChunk, ChatMessage, FakeLlm, FakeStt, FakeTts, FakeVad, Modality,
-        ProviderStream, Role, SttProvider, SynthesizeRequest, TranscriptChunk, TtsProvider,
-        FAKE_REPLY, FAKE_SAMPLE_RATE, FAKE_TRANSCRIPT, FAKE_TTS_FRAMES,
+        cancelable_stream, AudioChunk, ChatMessage, FakeLlm, FakeStt, FakeTts, FakeVad,
+        GenerateRequest, LlmProvider, Modality, ProviderStream, Role, SttProvider,
+        SynthesizeRequest, TranscriptChunk, TtsProvider, VadProvider, FAKE_REPLY, FAKE_SAMPLE_RATE,
+        FAKE_TRANSCRIPT, FAKE_TTS_FRAMES,
     };
 
     /// TTS double that reports a fixed sidecar drop count exactly once, proving
@@ -1719,6 +1763,250 @@ mod tests {
             })];
             Ok(cancelable_stream(items, cancel))
         }
+    }
+
+    /// LLM double that streams exactly the deltas it was built with. The
+    /// default [`FakeLlm`] is fine for most tests; this one makes the delta
+    /// count explicit so a test can prove `ReplyStarted` no longer tracks it.
+    struct ScriptedLlm {
+        manifest: ProviderManifest,
+        deltas: Vec<String>,
+    }
+
+    impl ScriptedLlm {
+        fn new(deltas: &[&str]) -> Self {
+            ScriptedLlm {
+                manifest: ProviderManifest::new("scripted-llm", Modality::Llm),
+                deltas: deltas.iter().map(|delta| (*delta).to_string()).collect(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for ScriptedLlm {
+        fn manifest(&self) -> &ProviderManifest {
+            &self.manifest
+        }
+
+        async fn generate(
+            &self,
+            _request: GenerateRequest,
+            cancel: CancellationToken,
+        ) -> Result<ProviderStream<String>, ParlevoxError> {
+            let items = self.deltas.iter().map(|delta| Ok(delta.clone())).collect();
+            Ok(cancelable_stream(items, cancel))
+        }
+    }
+
+    /// LLM double that fails mid-turn on its first request (the stream errors
+    /// before yielding a delta) and streams a normal reply afterwards. The
+    /// pre-delta failure is deliberate: it leaves a machine without
+    /// `TurnMachine::abort` in `Thinking`, which is exactly the state the
+    /// removed correction arm used to absorb.
+    struct FailOnceLlm {
+        manifest: ProviderManifest,
+        deltas: Vec<String>,
+        failed: AtomicBool,
+    }
+
+    impl FailOnceLlm {
+        fn new(deltas: &[&str]) -> Self {
+            FailOnceLlm {
+                manifest: ProviderManifest::new("fail-once-llm", Modality::Llm),
+                deltas: deltas.iter().map(|delta| (*delta).to_string()).collect(),
+                failed: AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for FailOnceLlm {
+        fn manifest(&self) -> &ProviderManifest {
+            &self.manifest
+        }
+
+        async fn generate(
+            &self,
+            _request: GenerateRequest,
+            cancel: CancellationToken,
+        ) -> Result<ProviderStream<String>, ParlevoxError> {
+            let items: Vec<Result<String, ParlevoxError>> =
+                if self.failed.swap(true, Ordering::SeqCst) {
+                    self.deltas.iter().map(|delta| Ok(delta.clone())).collect()
+                } else {
+                    vec![Err(ParlevoxError::provider(
+                        "fail-once-llm",
+                        "request failed before the first delta",
+                    ))]
+                };
+            Ok(cancelable_stream(items, cancel))
+        }
+    }
+
+    /// LLM double that emits one successful delta and then errors mid-stream on
+    /// its first request, then streams a normal reply. Its first failure lands
+    /// while the pipelined driver has already emitted audio and entered
+    /// `Speaking`, the position `Session::fail`'s `abort` must close without
+    /// discarding the original error.
+    struct PartialThenFailLlm {
+        manifest: ProviderManifest,
+        failed: AtomicBool,
+    }
+
+    impl PartialThenFailLlm {
+        fn new() -> Self {
+            PartialThenFailLlm {
+                manifest: ProviderManifest::new("partial-then-fail-llm", Modality::Llm),
+                failed: AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for PartialThenFailLlm {
+        fn manifest(&self) -> &ProviderManifest {
+            &self.manifest
+        }
+
+        async fn generate(
+            &self,
+            _request: GenerateRequest,
+            cancel: CancellationToken,
+        ) -> Result<ProviderStream<String>, ParlevoxError> {
+            let items: Vec<Result<String, ParlevoxError>> =
+                if self.failed.swap(true, Ordering::SeqCst) {
+                    vec![Ok("All good.".to_string())]
+                } else {
+                    // The trailing word is deliberate: a sentence whose last
+                    // buffered character is terminator whitespace is held one
+                    // delta, so without it no synthesis would start before the
+                    // error and the turn would fail from `Thinking`.
+                    vec![
+                        Ok("Hello there. Next".to_string()),
+                        Err(ParlevoxError::provider(
+                            "partial-then-fail-llm",
+                            "stream failed after the first delta",
+                        )),
+                    ]
+                };
+            Ok(cancelable_stream(items, cancel))
+        }
+    }
+
+    /// TTS double that emits no audio chunks at all: the text-only-reply case.
+    struct EmptyTts {
+        manifest: ProviderManifest,
+    }
+
+    impl EmptyTts {
+        fn new() -> Self {
+            EmptyTts {
+                manifest: ProviderManifest::new("empty-tts", Modality::Tts),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TtsProvider for EmptyTts {
+        fn manifest(&self) -> &ProviderManifest {
+            &self.manifest
+        }
+
+        async fn synthesize(
+            &self,
+            request: SynthesizeRequest,
+            cancel: CancellationToken,
+        ) -> Result<ProviderStream<AudioChunk>, ParlevoxError> {
+            if request.text.trim().is_empty() {
+                return Err(ParlevoxError::Protocol("empty synthesis text".into()));
+            }
+            let items: Vec<Result<AudioChunk, ParlevoxError>> = Vec::new();
+            Ok(cancelable_stream(items, cancel))
+        }
+    }
+
+    /// TTS double that emits exactly one audio chunk, independent of the
+    /// reply's delta count.
+    struct OneChunkTts {
+        manifest: ProviderManifest,
+    }
+
+    impl OneChunkTts {
+        fn new() -> Self {
+            OneChunkTts {
+                manifest: ProviderManifest::new("one-chunk-tts", Modality::Tts),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TtsProvider for OneChunkTts {
+        fn manifest(&self) -> &ProviderManifest {
+            &self.manifest
+        }
+
+        async fn synthesize(
+            &self,
+            request: SynthesizeRequest,
+            cancel: CancellationToken,
+        ) -> Result<ProviderStream<AudioChunk>, ParlevoxError> {
+            let chunk = AudioChunk::new(request.sample_rate, request.channels, vec![1; 16]);
+            Ok(cancelable_stream(vec![Ok(chunk)], cancel))
+        }
+    }
+
+    /// VAD double that reports no voice-activity transitions. It isolates the
+    /// turn state machine from VAD ordering in tests that drive turns
+    /// back-to-back.
+    struct SilentVad {
+        manifest: ProviderManifest,
+    }
+
+    impl SilentVad {
+        fn new() -> Self {
+            SilentVad {
+                manifest: ProviderManifest::new("silent-vad", Modality::Vad),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl VadProvider for SilentVad {
+        fn manifest(&self) -> &ProviderManifest {
+            &self.manifest
+        }
+
+        async fn analyze(
+            &self,
+            _audio: AudioChunk,
+            cancel: CancellationToken,
+        ) -> Result<ProviderStream<VadTransition>, ParlevoxError> {
+            let items: Vec<Result<VadTransition, ParlevoxError>> = Vec::new();
+            Ok(cancelable_stream(items, cancel))
+        }
+    }
+
+    /// Build a session from one custom provider set, resolving by the names the
+    /// manifests advertise.
+    fn session_with(
+        config: SessionConfig,
+        llm: Arc<dyn LlmProvider>,
+        tts: Arc<dyn TtsProvider>,
+        vad: Arc<dyn VadProvider>,
+    ) -> Session {
+        let names = ProviderNames {
+            stt: "fake-stt".into(),
+            llm: llm.manifest().name.clone(),
+            tts: tts.manifest().name.clone(),
+            vad: vad.manifest().name.clone(),
+        };
+        let mut registry = ProviderRegistry::new();
+        registry.register_stt(Arc::new(FakeStt::new())).unwrap();
+        registry.register_llm(llm).unwrap();
+        registry.register_tts(tts).unwrap();
+        registry.register_vad(vad).unwrap();
+        let providers = registry.resolve(&names).unwrap();
+        Session::new(config, providers).unwrap()
     }
 
     fn fake_session(config: SessionConfig) -> Session {
@@ -2146,5 +2434,178 @@ mod tests {
         let b = demo_utterance(16_000, 1, 20);
         assert_eq!(a, b);
         assert_eq!(a.pcm.len(), 320);
+    }
+
+    #[tokio::test]
+    async fn text_only_reply_reaches_listening_without_speaking() {
+        // Two deltas, zero TTS chunks: the reply finishes without audio and
+        // must not leave the machine stuck in `Thinking`.
+        let llm = Arc::new(ScriptedLlm::new(&["Hello", ", world"]));
+        let mut session = session_with(
+            SessionConfig::default(),
+            llm,
+            Arc::new(EmptyTts::new()),
+            Arc::new(FakeVad::new()),
+        );
+
+        let report = session
+            .run_turn(demo_utterance(FAKE_SAMPLE_RATE, 1, 40))
+            .await
+            .expect("a text-only reply is a completed turn");
+
+        assert_eq!(report.audio_frames, 0);
+        assert_eq!(report.reply, "Hello, world");
+        assert_eq!(session.state(), TurnState::Listening);
+
+        let log = session.transition_log();
+        assert!(
+            log.iter().any(|t| t.to == TurnState::Thinking),
+            "the turn must open into Thinking: {log:?}"
+        );
+        assert!(
+            log.iter()
+                .any(|t| t.from == TurnState::Thinking && t.to == TurnState::Listening),
+            "ReplyFinished must close a text-only turn from Thinking: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|t| t.to == TurnState::Speaking),
+            "ReplyStarted must not fire without an emitted audio frame: {log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_emitted_audio_frame_applies_reply_started() {
+        let deltas = ["Hello", ", ", "world"];
+        assert!(deltas.len() > 1, "the delta count must exceed one");
+        let llm = Arc::new(ScriptedLlm::new(&deltas));
+        let mut session = session_with(
+            SessionConfig::default(),
+            llm,
+            Arc::new(OneChunkTts::new()),
+            Arc::new(FakeVad::new()),
+        );
+
+        let report = session
+            .run_turn(demo_utterance(FAKE_SAMPLE_RATE, 1, 40))
+            .await
+            .unwrap();
+        assert_eq!(report.audio_frames, 1);
+        assert_eq!(report.reply, "Hello, world");
+
+        let delta_events = session
+            .take_events()
+            .iter()
+            .filter(|event| matches!(event, SessionEvent::ReplyDelta { .. }))
+            .count();
+        assert_eq!(delta_events, deltas.len());
+
+        // Only the reply lifecycle: everything that enters or leaves Thinking
+        // or Speaking.
+        let lifecycle: Vec<(TurnState, TurnState)> = session
+            .transition_log()
+            .iter()
+            .filter(|transition| {
+                matches!(transition.from, TurnState::Thinking | TurnState::Speaking)
+                    || matches!(transition.to, TurnState::Thinking | TurnState::Speaking)
+            })
+            .map(|transition| (transition.from, transition.to))
+            .collect();
+        assert_eq!(
+            lifecycle,
+            vec![
+                (TurnState::UserSpeaking, TurnState::Thinking),
+                (TurnState::Thinking, TurnState::Speaking),
+                (TurnState::Speaking, TurnState::Listening),
+            ],
+            "the first emitted frame, not the first delta, must enter Speaking"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_turn_closes_the_machine_before_the_next_turn() {
+        let llm = Arc::new(FailOnceLlm::new(&["partial", " reply"]));
+        let mut session = session_with(
+            SessionConfig::default(),
+            llm,
+            Arc::new(OneChunkTts::new()),
+            Arc::new(SilentVad::new()),
+        );
+        let utterance = demo_utterance(FAKE_SAMPLE_RATE, 1, 40);
+
+        let first = session.run_turn(utterance.clone()).await;
+        assert!(first.is_err(), "the mid-stream failure must surface");
+        let state_after_failure = session.state();
+
+        let second = session.run_turn(utterance).await;
+        println!(
+            "failed turn left state={state_after_failure:?}; second turn={:?}",
+            second.as_ref().map(|report| report.turn)
+        );
+
+        assert_eq!(
+            state_after_failure,
+            TurnState::Listening,
+            "a failed turn must close the machine before the next one"
+        );
+        let report = second.expect("the next turn must run after a failed one");
+        assert_eq!(report.turn, 2);
+        assert_eq!(session.state(), TurnState::Listening);
+    }
+
+    #[tokio::test]
+    async fn failed_pipelined_turn_after_a_reply_delta_is_closed() {
+        let llm = Arc::new(PartialThenFailLlm::new());
+        let mut session = session_with(
+            SessionConfig {
+                pipelined_tts: true,
+                ..SessionConfig::default()
+            },
+            llm,
+            Arc::new(OneChunkTts::new()),
+            Arc::new(SilentVad::new()),
+        );
+        let utterance = demo_utterance(FAKE_SAMPLE_RATE, 1, 40);
+
+        let first = session.run_turn(utterance.clone()).await;
+        let err = first.expect_err("the mid-stream failure must surface");
+        assert_eq!(err.class(), ErrorClass::Transient);
+
+        // The pipelined driver services the TTS stream before polling the LLM
+        // again, so the first delta's sentence synthesizes and emits audio
+        // before the second LLM poll yields the error.
+        let log_debug = format!("{:?}", session.transition_log());
+        let entered_speaking = session.transition_log().iter().any(|transition| {
+            transition.turn == 1
+                && transition.from == TurnState::Thinking
+                && transition.to == TurnState::Speaking
+        });
+        assert!(
+            entered_speaking,
+            "the failed turn must have entered Speaking before the error: {log_debug}"
+        );
+        let emitted_audio = session
+            .take_events()
+            .iter()
+            .any(|event| matches!(event, SessionEvent::AudioOut { turn: 1, .. }));
+        assert!(
+            emitted_audio,
+            "an emitted audio frame, not just the delta, must have entered Speaking"
+        );
+        assert_eq!(
+            session.state(),
+            TurnState::Listening,
+            "a failure while Speaking must close the machine"
+        );
+
+        let second = session
+            .run_turn(utterance)
+            .await
+            .expect("the next turn must run after a failed one");
+        assert_eq!(second.turn, 2);
+        assert_eq!(
+            second.reply, "All good.",
+            "the partial reply from the failed turn must be discarded"
+        );
+        assert_eq!(session.state(), TurnState::Listening);
     }
 }
