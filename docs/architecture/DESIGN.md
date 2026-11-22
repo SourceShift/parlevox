@@ -112,8 +112,10 @@ dangling. The runtime reports the interrupted turn as `TurnDone { interrupted:
 true }`.
 
 **The default turn is half-duplex.** The next stage does not start until the
-previous one finishes. Early-start STT (synthesizing before the transcript is
-final) remains deliberately unimplemented — see the ADR's "Non-goals for v0".
+previous one finishes. Early-start behavior is opt-in only:
+`SessionConfig::speculative_start: Option<SpeculativeStart>` (default `None`)
+starts the LLM request on the first usable STT partial, and the flag-off path
+still discards every partial — see the ADR's "Non-goals for v0".
 
 The reply side has one opt-in exception, `SessionConfig::pipelined_tts`
 (default `false`). With it enabled, the reply is split on sentence boundaries
@@ -126,6 +128,19 @@ it (`Session::pipeline_stats`); the in-flight synthesis stream stays on the
 turn future, so a barge-in tears it down structurally with no spawned task.
 With the flag off, the turn loop is the sequential one described above — same
 provider calls, order, events and span shape.
+
+The other opt-in exception is `SessionConfig::speculative_start` (default
+`None`). When set, the first non-final transcript whose trimmed text is at
+least `min_partial_chars` long starts exactly one LLM request against that
+partial, on a `CancellationToken` child of the turn's so a barge-in still
+reaches it. When the final arrives the stream is adopted only if the trimmed
+partial is a prefix of the trimmed final; every character the model saw was
+spoken, so the rule bounds the risk to an under-specified prompt and never
+admits injected text. A divergent final cancels the child token and runs the
+ordinary path, and `Session::speculation_stats` reports cumulative and
+per-turn `started`/`adopted`/`abandoned` counts. This overlaps generation with
+the tail of STT, not synthesis with the reply, and only one request per turn is
+tried.
 
 ## 4. Invariants (the reason this exists)
 
@@ -222,10 +237,11 @@ What remains open:
   drop-not-throttle remains the default (see ADR §"Backpressure and loss
   accounting" and its 2026-11-20 amendment).
 - Half-duplex turn model by default (see §3 and the ADR's "Non-goals for v0").
-  Reply-side `pipelined_tts` exists behind an opt-in flag; early-start STT
-  (synthesis before the final transcript) remains unimplemented. The pipelined
-  sentence handoff is bounded and its drops are counted through
-  `Session::pipeline_stats`.
+  Reply-side `pipelined_tts` and speculative LLM start from a partial
+  (`speculative_start`, with prefix-extension adoption and counted
+  abandonments through `Session::speculation_stats`) exist behind opt-in flags.
+  The pipelined sentence handoff is bounded and its drops are counted through
+  `Session::pipeline_stats`. Early-start *synthesis* remains unimplemented.
 - Turn spans exist but are opt-in: `cargo build -p parlevox-runtime --features otel`
   emits one `turn` root span with `vad`, `stt`, `llm`, `tts` and `playout`
   children plus MonoClock-derived boundary-cost attributes, and the default
