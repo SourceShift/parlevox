@@ -40,6 +40,24 @@ use opentelemetry::KeyValue;
 #[cfg(feature = "otel")]
 use parlevox_core::Timestamp;
 
+/// Opt-in speculative LLM start on the first usable STT partial.
+///
+/// With [`SessionConfig::speculative_start`] set, the turn loop sends the LLM
+/// request against the first non-final transcript that is long enough, instead
+/// of waiting for the final. When the final arrives the speculative stream is
+/// adopted only if its prompt is a prefix of the final text (see
+/// [`Session::speculation_stats`]); otherwise it is cancelled and the ordinary
+/// path runs against the final.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SpeculativeStart {
+    /// Minimum number of trimmed characters a partial must carry before it is
+    /// worth a speculative provider call.
+    ///
+    /// A zero threshold still requires a non-empty partial: the empty string is
+    /// never a usable prompt.
+    pub min_partial_chars: usize,
+}
+
 /// Tunables for one session.
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
@@ -73,6 +91,15 @@ pub struct SessionConfig {
     /// Maximum sentence length, in characters, before the splitter
     /// force-splits an unpunctuated run. Must be at least one.
     pub pipeline_max_sentence_chars: usize,
+    /// Opt-in: start the LLM request on the first usable STT partial instead of
+    /// waiting for the final transcript.
+    ///
+    /// Defaults to `None`. With it unset, partials are discarded exactly as
+    /// before: same provider calls, same order, same events, same span shape.
+    /// When set, a speculative request is made with a token derived from the
+    /// turn's, so a barge-in still reaches it; adoption is decided by a strict
+    /// trimmed prefix rule and every abandoned request is counted.
+    pub speculative_start: Option<SpeculativeStart>,
 }
 
 impl Default for SessionConfig {
@@ -90,6 +117,7 @@ impl Default for SessionConfig {
             pipelined_tts: false,
             pipeline_queue_capacity: 8,
             pipeline_max_sentence_chars: 240,
+            speculative_start: None,
         }
     }
 }
@@ -204,6 +232,74 @@ struct TurnBaseline {
     context_evicted_messages: u64,
 }
 
+/// Additive view of the opt-in speculative LLM start.
+///
+/// Obtained from [`Session::speculation_stats`]. It is never part of
+/// [`TurnReport`], so a report stays constructible by existing callers.
+///
+/// The three `started`/`adopted`/`abandoned` counters are cumulative over the
+/// session; the `turn_*` counters describe the most recent turn (including one
+/// interrupted before it committed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SpeculationStats {
+    /// Speculative LLM requests successfully started, for the whole session.
+    pub started: u64,
+    /// Speculative requests adopted because the final extended their partial.
+    pub adopted: u64,
+    /// Speculative requests abandoned because the final diverged.
+    pub abandoned: u64,
+    /// Speculative requests started in the most recent turn.
+    pub turn_started: u64,
+    /// Speculative requests adopted in the most recent turn.
+    pub turn_adopted: u64,
+    /// Speculative requests abandoned in the most recent turn.
+    pub turn_abandoned: u64,
+}
+
+/// The three cumulative counters, mirrored per turn by [`SpeculationStats`].
+#[derive(Debug, Clone, Copy, Default)]
+struct SpeculationCounters {
+    started: u64,
+    adopted: u64,
+    abandoned: u64,
+}
+
+/// One speculative LLM request held across the rest of the STT stream.
+///
+/// The stream is held unpolled until the final transcript decides its fate. If
+/// the speculation is not adopted, dropping this value cancels the child token,
+/// so no provider call is left dangling on any exit from the turn loop. An
+/// adopted speculation is marked before the stream is moved out, leaving the
+/// child token alone because a barge-in still reaches it through the parent.
+struct Speculation {
+    stream: Option<ProviderStream<String>>,
+    /// The trimmed partial the request was built from, used for the prefix
+    /// compatibility check against the final transcript.
+    prompt: String,
+    token: CancellationToken,
+    adopted: bool,
+}
+
+impl Drop for Speculation {
+    fn drop(&mut self) {
+        if !self.adopted {
+            self.token.cancel();
+        }
+    }
+}
+
+/// Whether a speculative request built from `partial` may stand in for the
+/// reply to `final`.
+///
+/// The rule is deliberately exact: after trimming, `partial` must be a
+/// non-empty prefix of `final`. Every character the model saw was therefore
+/// spoken by the user, so the only risk is an under-specified (shorter)
+/// prompt, never fabricated input.
+fn compatible(partial: &str, final_text: &str) -> bool {
+    let partial = partial.trim();
+    !partial.is_empty() && final_text.trim().starts_with(partial)
+}
+
 /// Everything the flag-selected LLM/TTS phase needs from the committed turn.
 ///
 /// Bundling these keeps the phase signatures small and makes it impossible to
@@ -212,6 +308,9 @@ struct PhaseInput<'a> {
     turn: u64,
     transcript: &'a str,
     history: Vec<ChatMessage>,
+    /// An already-started LLM stream adopted from a speculative request. When
+    /// present the phase uses it instead of calling `generate`.
+    adopted: Option<ProviderStream<String>>,
     token: CancellationToken,
     generation: u64,
     baseline: TurnBaseline,
@@ -401,6 +500,10 @@ pub struct Session {
     /// Bounded completed-sentence handoff for the opt-in pipelined mode. Empty
     /// and unused when [`SessionConfig::pipelined_tts`] is false.
     pipeline: SentenceQueue,
+    /// Cumulative counters for the opt-in speculative start.
+    speculation: SpeculationCounters,
+    /// Counters for the most recent turn, reset at turn start.
+    speculation_turn: SpeculationCounters,
     /// Test-only ordered log of transitions applied through [`Session::apply`].
     /// Absent from production builds, so the default runtime and the pinned
     /// demo output carry no recorder.
@@ -519,6 +622,8 @@ impl Session {
             events,
             context,
             pipeline,
+            speculation: SpeculationCounters::default(),
+            speculation_turn: SpeculationCounters::default(),
             #[cfg(test)]
             transition_log: Vec::new(),
             #[cfg(feature = "otel")]
@@ -587,6 +692,24 @@ impl Session {
     /// the session, like the input, playout, and event queues.
     pub fn pipeline_stats(&self) -> PipelineStats {
         self.pipeline.stats()
+    }
+
+    /// Cumulative and most-recent-turn counters for the opt-in speculative
+    /// start.
+    ///
+    /// Every counter stays zero when [`SessionConfig::speculative_start`] is
+    /// `None`. A speculation killed by a barge-in is counted only in
+    /// `started`: it is a user interrupt, not a divergence abandonment, so
+    /// `started >= adopted + abandoned` always holds.
+    pub fn speculation_stats(&self) -> SpeculationStats {
+        SpeculationStats {
+            started: self.speculation.started,
+            adopted: self.speculation.adopted,
+            abandoned: self.speculation.abandoned,
+            turn_started: self.speculation_turn.started,
+            turn_adopted: self.speculation_turn.adopted,
+            turn_abandoned: self.speculation_turn.abandoned,
+        }
     }
 
     pub fn provider_manifests(&self) -> Vec<ProviderManifest> {
@@ -731,6 +854,8 @@ impl Session {
         // They belong to a reply the caller never finished hearing, so never
         // synthesize them at the head of this turn.
         self.pipeline.clear_pending();
+        // The per-turn speculation counters describe this turn only.
+        self.speculation_turn = SpeculationCounters::default();
 
         let baseline = TurnBaseline {
             output: self.output.stats(),
@@ -800,6 +925,12 @@ impl Session {
             Ok(stream) => stream,
             Err(err) => return self.fail(err),
         };
+        let spec_config = self.config.speculative_start;
+        // One speculative request per turn. Held unpolled across the rest of
+        // the STT stream; its guard cancels the child token on every exit that
+        // does not adopt it.
+        let mut speculation: Option<Speculation> = None;
+        let mut speculation_attempted = false;
         let mut transcript = String::new();
         let mut saw_final = false;
         while let Some(item) = stt.next().await {
@@ -808,6 +939,52 @@ impl Session {
                     if chunk.is_final {
                         transcript = chunk.text;
                         saw_final = true;
+                    } else if let Some(limits) = spec_config {
+                        // Later partials are ignored whatever the outcome of
+                        // the first attempt.
+                        if !saw_final && !speculation_attempted {
+                            let partial = chunk.text.trim().to_string();
+                            let partial_chars = partial.chars().count();
+                            if !partial.is_empty() && partial_chars >= limits.min_partial_chars {
+                                speculation_attempted = true;
+                                let spec_token = token.child_token();
+                                let llm_provider = Arc::clone(&self.providers.llm);
+                                // Neither `history` nor the current utterance
+                                // has been recorded yet, so this snapshot is
+                                // byte-identical to the ordinary one taken
+                                // after the STT stream ends.
+                                let history = self.context.messages();
+                                let request = GenerateRequest {
+                                    prompt: partial.clone(),
+                                    history,
+                                };
+                                match llm_provider.generate(request, spec_token.clone()).await {
+                                    Ok(stream) => {
+                                        speculation = Some(Speculation {
+                                            stream: Some(stream),
+                                            prompt: partial,
+                                            token: spec_token,
+                                            adopted: false,
+                                        });
+                                        self.speculation.started =
+                                            self.speculation.started.saturating_add(1);
+                                        self.speculation_turn.started =
+                                            self.speculation_turn.started.saturating_add(1);
+                                    }
+                                    Err(err) => {
+                                        // A speculative start failure is not the
+                                        // turn's failure: the ordinary path
+                                        // will surface any real provider error.
+                                        tracing::trace!(
+                                            target: "parlevox_runtime",
+                                            error = %err,
+                                            "speculative llm start failed; ignoring"
+                                        );
+                                        spec_token.cancel();
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 Err(ParlevoxError::Cancelled) => {
@@ -850,6 +1027,45 @@ impl Session {
         let history = self.context.messages();
         self.context.push_user(transcript.clone());
 
+        // Decide the speculative request's fate. Adoption needs the final to
+        // extend the exact partial the model saw; anything else lets the final
+        // be authoritative. A dropped guard cancels the child token, so the
+        // divergent provider call stops without a second unwind site.
+        let adopted = match speculation.take() {
+            None => None,
+            Some(mut spec) => {
+                if compatible(&spec.prompt, &transcript) {
+                    match spec.stream.take() {
+                        Some(stream) => {
+                            // Leave the child token alone: it is still linked
+                            // to the turn's token, so a barge-in reaches the
+                            // adopted provider call through the parent.
+                            spec.adopted = true;
+                            self.speculation.adopted = self.speculation.adopted.saturating_add(1);
+                            self.speculation_turn.adopted =
+                                self.speculation_turn.adopted.saturating_add(1);
+                            Some(stream)
+                        }
+                        // A started speculation always holds its stream; treat
+                        // a missing one as an abandonment instead of panicking.
+                        None => {
+                            self.speculation.abandoned =
+                                self.speculation.abandoned.saturating_add(1);
+                            self.speculation_turn.abandoned =
+                                self.speculation_turn.abandoned.saturating_add(1);
+                            None
+                        }
+                    }
+                } else {
+                    // `spec` drops here and cancels the child token.
+                    self.speculation.abandoned = self.speculation.abandoned.saturating_add(1);
+                    self.speculation_turn.abandoned =
+                        self.speculation_turn.abandoned.saturating_add(1);
+                    None
+                }
+            }
+        };
+
         // 3. Streaming completion and synthesis. The flag selects the phase;
         // the prologue above and the epilogue below are shared, so the default
         // sequential turn keeps the same provider calls, order, events, and
@@ -860,6 +1076,7 @@ impl Session {
                     turn,
                     transcript: &transcript,
                     history,
+                    adopted,
                     token: token.clone(),
                     generation,
                     baseline,
@@ -874,6 +1091,7 @@ impl Session {
                     turn,
                     transcript: &transcript,
                     history,
+                    adopted,
                     token: token.clone(),
                     generation,
                     baseline,
@@ -966,6 +1184,7 @@ impl Session {
             turn,
             transcript,
             history,
+            adopted,
             token,
             generation,
             baseline,
@@ -979,19 +1198,26 @@ impl Session {
         let llm_started = self.clock.now();
         #[cfg(feature = "otel")]
         let mut llm_span = trace.stage("llm", llm_started);
-        let llm_provider = Arc::clone(&self.providers.llm);
-        let mut llm = match llm_provider
-            .generate(
-                GenerateRequest {
-                    prompt: transcript.to_string(),
-                    history,
-                },
-                token.clone(),
-            )
-            .await
-        {
-            Ok(stream) => stream,
-            Err(err) => return self.fail(err),
+        // An adopted speculation already issued the request; only a turn
+        // without one calls `generate` here.
+        let mut llm = match adopted {
+            Some(stream) => stream,
+            None => {
+                let llm_provider = Arc::clone(&self.providers.llm);
+                match llm_provider
+                    .generate(
+                        GenerateRequest {
+                            prompt: transcript.to_string(),
+                            history,
+                        },
+                        token.clone(),
+                    )
+                    .await
+                {
+                    Ok(stream) => stream,
+                    Err(err) => return self.fail(err),
+                }
+            }
         };
         let mut reply = String::new();
         let mut saw_reply_delta = false;
@@ -1172,6 +1398,7 @@ impl Session {
             turn,
             transcript,
             history,
+            adopted,
             token,
             generation,
             baseline,
@@ -1183,19 +1410,26 @@ impl Session {
         #[cfg(feature = "otel")]
         let phase_started = self.clock.now();
 
-        let llm_provider = Arc::clone(&self.providers.llm);
-        let mut llm = match llm_provider
-            .generate(
-                GenerateRequest {
-                    prompt: transcript.to_string(),
-                    history,
-                },
-                token.clone(),
-            )
-            .await
-        {
-            Ok(stream) => stream,
-            Err(err) => return self.fail(err),
+        // An adopted speculation already issued the request; only a turn
+        // without one calls `generate` here.
+        let mut llm = match adopted {
+            Some(stream) => stream,
+            None => {
+                let llm_provider = Arc::clone(&self.providers.llm);
+                match llm_provider
+                    .generate(
+                        GenerateRequest {
+                            prompt: transcript.to_string(),
+                            history,
+                        },
+                        token.clone(),
+                    )
+                    .await
+                {
+                    Ok(stream) => stream,
+                    Err(err) => return self.fail(err),
+                }
+            }
         };
 
         let mut state = PipelinePhaseState {
@@ -2746,5 +2980,32 @@ mod tests {
             "the partial reply from the failed turn must be discarded"
         );
         assert_eq!(session.state(), TurnState::Listening);
+    }
+
+    #[test]
+    fn compatible_partial_prefix_rule() {
+        // An extension of the trimmed partial is compatible.
+        assert!(compatible(
+            "what is the wea",
+            "what is the weather in Paris"
+        ));
+        // Whitespace around either side is trimmed before comparing.
+        assert!(compatible(
+            "  what is the wea  ",
+            " what is the weather in Paris "
+        ));
+        // Mid-word extension is accepted: every character the model saw was
+        // spoken by the user.
+        assert!(compatible("open the do", "open the door"));
+        // Divergence, an empty partial, and an empty final are all rejected.
+        assert!(!compatible(
+            "what is the weather in Paris",
+            "what is the capital of Peru"
+        ));
+        assert!(!compatible("", "anything"));
+        assert!(!compatible("   ", "anything"));
+        assert!(!compatible("anything", ""));
+        // The rule is byte-exact after trimming: case changes diverge.
+        assert!(!compatible("Hello", "hello world"));
     }
 }

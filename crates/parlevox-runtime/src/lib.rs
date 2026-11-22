@@ -20,5 +20,6 @@ pub use parlevox_core::{CreditHandle, CreditSnapshot, CreditStats, CreditWait};
 pub use pipeline::{PipelineStats, SentenceQueue, SentenceSplitter};
 pub use registry::{ProviderNames, ProviderRegistry, Providers};
 pub use session::{
-    demo_utterance, BargeInHandle, Session, SessionConfig, SessionCredits, TurnReport,
+    demo_utterance, BargeInHandle, Session, SessionConfig, SessionCredits, SpeculationStats,
+    SpeculativeStart, TurnReport,
 };
