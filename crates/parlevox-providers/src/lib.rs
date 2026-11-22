@@ -20,10 +20,12 @@ pub use fakes::{
     FAKE_FRAME_MS, FAKE_FRAME_SAMPLES, FAKE_LLM_DELTAS, FAKE_PARTIAL_TRANSCRIPT, FAKE_REPLY,
     FAKE_SAMPLE_RATE, FAKE_TRANSCRIPT, FAKE_TTS_FRAMES,
 };
-pub use fallback::{FallbackLlm, FallbackStats, FallbackStatsSnapshot, FallbackStt, FallbackTts};
+pub use fallback::{
+    FallbackLlm, FallbackStats, FallbackStatsSnapshot, FallbackStt, FallbackTts, FallbackVad,
+};
 pub use manifest::{Modality, ProviderManifest};
 pub use stream::cancelable_stream;
 pub use traits::{
     AudioChunk, ChatMessage, GenerateRequest, LlmProvider, ProviderStream, Role, SttProvider,
-    SynthesizeRequest, TranscriptChunk, TtsProvider, VadEvent, VadProvider,
+    SynthesizeRequest, TranscriptChunk, TtsProvider, VadEvent, VadProvider, VadTransition,
 };
