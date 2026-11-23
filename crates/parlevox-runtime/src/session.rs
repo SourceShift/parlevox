@@ -18,8 +18,9 @@ use std::task::Poll;
 
 use futures_util::{FutureExt, StreamExt};
 use parlevox_core::{
-    AudioRing, CreditHandle, CreditSnapshot, CreditStats, CreditWait, MonoClock, OverflowPolicy,
-    ParlevoxError, PushOutcome, RingStats, TurnEvent, TurnMachine, TurnState,
+    AudioFrame, AudioRing, CreditHandle, CreditSnapshot, CreditStats, CreditWait, DurationMs,
+    MonoClock, OverflowPolicy, ParlevoxError, PushOutcome, RingStats, TurnEvent, TurnMachine,
+    TurnState,
 };
 use parlevox_providers::{
     AudioChunk, ChatMessage, GenerateRequest, ProviderManifest, ProviderStream, SynthesizeRequest,
@@ -67,11 +68,15 @@ pub struct SpeculativeStart {
 /// is retained; if the next turn's final transcript is short enough to be a
 /// backchannel, that retained reply is replayed instead of calling the LLM.
 ///
-/// This is deliberately conservative. There is no playback acknowledgement, so
-/// the *whole* retained reply is replayed and the user may hear a sentence
-/// twice. Recovery happens only when the reply text was fully known; a reply
-/// interrupted during the LLM stream retains nothing. The backchannel test is a
-/// character-length heuristic, not a model.
+/// This is deliberately conservative. Without
+/// [`Session::with_partial_audio_resume`], there is no playback cursor, so the
+/// *whole* retained reply is replayed and the user may hear a sentence twice;
+/// with that option installed and the reply's audio retained within its cap,
+/// the backchannel turn resumes from the estimated playback position instead.
+/// Recovery
+/// happens only when the reply text was fully known; a reply interrupted during
+/// the LLM stream retains nothing. The backchannel test is a character-length
+/// heuristic, not a model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InterruptionRecovery {
     /// Maximum trimmed `chars().count()` of a final transcript that is treated
@@ -85,6 +90,62 @@ impl Default for InterruptionRecovery {
     fn default() -> Self {
         InterruptionRecovery {
             max_backchannel_chars: 12,
+        }
+    }
+}
+
+/// Opt-in resumption of a retained reply from its estimated playback position.
+///
+/// Installed with [`Session::with_partial_audio_resume`]. It removes the
+/// whole-reply replay limitation of [`InterruptionRecovery`] for the sequential
+/// path: when the frames the interrupted turn produced fit this bounded cap and
+/// the estimated playback position had not reached their end, the following
+/// backchannel turn emits only the produced frames after that position instead
+/// of calling the LLM and re-synthesizing the whole reply.
+///
+/// The option requires [`Session::with_interruption_recovery`]; without it the
+/// policy is inert. A non-zero [`Self::max_retained_frames`] is also required —
+/// zero installs the policy without retaining anything. Retention is bounded by
+/// that cap, so an over-long reply is never buffered beyond it.
+///
+/// The position is an *estimate*, not an acknowledgement. The transport never
+/// reports what it has played, so the session compares the wall-clock time
+/// elapsed since the first emitted frame with the frames' declared durations,
+/// assuming the transport starts playing each frame in real time on receipt.
+/// A transport that buffers far ahead of real time makes the estimate late: it
+/// under-skips (replaying audio the user may already have heard) and can never
+/// skip past the frames that were produced. With no emitted frame the estimate
+/// is zero. See [`playback_cursor`].
+///
+/// Only *produced* frames can be retained. If the barge-in cuts synthesis short,
+/// the unproduced remainder of the reply's audio never exists on either turn:
+/// the resume emits the tail of the produced prefix and then ends, while the
+/// turn's `reply` text (already complete when the LLM finished) stays the full
+/// reply. A resume emits no [`SessionEvent::ReplyDelta`]: the whole reply text
+/// was already streamed on the interrupted turn, so transports that render
+/// subtitles from deltas must not expect any on the resumed turn. A reply whose
+/// produced frames exceed the cap is never retained as audio and falls back to
+/// the text-only whole-reply replay. The pipelined path
+/// (`SessionConfig::pipelined_tts`) is unchanged and still replays text.
+///
+/// The option changes nothing about *when* the sequential path emits audio.
+/// Each produced frame is pushed to the bounded playout ring and drained
+/// immediately — the same body as the policy-off path, with no ring-window
+/// deferral — so the [`SessionEvent::AudioOut`] cadence is byte-identical and
+/// the two paths differ only in the observation that feeds retention. See
+/// [`Session::with_partial_audio_resume`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartialResume {
+    /// Hard cap on retained audio frames per retained reply. Zero disables
+    /// retention (the option is installed but inert).
+    pub max_retained_frames: usize,
+}
+
+impl Default for PartialResume {
+    /// 512 frames — roughly 10 s of 20 ms frames — is the default bound.
+    fn default() -> Self {
+        PartialResume {
+            max_retained_frames: 512,
         }
     }
 }
@@ -116,6 +177,112 @@ struct RecoveryCounters {
 #[derive(Debug, Clone)]
 struct PendingReply {
     text: String,
+    /// The reply's *produced* audio when the opt-in partial-resume policy was
+    /// active and it fit the retention cap. `None` keeps today's text-only
+    /// whole-reply TTS replay.
+    audio: Option<RetainedAudio>,
+}
+
+/// Estimate how many leading frames of `durations` had been heard after
+/// `elapsed` of wall-clock time.
+///
+/// The result is the length of the longest prefix whose declared durations sum
+/// to at most `elapsed`: a frame counts as heard once its whole declared
+/// duration has elapsed, so an exact prefix-sum boundary includes the last
+/// frame of that prefix. Sums and the count use saturating arithmetic, so a
+/// pathological duration can never wrap. An empty iterator yields zero.
+///
+/// This is the pure core of the opt-in [`PartialResume`] estimate: the turn
+/// compares the time since its first emitted frame with the retained frames'
+/// [`AudioFrame::duration`]. It is exposed for integration tests only and is
+/// deliberately not re-exported from the crate root, so it adds no supported
+/// public surface.
+#[doc(hidden)]
+#[must_use]
+pub fn playback_cursor(durations: impl Iterator<Item = DurationMs>, elapsed: DurationMs) -> u64 {
+    let mut heard: u64 = 0;
+    let mut cumulative: u64 = 0;
+    for duration in durations {
+        let next = cumulative.saturating_add(duration.as_millis());
+        if next > elapsed.as_millis() {
+            break;
+        }
+        cumulative = next;
+        heard = heard.saturating_add(1);
+    }
+    heard
+}
+
+/// A complete reply's audio retained by the opt-in partial-resume policy.
+///
+/// `frames[played..]` is exactly what a resume still has to emit: the frames
+/// the interrupted turn produced but, at the moment it stopped, had not been
+/// estimated heard. `played` is that estimate, not an acknowledgement.
+#[derive(Debug, Clone)]
+struct RetainedAudio {
+    frames: Vec<AudioFrame>,
+    /// Frames estimated heard before the interrupted turn stopped.
+    played: u64,
+}
+
+impl RetainedAudio {
+    /// Every retained frame was already estimated heard, so a resume would be
+    /// silent.
+    fn fully_played(&self) -> bool {
+        self.played >= u64::try_from(self.frames.len()).unwrap_or(u64::MAX)
+    }
+}
+
+/// Bounded accumulator for a reply's produced frames while partial resume is
+/// active.
+///
+/// It never grows past `cap`: the first frame that would exceed the cap drops
+/// the whole buffer and marks it overflowed, so a partially retained prefix can
+/// never be mistaken for the reply's complete audio. A zero cap marks the
+/// first frame as overflowed without allocating.
+#[derive(Debug)]
+struct RetentionBuffer {
+    frames: Vec<AudioFrame>,
+    cap: usize,
+    overflowed: bool,
+}
+
+impl RetentionBuffer {
+    fn new(cap: usize) -> Self {
+        RetentionBuffer {
+            // Match the ring's defensive sizing: the caller's cap bounds the
+            // buffer, but a huge cap must not force a huge upfront allocation.
+            frames: Vec::with_capacity(cap.min(4096)),
+            cap,
+            overflowed: false,
+        }
+    }
+
+    /// Retain one produced frame, or drop the whole buffer on overflow.
+    fn observe(&mut self, frame: &AudioFrame) {
+        if self.overflowed {
+            return;
+        }
+        if self.frames.len() >= self.cap {
+            self.frames = Vec::new();
+            self.overflowed = true;
+            return;
+        }
+        self.frames.push(frame.clone());
+    }
+
+    /// Turn the accumulator into a resume position, or `None` when the reply
+    /// overflowed or produced no frames. `None` is the text-only replay path.
+    fn finish(self, played: u64) -> Option<RetainedAudio> {
+        if self.overflowed || self.frames.is_empty() {
+            None
+        } else {
+            Some(RetainedAudio {
+                frames: self.frames,
+                played,
+            })
+        }
+    }
 }
 
 /// Tunables for one session.
@@ -292,6 +459,45 @@ struct TurnBaseline {
     context_evicted_messages: u64,
 }
 
+/// What a turn produced before it was interrupted, as handed to
+/// [`Session::finish_interrupted`].
+///
+/// Grouping these keeps the single unwind site's argument list small and makes
+/// the retention-relevant fields travel together.
+struct InterruptedTurn<'a> {
+    audio_frames: u64,
+    transcript: &'a str,
+    reply: &'a str,
+    reply_complete: bool,
+    retained_audio: Option<RetainedAudio>,
+}
+
+impl InterruptedTurn<'static> {
+    /// A turn that stopped before it produced any transcript or reply (VAD or
+    /// STT cancellation).
+    fn before_reply() -> Self {
+        InterruptedTurn {
+            audio_frames: 0,
+            transcript: "",
+            reply: "",
+            reply_complete: false,
+            retained_audio: None,
+        }
+    }
+}
+
+/// The inputs a partial-audio resume needs from the committed turn.
+///
+/// Kept apart from [`PhaseInput`] because a resume never starts an LLM stream
+/// and never reads the transcript or history.
+struct ResumeRequest {
+    turn: u64,
+    reply: String,
+    retained: RetainedAudio,
+    token: CancellationToken,
+    generation: u64,
+}
+
 /// Additive view of the opt-in speculative LLM start.
 ///
 /// Obtained from [`Session::speculation_stats`]. It is never part of
@@ -372,8 +578,10 @@ struct PhaseInput<'a> {
     /// present the phase uses it instead of calling `generate`.
     adopted: Option<ProviderStream<String>>,
     /// A retained reply to replay instead of calling the LLM. When present it
-    /// takes precedence over `adopted`.
-    replay: Option<String>,
+    /// takes precedence over `adopted`. A reply that also carries audio is
+    /// resumed from its estimated playback position; otherwise its text is
+    /// replayed.
+    replay: Option<PendingReply>,
     token: CancellationToken,
     generation: u64,
     baseline: TurnBaseline,
@@ -390,6 +598,10 @@ struct PhaseOutcome {
     /// reply interrupted during the LLM stream is incomplete and cannot be
     /// retained for replay.
     reply_complete: bool,
+    /// Audio the sequential phase produced before a barge-in, when the opt-in
+    /// partial-resume policy was active. `None` on a normal completion, on an
+    /// LLM-stream interruption, and whenever partial resume is inert.
+    retained_audio: Option<RetainedAudio>,
 }
 
 /// Mutable state of the pipelined LLM/TTS phase.
@@ -574,6 +786,9 @@ pub struct Session {
     /// Opt-in false-interruption recovery policy. `None` disables the feature
     /// entirely, so the default path retains and replays nothing.
     interruption_recovery: Option<InterruptionRecovery>,
+    /// Opt-in partial-audio resume policy. Inert without
+    /// [`Self::interruption_recovery`] and when its cap is zero.
+    partial_resume: Option<PartialResume>,
     /// A complete reply retained after a user barge-in, consumed by exactly one
     /// following turn.
     pending_recovery: Option<PendingReply>,
@@ -676,6 +891,45 @@ impl Session {
         self
     }
 
+    /// Enable opt-in resumption of a retained reply from its estimated playback
+    /// position.
+    ///
+    /// Requires [`Session::with_interruption_recovery`]: without it this policy
+    /// is inert and [`Session::recovery_stats`] stays all zeros. It is also
+    /// inert when [`PartialResume::max_retained_frames`] is zero.
+    ///
+    /// Installed, the sequential reply path retains the reply's produced audio
+    /// up to the cap. The position a resume starts from is an estimate: the
+    /// session compares the wall-clock time elapsed since the first emitted
+    /// frame with the frames' declared durations, assuming the transport plays a
+    /// frame in real time on receipt. There is no playback acknowledgement, so a
+    /// transport that buffers far ahead of real time makes the estimate late —
+    /// it under-skips, replaying audio the user may already have heard, and can
+    /// never skip past the produced frames. If a user barge-in stops a turn
+    /// whose produced frames fit the cap and whose estimated position is before
+    /// their end, the next backchannel turn emits only the frames after that
+    /// position — no LLM call, no TTS call, and no
+    /// [`SessionEvent::ReplyDelta`]. Only produced frames can be resumed: when
+    /// the barge-in cut synthesis short, the resume plays the produced prefix's
+    /// tail and the unproduced remainder is never heard, although the turn's
+    /// reply text stays the full LLM reply. A reply that overflowed the cap
+    /// keeps the text-only whole-reply replay. The pipelined path is unchanged
+    /// and still replays text.
+    ///
+    /// Emission cadence is unchanged: the policy-off path and the opted-in path
+    /// both push each produced frame to the bounded playout ring and drain it
+    /// immediately, with no ring-window deferral, so an
+    /// [`SessionEvent::AudioOut`] is emitted for every produced frame as it
+    /// arrives. See [`PartialResume`].
+    ///
+    /// The policy is session state, not [`SessionConfig`], so `SessionConfig`
+    /// stays publicly constructible without a new field.
+    #[must_use]
+    pub fn with_partial_audio_resume(mut self, policy: PartialResume) -> Self {
+        self.partial_resume = Some(policy);
+        self
+    }
+
     fn assemble(
         config: SessionConfig,
         providers: Providers,
@@ -732,6 +986,7 @@ impl Session {
             speculation: SpeculationCounters::default(),
             speculation_turn: SpeculationCounters::default(),
             interruption_recovery: None,
+            partial_resume: None,
             pending_recovery: None,
             recovery: RecoveryCounters::default(),
             #[cfg(test)]
@@ -1018,7 +1273,7 @@ impl Session {
         let mut speech_started = false;
         while let Some(item) = vad.next().await {
             if token.is_cancelled() {
-                return self.finish_interrupted(0, 0, "", "", false, baseline);
+                return self.finish_interrupted(0, InterruptedTurn::before_reply(), baseline);
             }
             match item {
                 Ok(transition) => match transition.event {
@@ -1036,7 +1291,7 @@ impl Session {
                     }
                 },
                 Err(ParlevoxError::Cancelled) => {
-                    return self.finish_interrupted(0, 0, "", "", false, baseline);
+                    return self.finish_interrupted(0, InterruptedTurn::before_reply(), baseline);
                 }
                 Err(err) => return self.fail(err),
             }
@@ -1118,7 +1373,7 @@ impl Session {
                     }
                 }
                 Err(ParlevoxError::Cancelled) => {
-                    return self.finish_interrupted(0, 0, "", "", false, baseline);
+                    return self.finish_interrupted(0, InterruptedTurn::before_reply(), baseline);
                 }
                 Err(err) => return self.fail(err),
             }
@@ -1170,7 +1425,7 @@ impl Session {
                 });
                 if is_backchannel {
                     self.recovery.resumed = self.recovery.resumed.saturating_add(1);
-                    Some(pending.text)
+                    Some(pending)
                 } else {
                     self.recovery.discarded = self.recovery.discarded.saturating_add(1);
                     None
@@ -1270,10 +1525,13 @@ impl Session {
         if outcome.interrupted {
             return self.finish_interrupted(
                 turn,
-                outcome.audio_frames,
-                &transcript,
-                &outcome.reply,
-                outcome.reply_complete,
+                InterruptedTurn {
+                    audio_frames: outcome.audio_frames,
+                    transcript: &transcript,
+                    reply: &outcome.reply,
+                    reply_complete: outcome.reply_complete,
+                    retained_audio: outcome.retained_audio,
+                },
                 baseline,
             );
         }
@@ -1360,6 +1618,43 @@ impl Session {
         #[cfg(not(feature = "otel"))]
         let _ = baseline;
 
+        // Split a retained reply into its text and, when the interrupted turn
+        // retained its produced audio within the cap, the frames the user had
+        // not heard yet.
+        let (replay_text, resume_audio) = match replay {
+            None => (None, None),
+            Some(mut pending) => (Some(pending.text), pending.audio.take()),
+        };
+
+        // A retained reply that carries audio is resumed from its played
+        // position: neither provider is called and no `ReplyDelta` is emitted.
+        if let Some(retained) = resume_audio {
+            return self.resume_retained_audio(
+                ResumeRequest {
+                    turn,
+                    reply: replay_text.unwrap_or_default(),
+                    retained,
+                    token,
+                    generation,
+                },
+                #[cfg(feature = "otel")]
+                baseline,
+                #[cfg(feature = "otel")]
+                trace,
+            );
+        }
+
+        // The opt-in partial-resume policy applies only when recovery is
+        // installed and the retention cap is non-zero. `None` keeps the
+        // pre-existing sequential loop unchanged, byte for byte.
+        let partial_cap = if self.interruption_recovery.is_some() {
+            self.partial_resume
+                .map(|policy| policy.max_retained_frames)
+                .filter(|cap| *cap > 0)
+        } else {
+            None
+        };
+
         // 3. Streaming completion.
         #[cfg(feature = "otel")]
         let llm_started = self.clock.now();
@@ -1369,7 +1664,7 @@ impl Session {
         // `generate` entirely and takes precedence over an adopted speculation.
         // Otherwise an adopted speculation already issued the request and only
         // a turn without one calls `generate` here.
-        let mut llm = match replay {
+        let mut llm = match replay_text {
             Some(text) => futures_util::stream::once(async move { Ok(text) }).boxed(),
             None => match adopted {
                 Some(stream) => stream,
@@ -1450,6 +1745,7 @@ impl Session {
                 audio_frames: 0,
                 interrupted: true,
                 reply_complete: false,
+                retained_audio: None,
             });
         }
 
@@ -1472,6 +1768,15 @@ impl Session {
             Err(err) => return self.fail(err),
         };
         let mut audio_frames = 0u64;
+        let mut retained_audio = None;
+        // The opt-in policy observes every produced frame so the frames after
+        // the estimated-heard prefix can resume. Observation never changes
+        // emission: it runs immediately before the policy-off body, so both
+        // paths push and drain the bounded ring at the same cadence.
+        let mut retention = partial_cap.map(RetentionBuffer::new);
+        // When the first frame was emitted: the anchor for the playback
+        // estimate. `None` until audio is actually emitted.
+        let mut first_audio_at = None;
         loop {
             if token.is_cancelled() || self.generation != generation {
                 interrupted = true;
@@ -1487,11 +1792,16 @@ impl Session {
                             millis(self.clock.now().since(tts_started)),
                         ));
                     }
-                    let ts = self.clock.now();
-                    // Branch on the bounded playout ring's outcome: a frame the
-                    // ring rejects is counted inside the ring, but the producer
-                    // must still observe that the drop happened.
-                    match self.output.push(chunk.to_frame(ts)) {
+                    let frame = chunk.to_frame(self.clock.now());
+                    if let Some(retention) = retention.as_mut() {
+                        // Retain before playout: the estimate covers every
+                        // produced frame, whether or not the ring accepts it.
+                        retention.observe(&frame);
+                    }
+                    // Branch on the bounded playout ring's outcome: a frame
+                    // the ring rejects is counted inside the ring, but the
+                    // producer must still observe that the drop happened.
+                    match self.output.push(frame) {
                         PushOutcome::Accepted | PushOutcome::Replaced => {}
                         PushOutcome::Dropped => {
                             tracing::trace!(
@@ -1501,18 +1811,20 @@ impl Session {
                         }
                     }
                     while let Some(played) = self.output.pop() {
-                        audio_frames += 1;
+                        audio_frames = audio_frames.saturating_add(1);
                         self.emit(SessionEvent::AudioOut {
                             turn,
                             frame: played,
                         })?;
-                    }
-                    // `Speaking` means the agent's audio is playing, so enter it
-                    // only after a frame was actually emitted. A text-only reply
-                    // never gets here and honestly stays `Thinking`.
-                    if audio_frames > 0 && !speaking_entered {
-                        self.apply(TurnEvent::ReplyStarted)?;
-                        speaking_entered = true;
+                        // `Speaking` means the agent's audio is playing, so
+                        // enter it only after a frame was actually emitted. A
+                        // text-only reply never gets here and honestly stays
+                        // `Thinking`. The first emit anchors the estimate.
+                        if !speaking_entered {
+                            self.apply(TurnEvent::ReplyStarted)?;
+                            speaking_entered = true;
+                            first_audio_at = Some(self.clock.now());
+                        }
                     }
                 }
                 Some(Err(ParlevoxError::Cancelled)) => {
@@ -1521,6 +1833,21 @@ impl Session {
                 }
                 Some(Err(err)) => return self.fail(err),
             }
+        }
+        if interrupted {
+            // Estimate how many produced frames the transport had played when
+            // the turn stopped, and keep only the frames after that prefix. No
+            // emitted frame means nothing could have been heard yet.
+            retained_audio = retention.and_then(|retention| {
+                let played = match first_audio_at {
+                    None => 0,
+                    Some(first) => playback_cursor(
+                        retention.frames.iter().map(AudioFrame::duration),
+                        self.clock.now().since(first),
+                    ),
+                };
+                retention.finish(played)
+            });
         }
         #[cfg(feature = "otel")]
         {
@@ -1540,6 +1867,7 @@ impl Session {
                 audio_frames,
                 interrupted: true,
                 reply_complete: true,
+                retained_audio,
             });
         }
 
@@ -1548,6 +1876,110 @@ impl Session {
             audio_frames,
             interrupted: false,
             reply_complete: true,
+            retained_audio: None,
+        })
+    }
+
+    /// Emit a retained reply's audio from its estimated playback position, in
+    /// order, through the bounded playout path.
+    ///
+    /// This is the resume half of [`PartialResume`]: the retained frames are
+    /// re-stamped with the clock at emit time and pushed/pop like any other
+    /// playout, so ring drops are counted and a cancelled resume stops at the
+    /// normal interruption law. It calls neither provider and streams no
+    /// [`SessionEvent::ReplyDelta`].
+    fn resume_retained_audio(
+        &mut self,
+        request: ResumeRequest,
+        #[cfg(feature = "otel")] baseline: TurnBaseline,
+        #[cfg(feature = "otel")] trace: &TurnTrace,
+    ) -> Result<PhaseOutcome, ParlevoxError> {
+        let ResumeRequest {
+            turn,
+            reply,
+            retained,
+            token,
+            generation,
+        } = request;
+        #[cfg(feature = "otel")]
+        let started = self.clock.now();
+        #[cfg(feature = "otel")]
+        let mut llm_span = trace.stage("llm", started);
+        #[cfg(feature = "otel")]
+        let mut tts_span = trace.stage("tts", started);
+        #[cfg(feature = "otel")]
+        let mut playout_span = trace.stage("playout", started);
+
+        let mut audio_frames = 0u64;
+        let mut speaking_entered = false;
+        let mut interrupted = false;
+        let start = usize::try_from(retained.played).unwrap_or(usize::MAX);
+        for mut frame in retained.frames.into_iter().skip(start) {
+            if token.is_cancelled() || self.generation != generation {
+                interrupted = true;
+                break;
+            }
+            // Retained timestamps describe the interrupted turn, not this one.
+            frame.timestamp = self.clock.now();
+            match self.output.push(frame) {
+                PushOutcome::Accepted | PushOutcome::Replaced => {}
+                PushOutcome::Dropped => {
+                    tracing::trace!(
+                        target: "parlevox_runtime",
+                        "playout ring rejected an audio frame"
+                    );
+                }
+            }
+            while let Some(played) = self.output.pop() {
+                audio_frames = audio_frames.saturating_add(1);
+                self.emit(SessionEvent::AudioOut {
+                    turn,
+                    frame: played,
+                })?;
+                // `Speaking` means the agent's audio is playing, so enter it
+                // only after a frame was actually emitted.
+                if !speaking_entered {
+                    self.apply(TurnEvent::ReplyStarted)?;
+                    speaking_entered = true;
+                }
+            }
+        }
+        if interrupted {
+            // Frames still queued when the resume was cancelled were never
+            // emitted; drop them rather than leak them into a later turn.
+            while self.output.pop().is_some() {}
+        }
+        #[cfg(feature = "otel")]
+        {
+            let output = self.output.stats();
+            let dropped = output.dropped.saturating_sub(baseline.output.dropped);
+            llm_span.set_attribute(KeyValue::new(
+                "reply.chars",
+                counter(to_u64(reply.chars().count())),
+            ));
+            llm_span.set_attribute(KeyValue::new("reply.deltas", counter(0)));
+            llm_span.end();
+            // No synthesis ran: the frames came from retention.
+            tts_span.set_attribute(KeyValue::new("audio.frames", counter(0)));
+            tts_span.set_attribute(KeyValue::new(
+                "replay.resumed_frames",
+                counter(audio_frames),
+            ));
+            tts_span.end();
+            playout_span.set_attribute(KeyValue::new("playout.frames", counter(audio_frames)));
+            playout_span.set_attribute(KeyValue::new("playout.dropped_frames", counter(dropped)));
+            playout_span.end();
+        }
+
+        Ok(PhaseOutcome {
+            reply,
+            audio_frames,
+            interrupted,
+            // A resume is never re-retained: the pending reply was consumed
+            // one-shot at the commit point and its audio belongs to the turn
+            // that was interrupted.
+            reply_complete: false,
+            retained_audio: None,
         })
     }
 
@@ -1594,8 +2026,10 @@ impl Session {
         // `generate` entirely and takes precedence over an adopted speculation.
         // Otherwise an adopted speculation already issued the request and only
         // a turn without one calls `generate` here.
+        // The pipelined path replays text only: a retained reply's audio is
+        // deliberately ignored here, so a pipeline still re-synthesizes it.
         let mut llm = match replay {
-            Some(text) => futures_util::stream::once(async move { Ok(text) }).boxed(),
+            Some(pending) => futures_util::stream::once(async move { Ok(pending.text) }).boxed(),
             None => match adopted {
                 Some(stream) => stream,
                 None => {
@@ -1841,6 +2275,9 @@ impl Session {
             // A pipelined reply is complete only when the LLM stream had
             // already ended before the interrupt, not merely because audio did.
             reply_complete: state.llm_done,
+            // Partial-audio resume is a sequential-path feature; the pipelined
+            // path never retains audio and always replays text.
+            retained_audio: None,
         })
     }
 
@@ -2130,12 +2567,16 @@ impl Session {
     fn finish_interrupted(
         &mut self,
         turn: u64,
-        audio_frames: u64,
-        transcript: &str,
-        reply: &str,
-        reply_complete: bool,
+        interrupted: InterruptedTurn<'_>,
         baseline: TurnBaseline,
     ) -> Result<TurnReport, ParlevoxError> {
+        let InterruptedTurn {
+            audio_frames,
+            transcript,
+            reply,
+            reply_complete,
+            retained_audio,
+        } = interrupted;
         // Read the cause before the next turn clears the flag: a request means
         // the caller asked to stop; anything else means a provider cancelled
         // on its own.
@@ -2148,15 +2589,41 @@ impl Session {
         // text was completely known may be retained. An upstream cancellation
         // is not the user asking to hear the reply again, and a reply cut short
         // during the LLM stream cannot be replayed honestly.
+        //
+        // When the opt-in partial-resume policy retained the reply's audio and
+        // the estimate had not reached its end, the audio travels with the text
+        // and the next backchannel turn resumes from that position. An
+        // overflowed or absent buffer keeps today's text-only whole-reply
+        // replay. A position at the end means every retained frame was already
+        // estimated heard, so there is nothing left to hear: such a reply is
+        // neither retained nor counted.
         if self.interruption_recovery.is_some()
             && cause == InterruptCause::User
             && reply_complete
             && !reply.is_empty()
         {
-            self.pending_recovery = Some(PendingReply {
-                text: reply.to_string(),
-            });
-            self.recovery.retained = self.recovery.retained.saturating_add(1);
+            match retained_audio {
+                // Every retained frame was already played, so there is nothing
+                // left to hear: retaining the text would only invite a
+                // duplicate re-synthesis.
+                Some(audio) if audio.fully_played() => {}
+                Some(audio) => {
+                    self.pending_recovery = Some(PendingReply {
+                        text: reply.to_string(),
+                        audio: Some(audio),
+                    });
+                    self.recovery.retained = self.recovery.retained.saturating_add(1);
+                }
+                // No audio was retained (policy inert, overflow, or nothing
+                // produced): keep today's text-only whole-reply replay.
+                None => {
+                    self.pending_recovery = Some(PendingReply {
+                        text: reply.to_string(),
+                        audio: None,
+                    });
+                    self.recovery.retained = self.recovery.retained.saturating_add(1);
+                }
+            }
         }
         self.ensure_listening_after_interrupt(cause)?;
         // The request belongs to the turn that just unwound. Clearing it here
