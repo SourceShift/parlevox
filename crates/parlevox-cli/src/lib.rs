@@ -7,6 +7,7 @@
 //! network. `demo --sidecar` runs the same turn with STT, LLM and TTS served by
 //! the optional Python plugin over the framed protocol.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use parlevox_core::ParlevoxError;
@@ -19,8 +20,8 @@ use parlevox_providers::{
     ProviderRegistry as DescriptorRegistry, SttProvider, TtsProvider,
 };
 use parlevox_runtime::{
-    demo_utterance, ProviderNames, ProviderRegistry, Providers, Session, SessionConfig,
-    SessionEvent, TurnReport,
+    demo_utterance, ProviderNames, ProviderRegistry, Providers, Recorder, RecorderConfig,
+    RecorderStats, Session, SessionConfig, SessionEvent, TurnReport,
 };
 use parlevox_sidecar::{
     resolve_sdk_path, PoolConfig, SdkSearch, SidecarClient, SidecarConfig, SidecarLlm, SidecarPool,
@@ -169,6 +170,105 @@ pub fn project_events(events: &[SessionEvent]) -> Vec<String> {
         .collect()
 }
 
+/// Which provider backend a `demo` invocation drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DemoBackend {
+    Fake,
+    Sidecar,
+}
+
+/// A `--record` target and its transcript policy.
+#[derive(Debug, Clone)]
+struct RecordOptions {
+    path: PathBuf,
+    record_transcripts: bool,
+}
+
+/// Parsed `demo` arguments.
+#[derive(Debug)]
+struct DemoArgs {
+    backend: DemoBackend,
+    pool: bool,
+    record: Option<RecordOptions>,
+}
+
+/// Parse `demo` arguments after the `demo` command word.
+///
+/// The accepted grammar is `--fake|--sidecar [--record <path>]
+/// [--record-transcripts] [--pool]`, with `--fake --pool` rejected and
+/// `--record-transcripts` required to accompany `--record`.
+fn parse_demo(rest: &[String]) -> Result<DemoArgs, ParlevoxError> {
+    let mut backend = None;
+    let mut record: Option<RecordOptions> = None;
+    let mut record_transcripts = false;
+    let mut pool = false;
+    let mut index = 0;
+    while index < rest.len() {
+        match rest[index].as_str() {
+            flag @ ("--fake" | "--sidecar") => {
+                if backend.is_some() {
+                    return Err(ParlevoxError::Protocol(format!(
+                        "demo backend given more than once: {flag}"
+                    )));
+                }
+                backend = Some(if flag == "--fake" {
+                    DemoBackend::Fake
+                } else {
+                    DemoBackend::Sidecar
+                });
+            }
+            "--record" => {
+                index += 1;
+                let Some(path) = rest.get(index) else {
+                    return Err(ParlevoxError::Protocol(
+                        "--record requires a file path: --record <path>".into(),
+                    ));
+                };
+                record = Some(RecordOptions {
+                    path: PathBuf::from(path),
+                    record_transcripts: false,
+                });
+            }
+            "--record-transcripts" => record_transcripts = true,
+            "--pool" => pool = true,
+            other => {
+                return Err(ParlevoxError::Protocol(format!(
+                    "unrecognised demo argument: {other}"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    let Some(backend) = backend else {
+        return Err(ParlevoxError::Protocol(
+            "demo requires --fake or --sidecar".into(),
+        ));
+    };
+    if record_transcripts && record.is_none() {
+        return Err(ParlevoxError::Protocol(
+            "--record-transcripts requires --record <path>".into(),
+        ));
+    }
+    if record_transcripts {
+        if let Some(options) = record.as_mut() {
+            options.record_transcripts = true;
+        }
+    }
+    if pool && backend == DemoBackend::Fake {
+        return Err(ParlevoxError::Protocol(
+            "demo --fake --pool is rejected: --pool requires --sidecar \
+             (the fakes spawn no plugin process)"
+                .into(),
+        ));
+    }
+    Ok(DemoArgs {
+        backend,
+        pool,
+        record,
+    })
+}
+
 /// Parse process arguments and run the matching demo.
 ///
 /// # Errors
@@ -179,38 +279,15 @@ pub fn project_events(events: &[SessionEvent]) -> Vec<String> {
 pub async fn run_args() -> Result<(), ParlevoxError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
-        [command, flag, pool] if command == "demo" && flag == "--fake" && pool == "--pool" => {
-            usage();
-            Err(ParlevoxError::Protocol(
-                "demo --fake --pool is rejected: --pool requires --sidecar \
-                 (the fakes spawn no plugin process)"
-                    .into(),
-            ))
-        }
-        [command, flag, pool] if command == "demo" && flag == "--sidecar" && pool == "--pool" => {
-            demo_sidecar_pooled().await
-        }
-        [command, flag] if command == "demo" && flag == "--fake" => demo_fake().await,
-        [command, flag] if command == "demo" && flag == "--sidecar" => demo_sidecar().await,
-        [command, subcommand] if command == "providers" && subcommand == "list" => providers_list(),
-        [command, subcommand, name] if command == "providers" && subcommand == "describe" => {
-            providers_describe(name)
-        }
-        [command, flag] if command == "providers" && (flag == "--help" || flag == "-h") => {
-            providers_usage();
-            Ok(())
-        }
-        [command, rest @ ..] if command == "providers" => {
-            providers_usage();
-            Err(ParlevoxError::Protocol(format!(
-                "unrecognised providers arguments: {}",
-                rest.join(" ")
-            )))
-        }
         [flag] if flag == "--help" || flag == "-h" => {
             usage();
             Ok(())
         }
+        [command, rest @ ..] if command == "demo" => {
+            let demo = parse_demo(rest).inspect_err(|_| usage())?;
+            run_demo(demo).await
+        }
+        [command, rest @ ..] if command == "providers" => run_providers(rest),
         _ => {
             usage();
             Err(ParlevoxError::Protocol(format!(
@@ -221,11 +298,75 @@ pub async fn run_args() -> Result<(), ParlevoxError> {
     }
 }
 
+async fn run_demo(args: DemoArgs) -> Result<(), ParlevoxError> {
+    if args.pool {
+        return demo_sidecar_pooled_with(args.record).await;
+    }
+    match args.backend {
+        DemoBackend::Fake => demo_fake_with(args.record).await,
+        DemoBackend::Sidecar => demo_sidecar_with(args.record).await,
+    }
+}
+
+fn run_providers(rest: &[String]) -> Result<(), ParlevoxError> {
+    match rest {
+        [subcommand] if subcommand == "list" => providers_list(),
+        [subcommand, name] if subcommand == "describe" => providers_describe(name),
+        [flag] if flag == "--help" || flag == "-h" => {
+            providers_usage();
+            Ok(())
+        }
+        _ => {
+            providers_usage();
+            Err(ParlevoxError::Protocol(format!(
+                "unrecognised providers arguments: {}",
+                rest.join(" ")
+            )))
+        }
+    }
+}
+
 pub fn usage() {
     eprintln!("usage: parlevox demo --fake");
     eprintln!("       parlevox demo --sidecar");
     eprintln!("       parlevox demo --sidecar --pool");
+    eprintln!("       parlevox demo --fake|--sidecar --record <path> [--record-transcripts]");
     eprintln!("note: demo --fake --pool is rejected; --pool requires --sidecar");
+}
+
+/// Attach a recorder to `session` when a `--record` target was given.
+///
+/// The recorder is created before the turn, so an unwritable path fails the
+/// command rather than being discovered mid-turn.
+fn attach_recorder(
+    session: Session,
+    record: Option<&RecordOptions>,
+) -> Result<Session, ParlevoxError> {
+    let Some(record) = record else {
+        return Ok(session);
+    };
+    let config = RecorderConfig {
+        record_transcripts: record.record_transcripts,
+        ..RecorderConfig::default()
+    };
+    let recorder = Recorder::to_path(&record.path, config)?;
+    Ok(session.with_recorder(recorder))
+}
+
+/// Print recorder counters to stderr, only when a recorder is installed.
+fn print_recorder_stats(stats: Option<RecorderStats>) {
+    if let Some(stats) = stats {
+        eprintln!(
+            "recorder records={} bytes={} dropped_cap={} dropped_write={} redacted={} \
+             transcripts_suppressed={}",
+            stats.records_written,
+            stats.bytes_written,
+            stats.dropped_cap,
+            stats.dropped_write,
+            stats.redacted,
+            stats.transcripts_suppressed
+        );
+    }
 }
 
 /// Print usage for the `providers` subcommands.
@@ -369,18 +510,23 @@ fn optional(value: Option<u32>) -> String {
 /// Returns a protocol-class error if a fake manifest or the session
 /// configuration is rejected, and propagates any error from the turn.
 pub async fn demo_fake() -> Result<(), ParlevoxError> {
+    demo_fake_with(None).await
+}
+
+async fn demo_fake_with(record: Option<RecordOptions>) -> Result<(), ParlevoxError> {
     start_trace_export();
-    let result = run_fake_demo().await;
+    let result = run_fake_demo(record).await;
     finish_trace_export();
     result
 }
 
 /// The one-turn fake body of [`demo_fake`], split out so the exporter is
 /// flushed on both the success and the error path.
-async fn run_fake_demo() -> Result<(), ParlevoxError> {
+async fn run_fake_demo(record: Option<RecordOptions>) -> Result<(), ParlevoxError> {
     let registry = ProviderRegistry::fakes()?;
     let providers = registry.resolve(&ProviderNames::default())?;
     let session = build_session(SessionConfig::default(), providers)?;
+    let session = attach_recorder(session, record.as_ref())?;
     println!("providers stt=fake-stt llm=fake-llm tts=fake-tts vad=fake-vad");
     run_and_render(session).await
 }
@@ -395,20 +541,25 @@ async fn run_fake_demo() -> Result<(), ParlevoxError> {
 /// spawned or reaped, a protocol-class error for an invalid manifest or session
 /// configuration, and any error raised by the turn.
 pub async fn demo_sidecar() -> Result<(), ParlevoxError> {
+    demo_sidecar_with(None).await
+}
+
+async fn demo_sidecar_with(record: Option<RecordOptions>) -> Result<(), ParlevoxError> {
     start_trace_export();
-    let result = run_sidecar_demo().await;
+    let result = run_sidecar_demo(record).await;
     finish_trace_export();
     result
 }
 
 /// The one-turn sidecar body of [`demo_sidecar`], split out so the exporter is
 /// flushed after the turn has rendered and after the child is reaped.
-async fn run_sidecar_demo() -> Result<(), ParlevoxError> {
+async fn run_sidecar_demo(record: Option<RecordOptions>) -> Result<(), ParlevoxError> {
     let sdk_path = resolve_sdk_path(&SdkSearch::from_process())
         .map_err(|err| ParlevoxError::Transport(err.to_string()))?;
     let client = Arc::new(SidecarClient::spawn(SidecarConfig::python_sdk_at(sdk_path)).await?);
 
     let (session, names) = build_sidecar_session(Arc::clone(&client))?;
+    let session = attach_recorder(session, record.as_ref())?;
     println!(
         "providers stt={} llm={} tts={} vad={}",
         names.stt, names.llm, names.tts, names.vad
@@ -443,6 +594,10 @@ async fn run_sidecar_demo() -> Result<(), ParlevoxError> {
 /// rejected, and any error raised by either turn. The pool is shut down before
 /// returning in every case.
 pub async fn demo_sidecar_pooled() -> Result<(), ParlevoxError> {
+    demo_sidecar_pooled_with(None).await
+}
+
+async fn demo_sidecar_pooled_with(record: Option<RecordOptions>) -> Result<(), ParlevoxError> {
     let sdk_path = resolve_sdk_path(&SdkSearch::from_process())
         .map_err(|err| ParlevoxError::Transport(err.to_string()))?;
     let pool = Arc::new(SidecarPool::new(
@@ -450,7 +605,7 @@ pub async fn demo_sidecar_pooled() -> Result<(), ParlevoxError> {
         PoolConfig::default(),
     ));
 
-    let turns = run_pooled_turns(Arc::clone(&pool)).await;
+    let turns = run_pooled_turns(Arc::clone(&pool), record.as_ref()).await;
     // Shut the pool down before reading stats so `shutdown` reflects the real
     // teardown, and do it on the failure path too.
     pool.shutdown().await;
@@ -473,7 +628,10 @@ pub async fn demo_sidecar_pooled() -> Result<(), ParlevoxError> {
 /// The two-leases-over-one-pool body of [`demo_sidecar_pooled`].
 ///
 /// Split out so the caller owns shutdown and statistics for both outcomes.
-async fn run_pooled_turns(pool: Arc<SidecarPool>) -> Result<(), ParlevoxError> {
+async fn run_pooled_turns(
+    pool: Arc<SidecarPool>,
+    record: Option<&RecordOptions>,
+) -> Result<(), ParlevoxError> {
     // Turn 1: the only turn that writes to stdout.
     let lease = pool.acquire().await?;
     if !lease.client().supports_reset() {
@@ -484,6 +642,9 @@ async fn run_pooled_turns(pool: Arc<SidecarPool>) -> Result<(), ParlevoxError> {
         ));
     }
     let (session, names) = build_sidecar_session(Arc::clone(lease.client()))?;
+    // A pooled run records only the first, rendered turn; the second is the
+    // deliberately silent reuse probe and must not double-write the trace.
+    let session = attach_recorder(session, record)?;
     println!(
         "providers stt={} llm={} tts={} vad={}",
         names.stt, names.llm, names.tts, names.vad
@@ -527,6 +688,9 @@ async fn run_and_render(mut session: Session) -> Result<(), ParlevoxError> {
     for event in session.take_events() {
         println!("{}", render(&event));
     }
+    // Recording is opt-in, and the counters go to stderr so stdout stays
+    // byte-identical to the unrecorded demo.
+    print_recorder_stats(session.recorder_stats());
     match result {
         Ok(report) => {
             println!(

@@ -909,6 +909,7 @@ dependencies = [
  "parlevox-providers",
  "proptest",
  "serde",
+ "serde_json",
  "tokio",
  "tokio-util",
  "tracing",

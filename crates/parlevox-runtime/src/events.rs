@@ -84,6 +84,36 @@ impl SessionEvent {
     }
 }
 
+/// Normalize one [`SessionEvent`] to the typed [`ObservationKind`] a trace
+/// records.
+///
+/// This is the single mapping used by the recorder, so a new [`SessionEvent`]
+/// variant cannot be traced under an invented kind. It is text-preserving: the
+/// caller applies transcript gating and credential redaction, because both
+/// depend on recorder policy rather than on the event itself.
+#[must_use]
+pub fn observation_kind(event: &SessionEvent) -> ObservationKind {
+    match event {
+        SessionEvent::TurnStarted { .. } => ObservationKind::Control {
+            event: TurnEventKind::Start,
+        },
+        SessionEvent::TranscriptFinal { text, .. } => {
+            ObservationKind::FinalTranscript { text: text.clone() }
+        }
+        SessionEvent::ReplyDelta { text, .. } => ObservationKind::ReplyDelta { text: text.clone() },
+        SessionEvent::AudioOut { frame, .. } => ObservationKind::AudioFrameQueued {
+            sample_rate: frame.sample_rate,
+            channels: frame.channels,
+            pcm_samples: u64::try_from(frame.pcm.len()).unwrap_or(u64::MAX),
+        },
+        SessionEvent::TurnDone { .. } => ObservationKind::ReplyFinished,
+        SessionEvent::Failed { class, message } => ObservationKind::Failure {
+            class: *class,
+            message: message.clone(),
+        },
+    }
+}
+
 /// Private externally tagged mirror of [`SessionEvent`] used by its [`Serialize`]
 /// impl.
 ///
@@ -184,6 +214,14 @@ pub struct TimedSessionEvent {
     pub t_ms: u64,
     /// The event observed at `t_ms`.
     pub event: SessionEvent,
+}
+
+impl TimedSessionEvent {
+    /// The observation kind this timed event records.
+    #[must_use]
+    pub fn kind(&self) -> ObservationKind {
+        observation_kind(&self.event)
+    }
 }
 
 /// A provider or session input in the form the trace adapter consumes.

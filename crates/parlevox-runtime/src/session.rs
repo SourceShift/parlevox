@@ -30,9 +30,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::context::{ChatContext, ContextStats};
 use crate::events::{
-    EventPushOutcome, EventQueue, EventQueueStats, SessionEvent, MIN_EVENT_CAPACITY,
+    EventPushOutcome, EventQueue, EventQueueStats, SessionEvent, TimedSessionEvent,
+    MIN_EVENT_CAPACITY,
 };
 use crate::pipeline::{PipelineStats, SentenceQueue, SentenceSplitter};
+use crate::recorder::{Recorder, RecorderStats};
 use crate::registry::Providers;
 use crate::strategy::{StrategyStats, TurnContext, TurnDecision, TurnStrategies};
 #[cfg(feature = "otel")]
@@ -802,6 +804,9 @@ pub struct Session {
     /// Cumulative turn-start consultation counters, exposed through
     /// [`Session::strategy_stats`]. Stays zero when no list is installed.
     strategy_stats: StrategyStats,
+    /// Opt-in observation recorder, installed with [`Session::with_recorder`].
+    /// `None` leaves the event path byte-identical: no clone, no format, no I/O.
+    recorder: Option<Recorder>,
     /// Test-only ordered log of transitions applied through [`Session::apply`].
     /// Absent from production builds, so the default runtime and the pinned
     /// demo output carry no recorder.
@@ -958,6 +963,27 @@ impl Session {
         self
     }
 
+    /// Install an opt-in [`Recorder`] that writes this session's observations.
+    ///
+    /// Recording stays off by default: without this builder no event is
+    /// cloned, formatted or written, so the default turn is unchanged. Each
+    /// event is recorded before it is pushed to the bounded event queue, so an
+    /// event the queue later drops is still traced. Recording never returns an
+    /// error to the turn; caps and write failures are counted in
+    /// [`RecorderStats`].
+    #[must_use]
+    pub fn with_recorder(mut self, recorder: Recorder) -> Self {
+        self.recorder = Some(recorder);
+        self
+    }
+
+    /// The installed recorder's cumulative counters, or `None` when no
+    /// recorder is installed.
+    #[must_use]
+    pub fn recorder_stats(&self) -> Option<RecorderStats> {
+        self.recorder.as_ref().map(Recorder::stats)
+    }
+
     fn assemble(
         config: SessionConfig,
         providers: Providers,
@@ -1019,6 +1045,7 @@ impl Session {
             recovery: RecoveryCounters::default(),
             turn_strategies: None,
             strategy_stats: StrategyStats::default(),
+            recorder: None,
             #[cfg(test)]
             transition_log: Vec::new(),
             #[cfg(feature = "otel")]
@@ -2588,6 +2615,16 @@ impl Session {
     /// Enqueue one event under the bounded-queue policy. Droppable overflow is
     /// absorbed by the queue; control overflow surfaces as a protocol error.
     fn emit(&mut self, event: SessionEvent) -> Result<(), ParlevoxError> {
+        // Record before the bounded queue so an event the queue drops is still
+        // traced. The no-recorder path does no clone and no format: the only
+        // cost of recording being off is one `Option` check.
+        if let Some(recorder) = self.recorder.as_mut() {
+            let timed = TimedSessionEvent {
+                t_ms: self.clock.elapsed_ms(),
+                event: event.clone(),
+            };
+            recorder.record(&timed, self.machine.turn_index(), self.generation);
+        }
         match self.events.push(event)? {
             EventPushOutcome::Accepted => {}
             EventPushOutcome::Replaced => {

@@ -7,6 +7,7 @@
 pub mod context;
 pub mod events;
 pub mod pipeline;
+pub mod recorder;
 pub mod registry;
 pub mod session;
 pub mod strategy;
@@ -16,9 +17,13 @@ pub mod strategy;
 mod telemetry;
 
 pub use context::{ChatContext, ContextStats};
-pub use events::{EventPushOutcome, EventQueue, EventQueueStats, SessionEvent};
+pub use events::{
+    observation_kind, EventPushOutcome, EventQueue, EventQueueStats, SessionEvent,
+    TimedSessionEvent,
+};
 pub use parlevox_core::{CreditHandle, CreditSnapshot, CreditStats, CreditWait};
 pub use pipeline::{PipelineStats, SentenceQueue, SentenceSplitter};
+pub use recorder::{Recorder, RecorderConfig, RecorderStats, REDACTED};
 pub use registry::{ProviderNames, ProviderRegistry, Providers};
 pub use session::{
     demo_utterance, BargeInHandle, InterruptionRecovery, PartialResume, RecoveryStats, Session,

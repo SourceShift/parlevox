@@ -222,3 +222,75 @@ in the state it already held.
 
 Every observation remains accounted for exactly once, so the identity extends
 to `accepted + ignored + rejected + dropped == observations`.
+
+## Observation recording
+
+`parlevox-runtime::Recorder` is an opt-in trace writer, installed with
+`Session::with_recorder` and enabled on the CLI as
+`demo --fake|--sidecar --record <path>`. A session without a recorder clones,
+formats and writes nothing on the event path, so the default turn is unchanged.
+
+### Record shape
+
+The file begins with exactly one header line and then one compact JSON
+`Observation` per line, matching
+`crates/parlevox-core/src/observation.rs`:
+
+```text
+{"observation_schema_version":1}
+{"t_ms":0,"event_id":0,"turn":1,"generation":1,"kind":{"control":{"event":"start"}}}
+```
+
+Fields serialize in the order `t_ms`, `event_id`, `turn`, `generation`, `kind`.
+`kind` is externally tagged snake_case: a unit kind is a bare string
+(`"reply_finished"`) and a data kind is a one-key object
+(`{"final_transcript":{"text":"hi"}}`). The session maps its events with
+`parlevox_runtime::observation_kind`: `TurnStarted` → `Control { event: Start }`,
+`TranscriptFinal` → `FinalTranscript`, `ReplyDelta` → `ReplyDelta`, `AudioOut` →
+`AudioFrameQueued`, `TurnDone` → `ReplyFinished`, `Failed` → `Failure`. A record
+is written **before** the event enters the bounded event queue, so an event the
+queue later drops is still traced.
+
+### Caps and drops
+
+`RecorderConfig::max_records` (default 100 000) and `max_bytes` (default 16 MiB)
+bound every write. A record that would exceed either cap is not written; the
+event is counted in `dropped_cap`. A record whose write fails is counted in
+`dropped_write`. Neither case returns an error to the turn: recording cannot
+fail or end a turn. `RecorderStats` exposes `records_written`, `bytes_written`,
+`dropped_cap`, `dropped_write`, `redacted` and `transcripts_suppressed`, and
+`records_written + dropped_cap + dropped_write + transcripts_suppressed` equals
+the number of events offered to the recorder. Writes are synchronous, so an
+operating system blocked on a full disk can still add latency.
+
+### Transcript gating
+
+Without `--record-transcripts` (the default,
+`RecorderConfig::record_transcripts == false`), the transcript field is **absent,
+never blank**: a final transcript is recorded as the text-free
+`Control { event: FinalTranscript }` so replay and the arbiter still see the
+turn open, while reply deltas are omitted and counted in
+`transcripts_suppressed`. With the flag, text-bearing kinds retain their text.
+
+### Redaction
+
+Every recorded transcript, delta and failure message is scanned for the
+credential shapes the repository forbids (`sk-…`, `ghp_…`, `github_pat_…`,
+`AKIA…`, `xox[bpa]-…`, and a PEM `-----BEGIN … PRIVATE KEY` block). Each match
+is replaced with `[redacted]` and counted in `RecorderStats::redacted`; a PEM
+block counts as one match however many bytes it spans.
+
+A PEM match is **block-level**, not header-level. Replacement runs from the
+matched `-----BEGIN … PRIVATE KEY` header through the first matching
+`-----END … PRIVATE KEY-----` marker inclusive, so the base64 body and the END
+marker are removed together with the header. When no END marker exists, the
+header's closing dashes and line terminator are replaced together with every
+following non-empty line whose content is only base64 bytes (`A-Z`, `a-z`,
+`0-9`, `+`, `/`, `=`); the first line with any other content ends the span, so
+ordinary prose after the block is not swallowed.
+
+The header itself is anchored on the trailing `PRIVATE KEY` literal, so a bare
+`-----BEGIN` followed by ordinary prose is not redacted, and prose after a lone
+header on the same line is left intact. Provider configuration and API-key
+values are never passed to the recorder, so there is no second path by which key
+material could reach a trace.
