@@ -1,0 +1,13 @@
+{
+  "method": "POST",
+  "path": "/tts/bytes",
+  "responses": [
+    {
+      "status": 200,
+      "headers": {
+        "content-type": "audio/pcm"
+      },
+      "body_base64": "nP+j/6r/sf+4/7//xv/N/9T/2//i/+n/8P/3//7/BQAMABMAGgAhACgALwA2AD0ARABLAFIAWQBgAJ7/pf+s/7P/uv/B/8j/z//W/93/5P/r//L/+f8AAAcADgAVABwAIwAqADEAOAA/AEYATQBUAFsAYgCg/6f/rv+1/7z/w//K/9H/2P/f/+b/7f/0//v/AgAJABAAFwAeACUALAAzADoAQQBIAE8AVgBdAGQAov+p/7D/t/++/8X/zP/T/9r/4f/o/+//9v/9/wQACwASABkAIAAnAC4ANQA8AEMASgBRAFgAXwCd/6T/q/+y/7n/wP/H/87/1f/c/+P/6v/x//j///8GAA0AFAAbACIAKQAwADcAPgBFAEwAUwBaAGEAn/+m/63/tP+7/8L/yf/Q/9f/3v/l/+z/8//6/wEACAAPABYAHQAkACsAMgA5AEAARwBOAFUAXABjAKH/qP+v/7b/vf/E/8v/0v/Z/+D/5//u//X//P8DAAoAEQAYAB8AJgAtADQAOwBCAEkAUABXAF4AnP+j/6r/sf+4/7//xv/N/9T/2//i/+n/8P/3//7/BQAMABMAGgAhACgALwA2AD0ARABLAFIAWQBgAJ7/pf+s/7P/uv/B/8j/z//W/93/"
+    }
+  ]
+}

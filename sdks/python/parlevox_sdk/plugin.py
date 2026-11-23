@@ -56,7 +56,7 @@ MAX_CANCELLED = 256
 _SUPPORTED_ADAPTERS = {
     "stt": {"fake", "openai", "deepgram", "assemblyai"},
     "llm": {"fake", "openai"},
-    "tts": {"fake", "openai"},
+    "tts": {"fake", "openai", "elevenlabs", "cartesia"},
     "vad": {"fake"},
 }
 
@@ -268,6 +268,14 @@ class Plugin:
             from .adapters.openai_tts import OpenAITTS
 
             tts = OpenAITTS(environ=env)
+        elif selection.get("tts") == "elevenlabs":
+            from .adapters.elevenlabs_tts import ElevenLabsTTS
+
+            tts = ElevenLabsTTS(environ=env)
+        elif selection.get("tts") == "cartesia":
+            from .adapters.cartesia_tts import CartesiaTTS
+
+            tts = CartesiaTTS(environ=env)
         # ``vad`` only accepts ``fake``, so it stays at the default FakeVad.
         return cls(
             name=_plugin_name(selection, name), stt=stt, llm=llm, tts=tts
