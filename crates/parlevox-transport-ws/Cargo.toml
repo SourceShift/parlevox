@@ -1,0 +1,32 @@
+[package]
+name = "parlevox-transport-ws"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "One-session-per-connection WebSocket PCM transport for the parlevox turn loop."
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+parlevox-core = { version = "0.1.0", path = "../parlevox-core" }
+parlevox-providers = { version = "0.1.0", path = "../parlevox-providers" }
+parlevox-runtime = { version = "0.1.0", path = "../parlevox-runtime" }
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+futures-core.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true

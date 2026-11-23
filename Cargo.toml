@@ -6,6 +6,7 @@ members = [
     "crates/parlevox-providers",
     "crates/parlevox-runtime",
     "crates/parlevox-sidecar",
+    "crates/parlevox-transport-ws",
     "crates/parlevox-cli",
 ]
 
@@ -28,11 +29,12 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bytes = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "process", "sync", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "process", "sync", "time", "signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 async-trait = "0.1"
 futures-core = "0.3"
 futures-util = "0.3"
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 anyhow = "1"
 proptest = "1"
 opentelemetry = { version = "0.33", default-features = false, features = ["trace", "metrics"] }
