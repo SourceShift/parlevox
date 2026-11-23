@@ -175,7 +175,7 @@ dimension. This is the honest scorecard against the shipped tree:
 |---|---|---|---|
 | 1 | Transport & audio path | Typed frames over a bounded, lag-counted ring | **Implemented** — `AudioRing`, `RingStats`, `dropped_ms` |
 | 2 | Concurrency & isolation | Supervised plugin processes, multiplexed by `request_id` | **Partial** — supervision + restart backoff + id-multiplexed client exist; an opt-in bounded warm pool reuses a `reset`-capable process across sessions (`demo --sidecar --pool` runs two turns through one process and reports the pool counters on stderr), while the default still spawns one plugin process per session |
-| 3 | Turn-taking | Rust-owned FSM with composable strategies | **Partial** — explicit FSM and barge-in are real; strategy list and adaptive endpointing are not |
+| 3 | Turn-taking | Rust-owned FSM with composable strategies | **Partial** — explicit FSM and barge-in are real, and an opt-in adaptive endpointing decorator (`EndpointingPolicy` + `AdaptiveEndpointingVad`) sits at the VAD boundary and accepts or rejects `SpeechEnd` transitions from the trailing silence of the analysed audio. The session still transcribes the whole utterance per `run_turn`, so the decorator shapes the turn-state events and the endpoint decision at the provider boundary; it does not make STT start earlier. A session-level composable strategy list and false-interruption recovery remain unimplemented |
 | 4 | Provider abstraction | One small interface per modality + versioned manifest | **Implemented** — traits, `ProviderManifest`, registry lookup |
 | 5 | State & context | Rust-owned `ChatContext`, bounded policy | **Implemented** — `ChatContext`/`ContextStats` bound by message count and character budget; eviction prefers non-system messages and all loss is counted. The char budget is an estimate, not a token count |
 | 6 | Failure handling | Non-fatal/fatal taxonomy, no replay after commit | **Implemented** — `ErrorClass` + `is_recoverable`; all four modalities have fallback chains (`FallbackLlm`/`FallbackTts`/`FallbackStt`/`FallbackVad`) that switch only on a pre-commit `Transient`/`Capacity` failure and never after a provider has committed output; the reply side also has opt-in retry-with-backoff (`RetryPolicy` + `RetryingLlm`) that retries the same `LlmProvider` only on a pre-commit `Transient`/`Capacity` failure and never after a committed delta or a cancellation; and an opt-in reply-side circuit breaker (`BreakerPolicy` + `CircuitBreakingLlm`) opens after N consecutive pre-commit `Transient`/`Capacity` failures, refuses requests while open without calling the provider, and admits one half-open probe after the cool-down (success closes, failure re-opens). Breakers exist for the reply side only; they compose with the fallback chains by wrapping a chain as the inner provider |
@@ -242,6 +242,16 @@ What remains open:
   abandonments through `Session::speculation_stats`) exist behind opt-in flags.
   The pipelined sentence handoff is bounded and its drops are counted through
   `Session::pipeline_stats`. Early-start *synthesis* remains unimplemented.
+- Turn-taking has an opt-in adaptive endpointing decorator
+  (`EndpointingPolicy` + `AdaptiveEndpointingVad`) at the VAD boundary: it
+  accepts or rejects each `SpeechEnd` from the trailing silence of the analysed
+  audio and synthesizes one end at the audio duration when the inner stream ends
+  with speech still open. The honest limit is that the session still transcribes
+  the whole utterance per `run_turn`, so the decorator shapes the turn-state
+  events and the endpoint decision at the provider boundary; it does not make
+  STT start earlier. Early-start STT, streaming audio intake, multi-chunk
+  utterances, a session-level composable strategy list, and false-interruption
+  recovery remain unimplemented.
 - Turn spans exist but are opt-in: `cargo build -p parlevox-runtime --features otel`
   emits one `turn` root span with `vad`, `stt`, `llm`, `tts` and `playout`
   children plus MonoClock-derived boundary-cost attributes, and the default
