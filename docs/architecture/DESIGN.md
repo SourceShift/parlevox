@@ -275,10 +275,18 @@ What remains open:
   `OTEL_EXPORTER_OTLP_ENDPOINT`, uses `OTEL_SERVICE_NAME` (default
   `parlevox`) as the resource service name, routes the demo session through
   `Session::with_tracer`, and force-flushes plus shuts the provider down on
-  exit. The honest limits are: traces only (no metric or log export, no
-  exemplars, no views or aggregation tuning), HTTP/protobuf only (no
-  gRPC/tonic, no blocking client), a single process-global exporter, and a
-  failed flush reported once on stderr rather than failing the turn. The
+  exit. The exporter is installed behind a batch span processor: span end
+  performs no export work, it only enqueues, so the export runs on the
+  processor's background schedule and once more on the exit drain, which
+  shares a single five-second budget between the flush and the shutdown. An
+  unresponsive collector can therefore delay the exit drain by up to that
+  five-second bound but can never delay a turn. The honest limits are: traces
+  only (no metric or log export, no exemplars, no views or aggregation
+  tuning), HTTP/protobuf only (no gRPC/tonic, no blocking client), a single
+  process-global exporter, a four-second per-export timeout (below the drain
+  bound, so a black-holed collector leaves the batch worker idle when the
+  drain returns), and a failed flush reported once on stderr rather than
+  failing the turn. The
   default build carries no OpenTelemetry, OTLP or HTTP-client dependency edge
   and prints nothing new. A fixed six-instrument metric set —
   `parlevox.turns`, `parlevox.turn.duration`, `parlevox.turn.stage.duration`,
