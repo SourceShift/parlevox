@@ -1,7 +1,7 @@
 //! Explicit turn state machine.
 //!
-//! Every framework compared in `docs/architecture/COMPARISON.md` encodes turn
-//! invariants somewhere: in booleans, in task cancellation, or in prose. Here
+//! Every comparable voice-agent framework encodes turn invariants somewhere:
+//! in booleans, in task cancellation, or in prose. Here
 //! they are a closed set of states and a table of legal transitions. An illegal
 //! event returns [`crate::error::ParlevoxError::Protocol`] instead of being
 //! silently absorbed, so a misbehaving plugin fails loudly at the boundary.

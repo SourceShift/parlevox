@@ -113,9 +113,11 @@ Tests are hermetic: no network, no API keys, no installed Python package.
 - [`docs/adr/0001-architecture.md`](docs/adr/0001-architecture.md) — the
   decision record: Rust-first runtime, optional Python sidecar, drop-not-throttle
   backpressure, half-duplex v0.
-- [`docs/architecture/COMPARISON.md`](docs/architecture/COMPARISON.md) — the
-  prior-art study that preceded the code. It documents choices made, not a
-  ranking of other frameworks; where it disagrees with the ADR, the ADR wins.
+- [`docs/architecture/PARITY-LIVEKIT-AGENTS.md`](docs/architecture/PARITY-LIVEKIT-AGENTS.md)
+  — the LiveKit Agents parity target: surface map, epics, and non-goals.
+- [`docs/architecture/PROVIDER-FOUNDATION-REQUIREMENTS.md`](docs/architecture/PROVIDER-FOUNDATION-REQUIREMENTS.md)
+  — how a provider is supported with a descriptor, a connector, or a sidecar
+  module, and never by patching the framework.
 
 ## Roadmap (v0.1+)
 

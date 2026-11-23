@@ -6,8 +6,8 @@ the LiveKit SFU, Cloud, SIP or TURN stack. Those are media-infrastructure
 products; parlevox interoperates with them by joining a room as a participant
 and never reimplements them.
 
-Reference copy: `/Volumes/docker-ssd/ps/livekit/agents` (88 plugin packages,
-`livekit-agents` v1.x Python SDK). All anchors below are relative to
+Reference: the upstream `livekit/agents` repository (`livekit-agents` v1.x
+Python SDK, 88 plugin packages). All anchors below are relative to
 `livekit-agents/livekit/agents/`.
 
 ## 1. Surface map
@@ -152,8 +152,8 @@ worker works.
 
 ## 5. Sequencing and operating model
 
-Lanes run as mini-ork deliverables in **separate git worktrees**, one run per
-worktree, each with its own `MINI_ORK_HOME`. Land order: E2(a) → E1 → E3, then
+Deliverables are developed in **separate git worktrees**, one deliverable per
+worktree, so two epics never share a working tree. Land order: E2(a) → E1 → E3, then
 E4/E5/E6 fan out; E9 after E2(a)+E1. Estimates: E2(a) 1–2 runs, E1 4 runs,
 E3 2–3 runs, E4 2–3 runs, E5 1–2, E6 2–3, E7 2, E9 1–2, E8 3–4.
 

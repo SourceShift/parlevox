@@ -234,6 +234,6 @@ This ADR records the boundary decision only. It does not restate the provider
 comparison that motivated it.
 
 See also: [`../architecture/DESIGN.md`](../architecture/DESIGN.md) for the
-shipped skeleton and the dimension-by-dimension status, and
-[`../architecture/COMPARISON.md`](../architecture/COMPARISON.md) for the
-four-framework audit that motivated this boundary.
+shipped skeleton, the dimension-by-dimension status, and the summary of the
+four-framework comparison (LiveKit Agents, Pipecat, TEN Framework, Vocode)
+that motivated this boundary.

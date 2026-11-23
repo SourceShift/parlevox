@@ -5,20 +5,18 @@ buffers, the turn state machine, provider calls, cancellation — lives in a
 single Rust process, with Python reachable only through an optional, framed
 sidecar for providers that need a Python SDK.
 
-This document describes **what exists in this repository today**. The
-prior-art study that preceded the code is [`COMPARISON.md`](COMPARISON.md)
-(it records choices made, not a ranking of other frameworks); the decision
-record is
+This document describes **what exists in this repository today**. The design
+was shaped by a prior-art study of four open-source voice-agent frameworks —
+LiveKit Agents, Pipecat, TEN Framework and Vocode — compared on the ten
+dimensions scored in §5. The study recorded the choices made, not a ranking of
+the others. The decision record is
 [`../adr/0001-architecture.md`](../adr/0001-architecture.md). Where the two
 disagree about scope, the ADR is authoritative.
 
 Status at `62f0850`: 87 Rust tests (including property tests for the audio ring
 and the event queue), 27 Python tests, `demo --fake` and `demo --sidecar` both
-green with identical event sequences. The advisory-closure run
-(`run-1795127680-3383`) and the follow-up idiom pass
-(`run-1795129305-30892`) were both approved by the four-family panel (glm,
-kimi, codex, minimax); [`panel-verdict.json`](panel-verdict.json) holds the
-most recent verdict, copied from its run directory.
+green with identical event sequences. The advisory-closure change and the
+follow-up idiom pass were both reviewed and approved.
 
 ---
 
@@ -168,8 +166,8 @@ tried.
 
 ## 5. How the ten comparison dimensions landed
 
-Section 1.3 of [`COMPARISON.md`](COMPARISON.md) selects one adopt per
-dimension. This is the honest scorecard against the shipped tree:
+The prior-art study selected one adopt per dimension. This is the honest
+scorecard against the shipped tree:
 
 | # | Dimension | Adopted direction | v0 status |
 |---|---|---|---|
@@ -220,7 +218,7 @@ Expected: a turn prints two `AudioOut` frames and a `TurnDone` carrying
 
 ## 8. Known gaps
 
-The v0.1 advisory list is closed (run `run-1795127680-3383`): the sidecar's
+The v0.1 advisory list is closed: the sidecar's
 dropped-frame count now reaches `TurnDone` as `sidecar_dropped_frames`,
 `EventQueue` has the same property coverage as `AudioRing`, the plugin's
 cancelled-request tombstones are a bounded ledger with counted eviction, and

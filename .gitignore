@@ -1,9 +1,13 @@
-# mini-ork runtime state (never commit: state.db + secrets)
+# local orchestrator state (never commit: run database + secrets)
 .mini-ork/
-# skills mini-ork materializes into the target repo for a node's lifetime
+# skills materialized into the tree for the lifetime of one task
 /.claude/skills/
 # reference framework clones (read-only comparison inputs)
 reference/
+# internal notes: raw tool output, run artifacts, operator-local paths
+/docs/internal/
+# local logs from development runs
+/runs/
 
 # Rust
 /target/
