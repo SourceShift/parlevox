@@ -6,7 +6,12 @@
 
 use std::collections::VecDeque;
 
-use parlevox_core::{AudioFrame, ErrorClass, OverflowPolicy, ParlevoxError};
+use parlevox_core::{
+    AudioFrame, ErrorClass, Observation, ObservationKind, ObservationSequencer, OverflowPolicy,
+    ParlevoxError, TurnEventKind,
+};
+use parlevox_providers::{TranscriptChunk, VadEvent, VadTransition};
+use serde::{Serialize, Serializer};
 
 /// Smallest event capacity a session can operate with.
 ///
@@ -76,6 +81,193 @@ impl SessionEvent {
     /// Streaming events may be dropped under backpressure; control may not.
     fn is_droppable(&self) -> bool {
         !self.is_control()
+    }
+}
+
+/// Private externally tagged mirror of [`SessionEvent`] used by its [`Serialize`]
+/// impl.
+///
+/// Variant names are preserved exactly, and [`SessionEvent::AudioOut`] is
+/// reduced to its format and sample count: the PCM payload is not part of the
+/// observation/trace form. No existing consumer deserializes `SessionEvent`, so
+/// this shape is additive rather than a wire change.
+#[derive(Serialize)]
+enum SessionEventWire<'a> {
+    TurnStarted {
+        turn: u64,
+    },
+    TranscriptFinal {
+        turn: u64,
+        text: &'a str,
+    },
+    ReplyDelta {
+        turn: u64,
+        text: &'a str,
+    },
+    AudioOut {
+        turn: u64,
+        sample_rate: u32,
+        channels: u16,
+        pcm_samples: u64,
+    },
+    TurnDone {
+        turn: u64,
+        audio_frames: u64,
+        dropped_frames: u64,
+        dropped_ms: u64,
+        dropped_events: u64,
+        sidecar_dropped_frames: u64,
+        interrupted: bool,
+    },
+    Failed {
+        class: ErrorClass,
+        message: &'a str,
+    },
+}
+
+impl Serialize for SessionEvent {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let wire = match self {
+            SessionEvent::TurnStarted { turn } => SessionEventWire::TurnStarted { turn: *turn },
+            SessionEvent::TranscriptFinal { turn, text } => {
+                SessionEventWire::TranscriptFinal { turn: *turn, text }
+            }
+            SessionEvent::ReplyDelta { turn, text } => {
+                SessionEventWire::ReplyDelta { turn: *turn, text }
+            }
+            SessionEvent::AudioOut { turn, frame } => SessionEventWire::AudioOut {
+                turn: *turn,
+                sample_rate: frame.sample_rate,
+                channels: frame.channels,
+                pcm_samples: u64::try_from(frame.pcm.len()).unwrap_or(u64::MAX),
+            },
+            SessionEvent::TurnDone {
+                turn,
+                audio_frames,
+                dropped_frames,
+                dropped_ms,
+                dropped_events,
+                sidecar_dropped_frames,
+                interrupted,
+            } => SessionEventWire::TurnDone {
+                turn: *turn,
+                audio_frames: *audio_frames,
+                dropped_frames: *dropped_frames,
+                dropped_ms: *dropped_ms,
+                dropped_events: *dropped_events,
+                sidecar_dropped_frames: *sidecar_dropped_frames,
+                interrupted: *interrupted,
+            },
+            SessionEvent::Failed { class, message } => SessionEventWire::Failed {
+                class: *class,
+                message,
+            },
+        };
+        wire.serialize(serializer)
+    }
+}
+
+/// A [`SessionEvent`] paired with the monotonic millisecond it was observed at.
+///
+/// `t_ms` is mandatory — never optional and never skipped — because a trace line
+/// with a missing timestamp silently corrupts every latency computation built
+/// on top of it. The timestamp is a companion field rather than a field on
+/// [`SessionEvent`] itself because the transports destructure every session
+/// variant exhaustively; adding a field would break them for no behavioural
+/// gain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TimedSessionEvent {
+    /// Milliseconds elapsed on the session's monotonic clock.
+    pub t_ms: u64,
+    /// The event observed at `t_ms`.
+    pub event: SessionEvent,
+}
+
+/// A provider or session input in the form the trace adapter consumes.
+///
+/// This adapter normalizes the runtime's existing inputs to
+/// [`ObservationKind`] so one code path can record them. It is **inert** in the
+/// current slice: the live session does not call it, and wiring it into the
+/// turn loop is TS-4. Keeping it here, unused, is deliberate — it fixes the
+/// normalization contract before the session depends on it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum IngressInput<'a> {
+    /// One streaming STT result; final and partial both normalize here.
+    Transcript(&'a TranscriptChunk),
+    /// One voice-activity transition.
+    Vad(VadTransition),
+    /// One streamed reply delta.
+    ReplyDelta(&'a str),
+    /// One audio frame queued for playout.
+    AudioFrame(&'a AudioFrame),
+    /// The reply finished.
+    ReplyFinished,
+    /// A barge-in was reported.
+    BargeIn,
+    /// A cancellation was observed.
+    Cancellation,
+    /// A classified failure.
+    Failure {
+        /// Recoverability class of the failure.
+        class: ErrorClass,
+        /// Human-readable failure message.
+        message: &'a str,
+    },
+    /// A turn-machine event observed at the ingress boundary.
+    Control(TurnEventKind),
+}
+
+impl IngressInput<'_> {
+    /// The observation kind this input records.
+    #[must_use]
+    pub fn kind(&self) -> ObservationKind {
+        match self {
+            IngressInput::Transcript(chunk) => {
+                if chunk.is_final {
+                    ObservationKind::FinalTranscript {
+                        text: chunk.text.clone(),
+                    }
+                } else {
+                    ObservationKind::PartialTranscript {
+                        text: chunk.text.clone(),
+                    }
+                }
+            }
+            IngressInput::Vad(transition) => match transition.event {
+                VadEvent::SpeechStart => ObservationKind::VadStarted,
+                VadEvent::SpeechEnd => ObservationKind::VadStopped,
+            },
+            IngressInput::ReplyDelta(text) => ObservationKind::ReplyDelta {
+                text: (*text).to_owned(),
+            },
+            IngressInput::AudioFrame(frame) => ObservationKind::AudioFrameQueued {
+                sample_rate: frame.sample_rate,
+                channels: frame.channels,
+                pcm_samples: u64::try_from(frame.pcm.len()).unwrap_or(u64::MAX),
+            },
+            IngressInput::ReplyFinished => ObservationKind::ReplyFinished,
+            IngressInput::BargeIn => ObservationKind::BargeInReported,
+            IngressInput::Cancellation => ObservationKind::CancellationObserved,
+            IngressInput::Failure { class, message } => ObservationKind::Failure {
+                class: *class,
+                message: (*message).to_owned(),
+            },
+            IngressInput::Control(kind) => ObservationKind::Control { event: *kind },
+        }
+    }
+
+    /// Normalize this input and stamp it into an [`Observation`].
+    #[must_use]
+    pub fn observe(
+        &self,
+        sequencer: &mut ObservationSequencer,
+        turn: u64,
+        generation: u64,
+    ) -> Observation {
+        sequencer.stamp(turn, generation, self.kind())
     }
 }
 
@@ -358,5 +550,108 @@ mod tests {
         assert_eq!(queue.take().len(), 1);
         assert!(queue.is_empty());
         assert_eq!(queue.stats().dropped, 3);
+    }
+
+    #[test]
+    fn session_event_is_serializable() {
+        fn assert_serialize<T: serde::Serialize>() {}
+        assert_serialize::<SessionEvent>();
+        assert_serialize::<TimedSessionEvent>();
+    }
+
+    #[test]
+    fn timed_session_event_requires_a_timestamp() {
+        // `t_ms` is a plain `u64`, not an `Option`, and the struct has no
+        // `Default`: constructing a timed event without a timestamp is a
+        // compile error, so a trace line can never silently lose it.
+        let timed = TimedSessionEvent {
+            t_ms: 12,
+            event: started(),
+        };
+        assert_eq!(timed.t_ms, 12);
+        assert_eq!(timed.event, started());
+    }
+
+    #[test]
+    fn ingress_inputs_normalize_to_kinds() {
+        let final_chunk = TranscriptChunk {
+            text: "hello".into(),
+            is_final: true,
+        };
+        let partial_chunk = TranscriptChunk {
+            text: "hel".into(),
+            is_final: false,
+        };
+        let frame = AudioFrame::new(
+            parlevox_core::Timestamp::from_millis(0),
+            16_000,
+            1,
+            vec![0i16; 160],
+        );
+
+        let cases = [
+            (
+                IngressInput::Transcript(&final_chunk),
+                ObservationKind::FinalTranscript {
+                    text: "hello".into(),
+                },
+            ),
+            (
+                IngressInput::Transcript(&partial_chunk),
+                ObservationKind::PartialTranscript { text: "hel".into() },
+            ),
+            (
+                IngressInput::Vad(VadTransition {
+                    event: VadEvent::SpeechStart,
+                    timestamp_ms: 5,
+                }),
+                ObservationKind::VadStarted,
+            ),
+            (
+                IngressInput::Vad(VadTransition {
+                    event: VadEvent::SpeechEnd,
+                    timestamp_ms: 9,
+                }),
+                ObservationKind::VadStopped,
+            ),
+            (
+                IngressInput::ReplyDelta("hi"),
+                ObservationKind::ReplyDelta { text: "hi".into() },
+            ),
+            (
+                IngressInput::AudioFrame(&frame),
+                ObservationKind::AudioFrameQueued {
+                    sample_rate: 16_000,
+                    channels: 1,
+                    pcm_samples: 160,
+                },
+            ),
+            (IngressInput::ReplyFinished, ObservationKind::ReplyFinished),
+            (IngressInput::BargeIn, ObservationKind::BargeInReported),
+            (
+                IngressInput::Cancellation,
+                ObservationKind::CancellationObserved,
+            ),
+            (
+                IngressInput::Failure {
+                    class: ErrorClass::Fatal,
+                    message: "boom",
+                },
+                ObservationKind::Failure {
+                    class: ErrorClass::Fatal,
+                    message: "boom".into(),
+                },
+            ),
+            (
+                IngressInput::Control(TurnEventKind::BargeInConfirmed),
+                ObservationKind::Control {
+                    event: TurnEventKind::BargeInConfirmed,
+                },
+            ),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(input.kind(), expected, "normalizing {input:?}");
+        }
     }
 }

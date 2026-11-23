@@ -5,9 +5,12 @@
 //! closes the session, [`ErrorClass::Protocol`] marks a plugin bug, and
 //! [`ErrorClass::Cancelled`] is never surfaced to the user.
 
+use serde::{Deserialize, Serialize};
+
 use crate::clock::DurationMs;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ErrorClass {
     /// Retry, fall back, or degrade. The session survives.
     Transient,

@@ -10,6 +10,7 @@
 pub mod audio;
 pub mod clock;
 pub mod error;
+pub mod observation;
 pub mod turn;
 
 pub use audio::{
@@ -18,6 +19,9 @@ pub use audio::{
 };
 pub use clock::{DurationMs, MonoClock, Timestamp};
 pub use error::{ErrorClass, ParlevoxError};
+pub use observation::{
+    Observation, ObservationKind, ObservationSequencer, OBSERVATION_SCHEMA_VERSION,
+};
 pub use turn::{
     AudioEmission, FloorOwner, TurnEvent, TurnEventKind, TurnMachine, TurnState, ALL_EVENT_KINDS,
     ALL_STATES, LEGAL_TRANSITIONS,

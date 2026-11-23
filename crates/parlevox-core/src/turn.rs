@@ -13,7 +13,7 @@
 //! cannot drift apart silently.
 
 use crate::error::ParlevoxError;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// The closed set of turn states.
 ///
@@ -166,7 +166,8 @@ impl AudioEmission {
 }
 
 /// A [`TurnEvent`] with its payload erased, suitable as a transition-table key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TurnEventKind {
     /// Session is ready to take input.
     Start,

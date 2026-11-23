@@ -88,12 +88,18 @@ impl MonoClock {
         }
     }
 
+    /// Milliseconds elapsed on this clock since its epoch.
+    ///
+    /// `Instant::elapsed` measures u128 milliseconds; a saturating conversion
+    /// cannot lose a realistic duration (u64 ms is about 584 million years) and
+    /// avoids an unchecked narrowing cast.
+    #[must_use]
+    pub fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
     pub fn now(&self) -> Timestamp {
-        // `Instant::elapsed` measures u128 milliseconds; a saturating
-        // conversion cannot lose a realistic duration (u64 ms is about
-        // 584 million years) and avoids an unchecked narrowing cast.
-        let ms = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
-        Timestamp(DurationMs::from_millis(ms))
+        Timestamp(DurationMs::from_millis(self.elapsed_ms()))
     }
 
     /// Measure a block with this clock. Useful in traces and tests.
