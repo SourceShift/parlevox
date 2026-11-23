@@ -19,9 +19,11 @@ rejected as an unknown request rather than executed.
 """
 
 import inspect
+import os
 import sys
 from collections import OrderedDict, deque
 
+from .adapters.base import AdapterConfigError, AdapterError, redact
 from .fakes import FakeLlm, FakeStt, FakeTts, FakeVad
 from .protocol import (
     KIND_AUDIO,
@@ -47,6 +49,96 @@ PENDING_AUDIO_OVERFLOW_POLICY = "drop_oldest"
 #: Capacity of the cancelled-request tombstone ledger, in ids. Oldest entries
 #: are evicted first once the ledger is full; evictions are counted.
 MAX_CANCELLED = 256
+
+
+#: Supported ``PARLEVOX_ADAPTERS`` modalities and the adapter names each may
+#: select. ``vad`` has no OpenAI-wire adapter in this slice.
+_SUPPORTED_ADAPTERS = {
+    "stt": {"fake", "openai"},
+    "llm": {"fake", "openai"},
+    "tts": {"fake", "openai"},
+    "vad": {"fake"},
+}
+
+#: Plugin name used when at least one real adapter is selected.
+_OPENAI_PLUGIN_NAME = "python-openai"
+
+
+def _redact_tree(value):
+    """Recursively redact every string that is about to reach the wire.
+
+    Scrubbing at the single send choke point means an error branch that
+    formats ``str(err)`` — including a ``ValueError`` or a defensive
+    ``except Exception`` — cannot bypass the redaction every adapter already
+    applies to its own messages. Audio-header fields pass through here too.
+    """
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, dict):
+        return {
+            redact(key) if isinstance(key, str) else key: _redact_tree(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return tuple(_redact_tree(item) for item in value)
+    if isinstance(value, list):
+        return [_redact_tree(item) for item in value]
+    return value
+
+
+def _parse_adapter_selection(raw):
+    """Parse ``modality:adapter,modality:adapter`` into a dict.
+
+    A malformed or unsupported token raises :class:`AdapterConfigError` naming
+    only the offending token (never a credential or environment value).
+    Duplicates are allowed; the last one wins.
+    """
+    selection = {}
+    text = (raw or "").strip()
+    if not text:
+        return selection
+    for piece in text.split(","):
+        token = piece.strip()
+        if not token:
+            continue
+        if ":" not in token:
+            raise AdapterConfigError(
+                "adapters", f"malformed adapter token {token!r}"
+            )
+        modality, _, adapter = token.partition(":")
+        modality = modality.strip().lower()
+        adapter = adapter.strip().lower()
+        if adapter not in _SUPPORTED_ADAPTERS.get(modality, set()):
+            raise AdapterConfigError("adapters", f"unknown adapter token {token!r}")
+        selection[modality] = adapter
+    return selection
+
+
+def _accepts_keywords(provider_method, names):
+    """The subset of ``names`` a callable accepts as keyword arguments.
+
+    Mirrors :func:`_accepts_history`: providers written against the older,
+    narrower signature keep working, and a genuine error raised inside the
+    provider is still reported rather than swallowed.
+    """
+    try:
+        parameters = inspect.signature(provider_method).parameters
+    except (TypeError, ValueError):
+        return set()
+    accepted = set()
+    for name in names:
+        parameter = parameters.get(name)
+        if parameter is not None and parameter.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            accepted.add(name)
+    if any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    ):
+        accepted.update(names)
+    return accepted
 
 
 def _accepts_history(provider):
@@ -128,6 +220,36 @@ class Plugin:
         self.tts = tts or FakeTts()
         self.vad = vad or FakeVad()
 
+    @classmethod
+    def from_env(cls, environ=None, name="python-fake"):
+        """Build a plugin from ``PARLEVOX_ADAPTERS``.
+
+        Unset, empty, or an all-``fake`` selection returns exactly
+        ``cls(name=name)`` so the default fake path stays byte-identical. Real
+        adapters are constructed without resolving their credential: the key is
+        read at first use, so importing or starting the plugin needs no secret.
+        """
+        env = os.environ if environ is None else environ
+        selection = _parse_adapter_selection(env.get("PARLEVOX_ADAPTERS", ""))
+        if not selection or all(value == "fake" for value in selection.values()):
+            return cls(name=name)
+
+        stt = llm = tts = None
+        if selection.get("stt") == "openai":
+            from .adapters.openai_stt import OpenAISTT
+
+            stt = OpenAISTT(environ=env)
+        if selection.get("llm") == "openai":
+            from .adapters.openai_llm import OpenAILlm
+
+            llm = OpenAILlm(environ=env)
+        if selection.get("tts") == "openai":
+            from .adapters.openai_tts import OpenAITTS
+
+            tts = OpenAITTS(environ=env)
+        # ``vad`` only accepts ``fake``, so it stays at the default FakeVad.
+        return cls(name=_OPENAI_PLUGIN_NAME, stt=stt, llm=llm, tts=tts)
+
     def manifest(self):
         return {
             "name": self.name,
@@ -164,31 +286,32 @@ class Plugin:
     # -- wire helpers -------------------------------------------------
     @staticmethod
     def _send(out, message):
-        write_frame(out, KIND_JSON, encode_json(message))
+        write_frame(out, KIND_JSON, encode_json(_redact_tree(message)))
 
     @staticmethod
     def _send_audio(out, request_id, seq, sample_rate, channels, pcm):
-        header = {
-            "request_id": request_id,
-            "seq": seq,
-            "sample_rate": sample_rate,
-            "channels": channels,
-        }
+        header = _redact_tree(
+            {
+                "request_id": request_id,
+                "seq": seq,
+                "sample_rate": sample_rate,
+                "channels": channels,
+            }
+        )
         write_frame(out, KIND_AUDIO, encode_audio(header, pcm))
 
     @staticmethod
     def _send_error(out, request_id, cls, message):
-        write_frame(
+        # Route through ``_send`` so the one choke point redacts the message,
+        # whichever branch produced it.
+        Plugin._send(
             out,
-            KIND_JSON,
-            encode_json(
-                {
-                    "type": "error",
-                    "request_id": request_id,
-                    "class": cls,
-                    "message": message,
-                }
-            ),
+            {
+                "type": "error",
+                "request_id": request_id,
+                "class": cls,
+                "message": message,
+            },
         )
 
     # -- bounded pending audio ----------------------------------------
@@ -345,8 +468,20 @@ class Plugin:
         request_id = message["request_id"]
         sample_rate = message.get("sample_rate", 16_000)
         channels = message.get("channels", 1)
+        # A provider may accept the requested output format as keywords. Older
+        # providers (including FakeTts) only take ``text``; introspecting keeps
+        # their call shape — and therefore the demo output — unchanged.
+        options = _accepts_keywords(self.tts.synthesize, ("sample_rate", "channels"))
+        keywords = {}
+        if "sample_rate" in options:
+            keywords["sample_rate"] = sample_rate
+        if "channels" in options:
+            keywords["channels"] = channels
         try:
-            chunks = list(self.tts.synthesize(message.get("text", "")))
+            chunks = list(self.tts.synthesize(message.get("text", ""), **keywords))
+        except AdapterError as err:
+            self._send_error(out, request_id, err.wire_class(), err.public_message())
+            return True
         except ValueError as err:
             self._send_error(out, request_id, "protocol", str(err))
             return True
@@ -383,6 +518,9 @@ class Plugin:
                 deltas = list(self.llm.generate(prompt, history=history))
             else:
                 deltas = list(self.llm.generate(prompt))
+        except AdapterError as err:
+            self._send_error(out, request_id, err.wire_class(), err.public_message())
+            return True
         except ValueError as err:
             self._send_error(out, request_id, "protocol", str(err))
             return True
@@ -430,7 +568,23 @@ class Plugin:
             return True
         try:
             if request["type"] == "transcribe":
-                for chunk in self.stt.transcribe(pcm):
+                # The core sends the utterance's own rate and channel count on
+                # the ``Transcribe`` request (``PluginRequest::Transcribe``).
+                # Thread them to a provider that accepts them so the upload
+                # container declares the audio it actually carries; older
+                # providers (including FakeStt) keep their ``transcribe(pcm)``
+                # shape and therefore their output unchanged.
+                sample_rate = request.get("sample_rate", 16_000)
+                channels = request.get("channels", 1)
+                options = _accepts_keywords(
+                    self.stt.transcribe, ("sample_rate", "channels")
+                )
+                keywords = {}
+                if "sample_rate" in options:
+                    keywords["sample_rate"] = sample_rate
+                if "channels" in options:
+                    keywords["channels"] = channels
+                for chunk in self.stt.transcribe(pcm, **keywords):
                     if chunk["final"]:
                         self._send(out, {"type": "final", "request_id": request_id, "text": chunk["text"]})
                     else:
@@ -446,6 +600,9 @@ class Plugin:
                             "timestamp_ms": transition["timestamp_ms"],
                         },
                     )
+        except AdapterError as err:
+            self._send_error(out, request_id, err.wire_class(), err.public_message())
+            return True
         except ValueError as err:
             self._send_error(out, request_id, "protocol", str(err))
             return True

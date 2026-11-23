@@ -1,0 +1,26 @@
+{
+  "method": "POST",
+  "path": "/chat/completions",
+  "responses": [
+    {
+      "status": 429,
+      "headers": {
+        "retry-after": "0"
+      },
+      "chunks": []
+    },
+    {
+      "status": 200,
+      "headers": {
+        "content-type": "text/event-stream"
+      },
+      "chunks": [
+        "data: {\"choices\": [{\"delta\": {\"content\": \"Hello\"}}]}\n\n",
+        "data: {\"choices\": [{\"delta\": {\"content\": \", \"}}]}\n\n",
+        "data: {\"choices\": [{\"delta\": {\"content\": \"world\"}}]}\n\n",
+        "data: {\"choices\": [{\"delta\": {\"content\": \"!\"}}]}\n\n",
+        "data: [DONE]\n\n"
+      ]
+    }
+  ]
+}

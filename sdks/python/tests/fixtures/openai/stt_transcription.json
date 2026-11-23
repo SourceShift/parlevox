@@ -1,0 +1,15 @@
+{
+  "method": "POST",
+  "path": "/audio/transcriptions",
+  "responses": [
+    {
+      "status": 200,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "chunks": [
+        "{\"text\": \"hello world\"}"
+      ]
+    }
+  ]
+}
