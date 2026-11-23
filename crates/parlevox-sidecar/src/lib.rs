@@ -10,7 +10,7 @@ pub mod pool;
 pub mod provider;
 pub mod supervisor;
 
-pub use client::{Incoming, RequestHandle, SidecarClient};
+pub use client::{Incoming, RequestHandle, SidecarClient, StallPolicy};
 pub use config::{
     resolve_sdk_path, sdk_is_available, SdkLookupError, SdkSearch, SidecarConfig, SDK_ENV_VAR,
 };

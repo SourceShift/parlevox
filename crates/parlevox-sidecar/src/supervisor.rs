@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use parlevox_core::ParlevoxError;
 
-use crate::client::SidecarClient;
+use crate::client::{SidecarClient, StallPolicy};
 use crate::config::SidecarConfig;
 
 #[derive(Debug, Clone)]
@@ -46,6 +46,9 @@ pub struct SidecarSupervisor {
     policy: RestartPolicy,
     client: Option<Arc<SidecarClient>>,
     restarts: u32,
+    /// Installed by [`SidecarSupervisor::with_stall_watchdog`]; every spawn
+    /// then carries the request idle bound.
+    stall_policy: Option<StallPolicy>,
 }
 
 impl SidecarSupervisor {
@@ -55,7 +58,16 @@ impl SidecarSupervisor {
             policy,
             client: None,
             restarts: 0,
+            stall_policy: None,
         }
+    }
+
+    /// Supervise clients spawned with `policy`. [`SidecarSupervisor::ensure`]
+    /// then replaces a wedged client exactly as it replaces a dead one.
+    #[must_use]
+    pub fn with_stall_watchdog(mut self, policy: StallPolicy) -> Self {
+        self.stall_policy = Some(policy);
+        self
     }
 
     pub fn restarts(&self) -> u32 {
@@ -95,7 +107,11 @@ impl SidecarSupervisor {
         }
         let mut attempt: u32 = 0;
         loop {
-            match SidecarClient::spawn(self.config.clone()).await {
+            let spawned = match self.stall_policy {
+                Some(policy) => SidecarClient::spawn_watched(self.config.clone(), policy).await,
+                None => SidecarClient::spawn(self.config.clone()).await,
+            };
+            match spawned {
                 Ok(client) => {
                     let client = Arc::new(client);
                     self.client = Some(Arc::clone(&client));
