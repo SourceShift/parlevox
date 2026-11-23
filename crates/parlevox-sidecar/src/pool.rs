@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use parlevox_core::ParlevoxError;
 use tokio::sync::Mutex;
 
-use crate::client::SidecarClient;
+use crate::client::{SidecarClient, StallPolicy};
 use crate::config::SidecarConfig;
 
 /// Idle-process bounds for a [`SidecarPool`].
@@ -395,6 +395,9 @@ pub struct SidecarPool {
     config: SidecarConfig,
     queue: Mutex<IdleQueue<Arc<SidecarClient>>>,
     stats: PoolStats,
+    /// Installed by [`SidecarPool::with_stall_watchdog`]; fresh spawns then
+    /// carry the request idle bound.
+    stall_policy: Option<StallPolicy>,
 }
 
 impl SidecarPool {
@@ -409,7 +412,17 @@ impl SidecarPool {
                     .with_max_reuses(pool_config.max_reuses),
             ),
             stats: PoolStats::default(),
+            stall_policy: None,
         }
+    }
+
+    /// Fresh spawns in this pool install `policy`, so a lease fails its request
+    /// with a transient error instead of hanging. Reuse and acquire already
+    /// probe with `reset`.
+    #[must_use]
+    pub fn with_stall_watchdog(mut self, policy: StallPolicy) -> Self {
+        self.stall_policy = Some(policy);
+        self
     }
 
     /// Counters accumulated since the pool was created.
@@ -458,7 +471,11 @@ impl SidecarPool {
             }
         }
 
-        let client = Arc::new(SidecarClient::spawn(self.config.clone()).await?);
+        let client = match self.stall_policy {
+            Some(policy) => SidecarClient::spawn_watched(self.config.clone(), policy).await?,
+            None => SidecarClient::spawn(self.config.clone()).await?,
+        };
+        let client = Arc::new(client);
         PoolStats::bump(&self.stats.spawned);
         Ok(PoolLease::new(client, Arc::clone(self), 0))
     }
