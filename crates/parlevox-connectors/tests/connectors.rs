@@ -6,7 +6,7 @@
 
 #![cfg(feature = "http")]
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -494,47 +494,116 @@ async fn groq_style_descriptor_builds_without_rust_changes() {
     assert_eq!(text, "Hello");
 }
 
+/// Guards against the connector layer growing a dependency on the runtime
+/// crates.
+///
+/// An earlier version of this test shelled out to `git status` and failed on
+/// any working-tree change under a list of protected paths. That measured the
+/// caller's checkout rather than this crate, so it failed on any concurrent
+/// edit anywhere in the workspace and proved nothing about linking. This is a
+/// static dependency and import check instead; do not replace it with a
+/// working-tree tripwire again.
 #[test]
-fn runtime_crates_are_untouched() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .expect("workspace root exists");
-    let paths = [
-        "crates/parlevox-runtime",
-        "crates/parlevox-core",
-        "crates/parlevox-ipc",
-        "crates/parlevox-sidecar",
-        "crates/parlevox-cli",
-        "docs",
-        "README.md",
+fn connectors_do_not_link_runtime_crates() {
+    // Arrange: the dependencies this crate may legitimately declare.
+    const ALLOWED: [&str; 12] = [
+        "async-trait",
+        "bytes",
+        "futures-core",
+        "futures-util",
+        "parlevox-core",
+        "parlevox-providers",
+        "reqwest",
+        "serde_json",
+        "thiserror",
+        "tokio",
+        "tokio-util",
+        "tracing",
     ];
-    let status = git_output(&root, &["status", "--porcelain", "--"], &paths);
-    assert!(
-        status.is_empty(),
-        "protected paths have working-tree changes:\n{status}"
-    );
-    let diff = git_output(&root, &["diff", "--stat", "--"], &paths);
-    assert!(
-        diff.is_empty(),
-        "protected paths have a non-empty diff:\n{diff}"
-    );
-}
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest_path = manifest_dir.join("Cargo.toml");
 
-fn git_output(root: &Path, arguments: &[&str], paths: &[&str]) -> String {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(arguments)
-        .args(paths)
-        .output()
-        .expect("git runs");
+    // Act: parse the `[dependencies]` table only, so `[features]`,
+    // `[dev-dependencies]` and their `dep:` entries never leak into the set.
+    let manifest = std::fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", manifest_path.display()));
+    let mut in_dependencies = false;
+    let mut declared = BTreeMap::new();
+    for (index, line) in manifest.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_dependencies = trimmed == "[dependencies]";
+            continue;
+        }
+        if !in_dependencies || trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let (key, _) = trimmed
+            .split_once('=')
+            .unwrap_or_else(|| panic!("malformed dependency at Cargo.toml:{}", index + 1));
+        // `dep.workspace = true` is a dotted key naming the dependency `dep`.
+        let name = key
+            .trim()
+            .split_once('.')
+            .map_or_else(|| key.trim(), |(name, _)| name);
+        declared.insert(name.to_owned(), index + 1);
+    }
+
+    let allowed: BTreeSet<&str> = ALLOWED.into_iter().collect();
+    let unexpected: Vec<String> = declared
+        .iter()
+        .filter(|(name, _)| !allowed.contains(name.as_str()))
+        .map(|(name, line)| format!("{name} at Cargo.toml:{line}"))
+        .collect();
+    let missing: Vec<&str> = allowed
+        .iter()
+        .filter(|name| !declared.contains_key(**name))
+        .copied()
+        .collect();
+
+    // Assert: the manifest declares exactly the allow-list, nothing more.
     assert!(
-        output.status.success(),
-        "git failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        unexpected.is_empty() && missing.is_empty(),
+        "connector dependencies drifted from the allow-list; \
+         unexpected: {unexpected:?}, missing: {missing:?}"
     );
-    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+
+    // Act: scan the crate sources for reach-ins into runtime crates.
+    let forbidden = [
+        "parlevox_runtime",
+        "parlevox_ipc",
+        "parlevox_sidecar",
+        "parlevox_cli",
+        "parlevox_transport_ws",
+    ];
+    let mut hits = BTreeSet::new();
+    let mut pending = vec![manifest_dir.join("src")];
+    while let Some(directory) = pending.pop() {
+        let entries = std::fs::read_dir(&directory)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", directory.display()));
+        for entry in entries {
+            let path = entry.expect("directory entry is readable").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                let source = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+                let relative = path.strip_prefix(manifest_dir).unwrap_or(&path);
+                for (index, line) in source.lines().enumerate() {
+                    if forbidden.iter().any(|name| line.contains(*name)) {
+                        hits.insert(format!("{}:{}", relative.display(), index + 1));
+                    }
+                }
+            }
+        }
+    }
+
+    // Assert: no source file names a runtime crate, and only paths/lines are
+    // reported, never the matched text.
+    assert!(
+        hits.is_empty(),
+        "connector sources reach into runtime crates: {hits:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
