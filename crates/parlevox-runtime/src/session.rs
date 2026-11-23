@@ -34,6 +34,7 @@ use crate::events::{
 };
 use crate::pipeline::{PipelineStats, SentenceQueue, SentenceSplitter};
 use crate::registry::Providers;
+use crate::strategy::{StrategyStats, TurnContext, TurnDecision, TurnStrategies};
 #[cfg(feature = "otel")]
 use crate::telemetry::{counter, millis, to_u64, StageSpan, TraceClock, TurnMetrics, TurnTrace};
 #[cfg(feature = "otel")]
@@ -794,6 +795,13 @@ pub struct Session {
     pending_recovery: Option<PendingReply>,
     /// Cumulative recovery counters, exposed through [`Session::recovery_stats`].
     recovery: RecoveryCounters,
+    /// Opt-in ordered turn-start strategy list. `None` means no list was
+    /// installed, so the turn-start decision is the default `Accept` and the
+    /// turn loop is byte-identical to the pre-strategy behaviour.
+    turn_strategies: Option<TurnStrategies>,
+    /// Cumulative turn-start consultation counters, exposed through
+    /// [`Session::strategy_stats`]. Stays zero when no list is installed.
+    strategy_stats: StrategyStats,
     /// Test-only ordered log of transitions applied through [`Session::apply`].
     /// Absent from production builds, so the default runtime and the pinned
     /// demo output carry no recorder.
@@ -930,6 +938,26 @@ impl Session {
         self
     }
 
+    /// Install the ordered turn-start strategy list.
+    ///
+    /// Additive: unset means today's behaviour byte-for-byte. Only the
+    /// turn-start decision consults the list — once per final transcript,
+    /// after the empty-final rejection and before the turn is committed.
+    /// Endpoint/stop strategies are not part of it, because utterance
+    /// boundaries are owned by the caller and the VAD decorator.
+    ///
+    /// An installed empty list is inert: it accepts, and
+    /// [`Session::strategy_stats`] stays zero. A list whose strategies all
+    /// abstain also accepts. The first `Accept` or `Reject` decides; a `Reject`
+    /// suppresses the turn without a user message, LLM call, TTS call, or
+    /// audio, and rests the machine via [`TurnMachine::abort`] without
+    /// advancing the turn index.
+    #[must_use]
+    pub fn with_turn_strategies(mut self, strategies: TurnStrategies) -> Self {
+        self.turn_strategies = Some(strategies);
+        self
+    }
+
     fn assemble(
         config: SessionConfig,
         providers: Providers,
@@ -989,6 +1017,8 @@ impl Session {
             partial_resume: None,
             pending_recovery: None,
             recovery: RecoveryCounters::default(),
+            turn_strategies: None,
+            strategy_stats: StrategyStats::default(),
             #[cfg(test)]
             transition_log: Vec::new(),
             #[cfg(feature = "otel")]
@@ -1092,6 +1122,17 @@ impl Session {
             resumed: self.recovery.resumed,
             discarded: self.recovery.discarded,
         }
+    }
+
+    /// Cumulative counters for the opt-in turn-start strategy list.
+    ///
+    /// Every counter stays zero while [`Session::with_turn_strategies`] has not
+    /// been called. `consulted` counts strategies reached, `accepted`,
+    /// `rejected` and `abstained` partition those consultations by verdict, and
+    /// `turns_rejected` counts final transcripts that did not commit a turn.
+    #[must_use]
+    pub fn strategy_stats(&self) -> StrategyStats {
+        self.strategy_stats
     }
 
     pub fn provider_manifests(&self) -> Vec<ProviderManifest> {
@@ -1390,6 +1431,67 @@ impl Session {
                 counter(to_u64(transcript.chars().count())),
             ));
             stt_span.end();
+        }
+
+        // Turn-start decision point: a final transcript exists and the turn is
+        // not yet committed. Consult the optional ordered strategy list exactly
+        // once. No list, an empty list, or an all-abstain list accepts and
+        // falls through to the unchanged commit path below.
+        let (decision, consulted) = {
+            let context = TurnContext {
+                transcript: transcript.as_str(),
+                state: self.machine.state(),
+                turn_index: self.machine.turn_index().saturating_add(1),
+            };
+            match self.turn_strategies.as_mut() {
+                Some(strategies) => strategies.resolve(&context),
+                None => (TurnDecision::Accept, StrategyStats::default()),
+            }
+        };
+        self.strategy_stats.consulted = self
+            .strategy_stats
+            .consulted
+            .saturating_add(consulted.consulted);
+        self.strategy_stats.accepted = self
+            .strategy_stats
+            .accepted
+            .saturating_add(consulted.accepted);
+        self.strategy_stats.rejected = self
+            .strategy_stats
+            .rejected
+            .saturating_add(consulted.rejected);
+        self.strategy_stats.abstained = self
+            .strategy_stats
+            .abstained
+            .saturating_add(consulted.abstained);
+
+        if decision == TurnDecision::Reject {
+            self.strategy_stats.turns_rejected =
+                self.strategy_stats.turns_rejected.saturating_add(1);
+            // A speculation started during STT (when configured) must not leak
+            // into the next turn; dropping its guard cancels the child token.
+            drop(speculation.take());
+            // Rest the machine without committing: `abort` returns
+            // `UserSpeaking`/`Thinking`/`Speaking`/`Interrupted` to `Listening`
+            // and leaves the committed turn index unchanged.
+            self.machine.abort()?;
+            // The STT adapter buffered this utterance, so take its per-request
+            // loss rather than billing it to the next turn.
+            let sidecar_dropped_frames = self.take_sidecar_dropped_frames();
+            return Ok(TurnReport {
+                turn: self.machine.turn_index(),
+                transcript,
+                reply: String::new(),
+                audio_frames: 0,
+                dropped_frames: 0,
+                dropped_ms: 0,
+                dropped_events: 0,
+                sidecar_dropped_frames,
+                input_dropped_frames: 0,
+                interrupted: false,
+                context_messages: 0,
+                context_evicted_messages: 0,
+            });
         }
 
         let transition = self.apply(TurnEvent::FinalTranscript {
