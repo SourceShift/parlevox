@@ -1478,6 +1478,11 @@ impl Session {
             // The STT adapter buffered this utterance, so take its per-request
             // loss rather than billing it to the next turn.
             let sidecar_dropped_frames = self.take_sidecar_dropped_frames();
+            // The turn ends `Ok` but commits nothing: flag it before the trace
+            // closes so the span carries no committed turn index and the metric
+            // outcome is `rejected`, not `ok`.
+            #[cfg(feature = "otel")]
+            trace.mark_rejected();
             return Ok(TurnReport {
                 turn: self.machine.turn_index(),
                 transcript,
@@ -1489,7 +1494,9 @@ impl Session {
                 sidecar_dropped_frames,
                 input_dropped_frames: 0,
                 interrupted: false,
-                context_messages: 0,
+                // The rejection leaves the retained history untouched, so report
+                // the depth a caller actually still holds rather than zero.
+                context_messages: self.context.len(),
                 context_evicted_messages: 0,
             });
         }

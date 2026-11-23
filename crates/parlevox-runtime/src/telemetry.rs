@@ -168,6 +168,10 @@ pub(crate) struct TurnTrace {
     /// The committed turn index, once known. `None` until the turn reaches
     /// `FinalTranscript` (or the turn ends and its outcome supplies it).
     turn: Option<u64>,
+    /// Set when a turn-start strategy rejects the turn. A rejected turn ends
+    /// `Ok` but commits no index, so it is exported as `rejected` rather than
+    /// folded into the ordinary committed-turn series.
+    rejected: bool,
     /// Caller-supplied instruments. `None` when the session has no meter, in
     /// which case the turn records no metrics.
     metrics: Option<Arc<TurnMetrics>>,
@@ -195,6 +199,7 @@ impl TurnTrace {
             started,
             ended: false,
             turn: None,
+            rejected: false,
             metrics,
         }
     }
@@ -213,6 +218,14 @@ impl TurnTrace {
         self.cx
             .span()
             .set_attribute(KeyValue::new("turn.index", counter(turn)));
+    }
+
+    /// Flag the turn as rejected by a turn-start strategy.
+    ///
+    /// Must be called before [`TurnTrace::finish`], which uses the flag to
+    /// suppress the committed turn index and to classify the metric outcome.
+    pub(crate) fn mark_rejected(&mut self) {
+        self.rejected = true;
     }
 
     /// Record the depth and capacity of the three bounded handoffs (input,
@@ -268,13 +281,20 @@ impl TurnTrace {
         // A turn that ended before `FinalTranscript` (a pre-commit barge-in)
         // still has a `TurnReport`; record its id so the span always matches
         // the report. The first-write-wins rule keeps the committed id intact.
+        // A rejected turn is the exception: it ends `Ok` but commits nothing, so
+        // exporting an index would make it look like an ordinary committed turn.
         if let Ok(report) = result {
-            self.record_turn(report.turn);
+            if !self.rejected {
+                self.record_turn(report.turn);
+            }
         }
         let span = self.cx.span();
         match result {
             Ok(report) => {
                 span.set_attributes(report_attributes(report));
+                if self.rejected {
+                    span.set_attribute(KeyValue::new("turn.rejected", true));
+                }
                 if report.interrupted {
                     span.set_attribute(KeyValue::new("turn.interrupted", true));
                 }
@@ -297,6 +317,7 @@ impl TurnTrace {
         // the final report are both known.
         if let Some(metrics) = &self.metrics {
             let outcome = match result {
+                Ok(_) if self.rejected => "rejected",
                 Ok(report) if report.interrupted => "interrupted",
                 Ok(_) => "ok",
                 Err(_) => "failed",

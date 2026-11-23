@@ -324,6 +324,51 @@ async fn reject_suppresses_the_turn() {
 }
 
 #[tokio::test]
+async fn rejected_turn_reports_the_real_context_depth() {
+    // Arrange: one accepted turn teaches the context two messages (the user
+    // prompt and the reply), then a second transcript is rejected.
+    let log = call_log();
+    let mut strategies = TurnStrategies::new();
+    strategies.push(Box::new(RejectIf {
+        reject_transcript: "drop this".to_string(),
+    }));
+    let mut session = session_with(
+        &["keep this", "drop this"],
+        Some(strategies),
+        Arc::clone(&log),
+    );
+
+    // Act: turn one is accepted, turn two is rejected without an error.
+    let accepted = session
+        .run_turn(utterance())
+        .await
+        .expect("the first turn is accepted");
+    let rejected = session
+        .run_turn(utterance())
+        .await
+        .expect("the second turn is rejected without an error");
+
+    // Assert: both reports describe the live context depth a caller reads.
+    let depth = session.context_stats().messages;
+    assert!(
+        depth > 0,
+        "the accepted turn populated the context before the rejection"
+    );
+    assert_eq!(
+        accepted.context_messages, depth,
+        "the accepted report must match the session's context depth"
+    );
+    assert_eq!(
+        rejected.context_messages, depth,
+        "a rejected turn must report the context depth it left intact"
+    );
+    assert_ne!(
+        rejected.context_messages, 0,
+        "a rejected turn after a committed turn has real depth, not zero"
+    );
+}
+
+#[tokio::test]
 async fn first_decisive_strategy_wins_and_abstain_falls_through() {
     // Arrange: abstain, then reject, then accept.
     let log = call_log();

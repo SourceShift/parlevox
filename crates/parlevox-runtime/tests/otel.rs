@@ -22,6 +22,7 @@ use parlevox_providers::{
 };
 use parlevox_runtime::{
     demo_utterance, ProviderNames, ProviderRegistry, Providers, Session, SessionConfig,
+    TurnContext, TurnDecision, TurnStrategies, TurnStrategy,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -58,6 +59,16 @@ fn i64_attribute(span: &SpanData, key: &str) -> Option<i64> {
         .find(|attribute| attribute.key.as_str() == key)
         .and_then(|attribute| match attribute.value {
             Value::I64(value) => Some(value),
+            _ => None,
+        })
+}
+
+fn bool_attribute(span: &SpanData, key: &str) -> Option<bool> {
+    span.attributes
+        .iter()
+        .find(|attribute| attribute.key.as_str() == key)
+        .and_then(|attribute| match attribute.value {
+            Value::Bool(value) => Some(value),
             _ => None,
         })
 }
@@ -150,6 +161,20 @@ fn assert_listening_after_failure(session: &Session) {
         TurnState::Listening,
         "a failed turn must already be back in Listening"
     );
+}
+
+/// Strategy double that rejects every final transcript, so one fake turn is a
+/// rejected turn.
+struct RejectEverything;
+
+impl TurnStrategy for RejectEverything {
+    fn name(&self) -> &'static str {
+        "reject-everything"
+    }
+
+    fn decide(&mut self, _context: &TurnContext<'_>) -> TurnDecision {
+        TurnDecision::Reject
+    }
 }
 
 #[tokio::test]
@@ -323,6 +348,52 @@ async fn failed_pre_final_turn_shares_committed_turn_index() {
 
     assert_eq!(i64_attribute(succeeded[0], "turn.index"), Some(first_turn));
     assert_eq!(i64_attribute(succeeded[1], "turn.index"), Some(second_turn));
+
+    provider.shutdown().expect("provider shuts down cleanly");
+}
+
+#[tokio::test]
+async fn rejected_turn_span_marks_rejection_and_omits_a_turn_index() {
+    // Arrange: one session whose tracer exports into memory and whose strategy
+    // list rejects every final transcript.
+    let exporter = CollectingExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_span_processor(SimpleSpanProcessor::new(exporter.clone()))
+        .build();
+    let tracer = provider.tracer("parlevox-runtime-test");
+    let providers = ProviderRegistry::fakes()
+        .expect("built-in fakes resolve")
+        .resolve(&ProviderNames::default())
+        .expect("fake providers resolve");
+    let mut strategies = TurnStrategies::new();
+    strategies.push(Box::new(RejectEverything));
+    let mut session = Session::with_tracer(SessionConfig::default(), providers, tracer)
+        .expect("session builds")
+        .with_turn_strategies(strategies);
+
+    // Act: one rejected turn.
+    let report = session
+        .run_turn(demo_utterance(16_000, 1, 40))
+        .await
+        .expect("a rejected turn returns Ok");
+    assert_eq!(report.turn, 0, "a rejected turn commits no index");
+
+    // Assert: the root span is flagged as rejected and carries no turn index,
+    // because a rejected turn commits nothing.
+    let spans = exporter.finished();
+    let roots: Vec<&SpanData> = spans.iter().filter(|span| span.name == "turn").collect();
+    assert_eq!(roots.len(), 1, "expected exactly one turn root span");
+    let root = roots[0];
+    assert_eq!(
+        bool_attribute(root, "turn.rejected"),
+        Some(true),
+        "a rejected turn must be flagged on its span"
+    );
+    assert_eq!(
+        i64_attribute(root, "turn.index"),
+        None,
+        "a rejected turn commits no index, so none may be exported"
+    );
 
     provider.shutdown().expect("provider shuts down cleanly");
 }

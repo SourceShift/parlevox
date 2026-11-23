@@ -14,7 +14,10 @@ use opentelemetry_sdk::metrics::data::{
     AggregatedMetrics, HistogramDataPoint, Metric, MetricData, ResourceMetrics, SumDataPoint,
 };
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
-use parlevox_runtime::{demo_utterance, ProviderNames, ProviderRegistry, Session, SessionConfig};
+use parlevox_runtime::{
+    demo_utterance, ProviderNames, ProviderRegistry, Session, SessionConfig, TurnContext,
+    TurnDecision, TurnStrategies, TurnStrategy,
+};
 
 /// Every metric the success path must export, in sorted order.
 const EXPECTED_METRICS: [&str; 6] = [
@@ -240,6 +243,58 @@ async fn interrupted_turn_reports_outcome_and_skips_tts() {
     assert_eq!(
         u64_histogram_points(metric(&collected, "parlevox.playout.depth")).len(),
         1
+    );
+}
+
+/// Strategy double that rejects every final transcript, so one fake turn is a
+/// rejected turn.
+struct RejectEverything;
+
+impl TurnStrategy for RejectEverything {
+    fn name(&self) -> &'static str {
+        "reject-everything"
+    }
+
+    fn decide(&mut self, _context: &TurnContext<'_>) -> TurnDecision {
+        TurnDecision::Reject
+    }
+}
+
+#[tokio::test]
+async fn rejected_turn_records_a_rejected_outcome_not_ok() {
+    // Arrange: a session whose strategy list rejects the only turn, handed a
+    // meter backed by an in-memory exporter.
+    let exporter = InMemoryMetricExporter::default();
+    let reader = PeriodicReader::builder(exporter.clone()).build();
+    let provider = SdkMeterProvider::builder().with_reader(reader).build();
+    let meter = provider.meter("parlevox-runtime-test");
+    let mut strategies = TurnStrategies::new();
+    strategies.push(Box::new(RejectEverything));
+    let mut session = fake_session(SessionConfig::default())
+        .with_meter(meter)
+        .with_turn_strategies(strategies);
+
+    // Act: one rejected turn, then force collection.
+    let report = session
+        .run_turn(demo_utterance(16_000, 1, 40))
+        .await
+        .expect("a rejected turn still reports");
+    assert_eq!(report.turn, 0, "a rejected turn commits no index");
+    let collected = flush(&exporter, &provider);
+
+    // Assert: the turn is recorded as `rejected`, never as `ok`.
+    let turn_points = u64_sum_points(metric(&collected, "parlevox.turns"));
+    assert_eq!(turn_points.len(), 1, "one turn outcome series");
+    assert_eq!(
+        string_attribute(turn_points[0].attributes(), "outcome"),
+        Some("rejected")
+    );
+    assert_eq!(turn_points[0].value(), 1);
+    assert!(
+        turn_points
+            .iter()
+            .all(|point| string_attribute(point.attributes(), "outcome") != Some("ok")),
+        "a rejected turn must not be recorded as ok"
     );
 }
 
