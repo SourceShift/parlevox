@@ -9,6 +9,7 @@ pub mod events;
 pub mod pipeline;
 pub mod registry;
 pub mod session;
+pub mod strategy;
 
 /// Opt-in OpenTelemetry turn tracing, enabled by the `otel` feature.
 #[cfg(feature = "otel")]
@@ -23,3 +24,4 @@ pub use session::{
     demo_utterance, BargeInHandle, InterruptionRecovery, PartialResume, RecoveryStats, Session,
     SessionConfig, SessionCredits, SpeculationStats, SpeculativeStart, TurnReport,
 };
+pub use strategy::{StrategyStats, TurnContext, TurnDecision, TurnStrategies, TurnStrategy};
