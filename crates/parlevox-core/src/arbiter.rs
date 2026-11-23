@@ -23,6 +23,8 @@
 //! [`TurnEventKind`]; mapping that onto the runtime's `SessionEvent` belongs to
 //! the runtime slice, which is deliberately not wired to this module yet.
 
+use std::cmp::Ordering;
+
 use serde::Serialize;
 
 use crate::observation::{Observation, ObservationKind};
@@ -89,9 +91,9 @@ pub enum Command {
 /// What a [`Command::Record`] reports, and therefore which [`ArbiterModel`]
 /// counter it is paired with.
 ///
-/// Every accepted, ignored and rejected observation is accounted for exactly
-/// once, so `accepted + ignored + rejected` always equals the number of
-/// observations fed to the arbiter.
+/// Every observation is accounted for exactly once, so `accepted + ignored +
+/// rejected + dropped` always equals the number of observations fed to the
+/// arbiter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecordKind {
@@ -103,11 +105,40 @@ pub enum RecordKind {
     /// The observation arrived after the session closed; reports the
     /// `rejected` counter.
     ObservationAfterClose,
+    /// The observation carried a `(turn, generation)` pair older than the
+    /// model's fence and was dropped; reports the `dropped` counter.
+    ObservationDropped,
+    /// The observation carried a `(turn, generation)` pair newer than the
+    /// model's fence; reports the `rejected` counter.
+    ObservationAhead,
     /// A new user turn was opened; reports the `accepted` counter.
     TurnOpened,
     /// An in-flight reply was superseded by a barge-in; reports the `accepted`
-    /// counter and precedes the generation increment.
+    /// counter. The model's generation is incremented in the same step, and
+    /// this value-less record marks that the previous generation was
+    /// superseded; it carries no generation number of its own.
     GenerationSuperseded,
+}
+
+/// Where one observation sits relative to the model's `(turn, generation)`
+/// fence.
+///
+/// The fence is the pair the model currently considers live. The two pairs are
+/// compared lexicographically, so an observation from an older turn is
+/// superseded even when it carries a larger generation, and within one turn a
+/// smaller generation is superseded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FencePosition {
+    /// The observation is stamped with the model's current turn and
+    /// generation. Only a current observation may move the machine.
+    Current,
+    /// The observation belongs to an older `(turn, generation)` pair. It is
+    /// dropped without a state transition.
+    Superseded,
+    /// The observation belongs to a newer `(turn, generation)` pair than the
+    /// model has reached. It is record-only: the model records it and counts
+    /// it as rejected, without a state transition.
+    Ahead,
 }
 
 /// The complete decision state of a session.
@@ -135,9 +166,13 @@ pub struct ArbiterModel {
     /// Observations ignored because they carry no actionable event. Written
     /// only by [`TurnArbiter::step`].
     pub ignored: u64,
-    /// Observations rejected as illegal or as arriving after close. Written
-    /// only by [`TurnArbiter::step`].
+    /// Observations rejected as illegal, as arriving after close, or as
+    /// newer than the model's fence. Written only by [`TurnArbiter::step`].
     pub rejected: u64,
+    /// Observations dropped because their `(turn, generation)` pair was
+    /// superseded by the model's fence. Monotonically non-decreasing; written
+    /// only by [`TurnArbiter::step`].
+    pub dropped: u64,
 }
 
 impl Default for ArbiterModel {
@@ -150,6 +185,31 @@ impl Default for ArbiterModel {
             accepted: 0,
             ignored: 0,
             rejected: 0,
+            dropped: 0,
+        }
+    }
+}
+
+impl ArbiterModel {
+    /// Classify `observation` against this model's `(turn, generation)` fence.
+    ///
+    /// An observation is [`FencePosition::Current`] only when its turn and
+    /// generation both equal the model's. A lexicographically smaller pair is
+    /// [`FencePosition::Superseded`] and a larger pair is
+    /// [`FencePosition::Ahead`].
+    ///
+    /// The default model is the pre-generation epoch `(0, 0)`, and an
+    /// observation stamped `(0, 0)` is admitted there as
+    /// [`FencePosition::Current`]. That choice keeps the
+    /// [`TurnEventKind::Start`], VAD and opening-transcript path alive before
+    /// the first turn exists; no older pair is representable at `(0, 0)`, so
+    /// admitting it cannot mask a stale observation.
+    #[must_use]
+    pub fn fence_position(&self, observation: &Observation) -> FencePosition {
+        match (observation.turn, observation.generation).cmp(&(self.turn, self.generation)) {
+            Ordering::Less => FencePosition::Superseded,
+            Ordering::Equal => FencePosition::Current,
+            Ordering::Greater => FencePosition::Ahead,
         }
     }
 }
@@ -167,18 +227,32 @@ impl TurnArbiter {
     ///
     /// # Decision rules
     ///
-    /// 1. If `model.state` is [`TurnState::Closed`], nothing moves: the model's
-    ///    `rejected` counter increments and the step yields
+    /// The observation is first classified against the model's `(turn,
+    /// generation)` fence by [`ArbiterModel::fence_position`]. The fence is
+    /// evaluated before every other branch.
+    ///
+    /// 1. A [`FencePosition::Superseded`] observation — an older `(turn,
+    ///    generation)` pair — never moves the machine: `dropped` increments by
+    ///    one and the step yields only [`RecordKind::ObservationDropped`].
+    ///    State, turn, generation, duck flag and the other counters are
+    ///    unchanged. This takes precedence over the closed, non-actionable and
+    ///    legality branches, so a late final transcript for turn `N-1` is
+    ///    dropped and counted even after the session has closed.
+    /// 2. A [`FencePosition::Ahead`] observation — a newer pair the model has
+    ///    not reached — is recorded without a transition: `rejected` increments
+    ///    by one and the step yields only [`RecordKind::ObservationAhead`].
+    /// 3. If `model.state` is [`TurnState::Closed`], nothing else moves: the
+    ///    model's `rejected` counter increments and the step yields
     ///    [`RecordKind::ObservationAfterClose`].
-    /// 2. An observation that carries no actionable event (a partial
+    /// 4. An observation that carries no actionable event (a partial
     ///    transcript, a reply delta, a queued audio frame, a cancellation
     ///    notice, or a failure) increments `ignored` and yields
     ///    [`RecordKind::ObservationIgnored`].
-    /// 3. An actionable event with no row in [`LEGAL_TRANSITIONS`] for the
+    /// 5. An actionable event with no row in [`LEGAL_TRANSITIONS`] for the
     ///    current state increments `rejected` and yields
     ///    [`RecordKind::IllegalTransition`]; the state, turn, generation and
     ///    duck flag are unchanged.
-    /// 4. An accepted event is applied exactly as `TurnMachine::apply` would
+    /// 6. An accepted event is applied exactly as `TurnMachine::apply` would
     ///    apply it: [`TurnEventKind::FinalTranscript`] opens a turn, and every
     ///    other accepted event only changes the state.
     ///
@@ -206,16 +280,43 @@ impl TurnArbiter {
     ///   `EmitTurnEvent`, and marks the model ducked.
     /// - Leaving the contested window ([`TurnState::EvaluatingBargeIn`]) for any
     ///   other state restores the ducked audio with `RestoreAudio`.
+    /// - A superseded observation yields only `Record(ObservationDropped)`;
+    ///   a newer observation yields only `Record(ObservationAhead)`.
     /// - Entering [`TurnState::Interrupted`] from any other state yields
     ///   `CancelGeneration`, `FlushAudioBuffer`, `RestoreAudio` when the model
-    ///   was ducked, `EmitTurnEvent` and `Record(GenerationSuperseded)`, then
-    ///   increments the generation.
+    ///   was ducked, `EmitTurnEvent` and `Record(GenerationSuperseded)`. The
+    ///   model's generation is incremented in the same step; the value-less
+    ///   record carries no generation number of its own.
     /// - Every other accepted event yields only `EmitTurnEvent`.
     ///
     /// The input is never mutated: the returned model is a distinct value, so a
     /// caller may reuse the old model for a retry or a trace.
     #[must_use]
     pub fn step(model: &ArbiterModel, observation: Observation) -> (ArbiterModel, Vec<Command>) {
+        match model.fence_position(&observation) {
+            FencePosition::Superseded => {
+                let mut next = *model;
+                next.dropped = next.dropped.saturating_add(1);
+                return (
+                    next,
+                    vec![Command::Record {
+                        kind: RecordKind::ObservationDropped,
+                    }],
+                );
+            }
+            FencePosition::Ahead => {
+                let mut next = *model;
+                next.rejected = next.rejected.saturating_add(1);
+                return (
+                    next,
+                    vec![Command::Record {
+                        kind: RecordKind::ObservationAhead,
+                    }],
+                );
+            }
+            FencePosition::Current => {}
+        }
+
         if model.state == TurnState::Closed {
             let mut next = *model;
             next.rejected = next.rejected.saturating_add(1);
@@ -305,8 +406,9 @@ impl TurnArbiter {
         // 4. The turn event mirrors the accepted event.
         commands.push(Command::EmitTurnEvent { kind });
 
-        // 5. Accounting. The superseded generation is bumped *after* the record
-        //    so the record reports the generation that was cancelled.
+        // 5. Accounting. The generation is incremented in the same step; this
+        //    value-less record only marks that the previous generation was
+        //    superseded, so it reports no generation number.
         if interrupts {
             next.generation = next.generation.saturating_add(1);
             commands.push(Command::Record {

@@ -170,7 +170,8 @@ map participates.
 ### Counters
 
 Every observation is accounted for exactly once, so `accepted + ignored +
-rejected` always equals the number of observations stepped through the arbiter.
+rejected + dropped` always equals the number of observations stepped through the
+arbiter.
 
 | `Record` kind | Counter | When |
 |---|---|---|
@@ -178,11 +179,46 @@ rejected` always equals the number of observations stepped through the arbiter.
 | `GenerationSuperseded` | `accepted` | An in-flight reply was interrupted. |
 | `ObservationIgnored` | `ignored` | The observation carried no actionable event. |
 | `IllegalTransition` | `rejected` | The event is illegal from the current state. |
-| `ObservationAfterClose` | `rejected` | Any observation after `Closed`; the state never leaves `Closed`. |
+| `ObservationAfterClose` | `rejected` | A current observation after `Closed`; the state never leaves `Closed`. |
+| `ObservationAhead` | `rejected` | The observation carried a newer `(turn, generation)` pair than the model has reached; see [Fence law](#fence-law). |
+| `ObservationDropped` | `dropped` | The observation carried an older `(turn, generation)` pair; see [Fence law](#fence-law). |
 
 An accepted event applies the same transition `TurnMachine::apply` would apply:
 only `FinalTranscript` opens a turn, and it also starts the next generation.
-Entering `Interrupted` from any other state cancels and flushes, restores ducked
-audio, and increments the generation afterwards. Leaving `EvaluatingBargeIn` for
-any other state restores ducked audio, so a model that is not in the contested
+Entering `Interrupted` from any other state cancels the superseded generation,
+flushes queued audio, restores ducked audio when it was ducked, and increments
+the model's generation in the same step; the value-less
+`Record(GenerationSuperseded)` marks that the previous generation was
+superseded and carries no generation number. Leaving `EvaluatingBargeIn` for any
+other state restores ducked audio, so a model that is not in the contested
 window is never left ducked.
+
+## Fence law
+
+Every observation is stamped with the `(turn, generation)` pair it belongs to.
+The model carries the pair it currently considers live, and
+`ArbiterModel::fence_position` classifies an observation against it by comparing
+the two pairs lexicographically. The predicate is stated once here; the
+implementation is in `crates/parlevox-core/src/arbiter.rs`.
+
+| Position | Predicate | Effect in `step` |
+|---|---|---|
+| `Current` | `observation.(turn, generation) == model.(turn, generation)` | Admitted to the ordinary closed, non-actionable and legality branches. |
+| `Superseded` | `observation.(turn, generation) < model.(turn, generation)` | Dropped: `dropped` increments and the step yields only `Record(ObservationDropped)`. No state, turn, generation or duck flag changes and no state-transition command is emitted. |
+| `Ahead` | `observation.(turn, generation) > model.(turn, generation)` | Recorded: `rejected` increments and the step yields only `Record(ObservationAhead)`. The model has not reached that pair, so it cannot act on the observation yet. |
+
+The default model is `(0, 0)`, the pre-generation epoch; an observation stamped
+`(0, 0)` is `Current` there, which keeps the `Start`, VAD and
+opening-transcript path admitted. No older pair is representable at `(0, 0)`, so
+admitting it cannot mask a stale observation.
+
+The fence is evaluated **before** the closed, non-actionable and legality
+branches. A superseded observation therefore counts as `dropped` even after the
+session has closed; only a current observation after `Closed` yields
+`ObservationAfterClose`. The named case the fence exists for is a late
+`FinalTranscript` for turn `N-1` arriving after turn `N` has opened: it is
+dropped and counted, emits no state-transition command, and leaves the machine
+in the state it already held.
+
+Every observation remains accounted for exactly once, so the identity extends
+to `accepted + ignored + rejected + dropped == observations`.

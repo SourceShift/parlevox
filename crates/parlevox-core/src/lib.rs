@@ -14,7 +14,7 @@ pub mod error;
 pub mod observation;
 pub mod turn;
 
-pub use arbiter::{ArbiterModel, Command, RecordKind, TurnArbiter, DUCK_GAIN};
+pub use arbiter::{ArbiterModel, Command, FencePosition, RecordKind, TurnArbiter, DUCK_GAIN};
 pub use audio::{
     AudioFrame, AudioRing, CreditHandle, CreditSnapshot, CreditStats, CreditWait, OverflowPolicy,
     PushOutcome, RingStats,

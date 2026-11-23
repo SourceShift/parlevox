@@ -7,8 +7,8 @@
 use std::collections::BTreeSet;
 
 use parlevox_core::{
-    ArbiterModel, Command, ErrorClass, Observation, ObservationKind, RecordKind, TurnArbiter,
-    TurnEventKind, TurnState, ALL_EVENT_KINDS, ALL_STATES, DUCK_GAIN,
+    ArbiterModel, Command, ErrorClass, FencePosition, Observation, ObservationKind, RecordKind,
+    TurnArbiter, TurnEventKind, TurnState, ALL_EVENT_KINDS, ALL_STATES, DUCK_GAIN,
 };
 use proptest::prelude::*;
 
@@ -83,16 +83,20 @@ fn model_strategy() -> impl Strategy<Value = ArbiterModel> {
         any::<u64>(),
         any::<u64>(),
         any::<u64>(),
+        any::<u64>(),
     )
         .prop_map(
-            |(state, turn, generation, ducked, accepted, ignored, rejected)| ArbiterModel {
-                state,
-                turn,
-                generation,
-                ducked,
-                accepted,
-                ignored,
-                rejected,
+            |(state, turn, generation, ducked, accepted, ignored, rejected, dropped)| {
+                ArbiterModel {
+                    state,
+                    turn,
+                    generation,
+                    ducked,
+                    accepted,
+                    ignored,
+                    rejected,
+                    dropped,
+                }
             },
         )
 }
@@ -232,15 +236,17 @@ fn ten_thousand_observations_keep_model_invariants() {
     let total = model
         .accepted
         .saturating_add(model.ignored)
-        .saturating_add(model.rejected);
+        .saturating_add(model.rejected)
+        .saturating_add(model.dropped);
     assert_eq!(
         total, DRIVE_STEPS,
-        "accepted + ignored + rejected must equal the step count"
+        "accepted + ignored + rejected + dropped must equal the step count"
     );
 
     println!(
-        "steps={DRIVE_STEPS} accepted={} ignored={} rejected={} state={:?} turn={} generation={}",
-        model.accepted, model.ignored, model.rejected, model.state, model.turn, model.generation
+        "steps={DRIVE_STEPS} accepted={} ignored={} rejected={} dropped={} state={:?} turn={} generation={}",
+        model.accepted, model.ignored, model.rejected, model.dropped, model.state, model.turn,
+        model.generation
     );
 }
 
@@ -257,15 +263,16 @@ fn model_in(state: TurnState, turn: u64, generation: u64, ducked: bool) -> Arbit
         accepted: 0,
         ignored: 0,
         rejected: 0,
+        dropped: 0,
     }
 }
 
-fn observed(kind: ObservationKind) -> Observation {
+fn observation_at(turn: u64, generation: u64, kind: ObservationKind) -> Observation {
     Observation {
         t_ms: 0,
         event_id: 0,
-        turn: 0,
-        generation: 0,
+        turn,
+        generation,
         kind,
     }
 }
@@ -290,18 +297,39 @@ fn record_tag(kind: RecordKind) -> u8 {
         RecordKind::ObservationAfterClose => 2,
         RecordKind::TurnOpened => 3,
         RecordKind::GenerationSuperseded => 4,
+        RecordKind::ObservationDropped => 5,
+        RecordKind::ObservationAhead => 6,
     }
 }
 
 /// Case name, starting model, observation, and the exact ordered commands.
+///
+/// Every observation is stamped with the model's current `(turn, generation)`,
+/// so each case exercises its named branch rather than being dropped by the
+/// fence. The superseded and ahead rows pin an explicit pair on purpose.
 fn coverage_table() -> Vec<(&'static str, ArbiterModel, Observation, Vec<Command>)> {
+    let opens = model_in(TurnState::Listening, 3, 4, false);
+    let synthesis = model_in(TurnState::Thinking, 1, 1, false);
+    let barge_in = model_in(TurnState::Speaking, 2, 7, false);
+    let ducks = model_in(TurnState::Speaking, 2, 7, false);
+    let restores = model_in(TurnState::EvaluatingBargeIn, 2, 7, true);
+    let ignored = model_in(TurnState::Listening, 2, 7, false);
+    let illegal = model_in(TurnState::Idle, 0, 0, false);
+    let closed = model_in(TurnState::Closed, 1, 1, false);
+    let superseded = model_in(TurnState::Listening, 3, 4, false);
+    let ahead = model_in(TurnState::Listening, 2, 7, false);
+
     vec![
         (
             "final transcript from listening opens a turn",
-            model_in(TurnState::Listening, 3, 4, false),
-            observed(ObservationKind::FinalTranscript {
-                text: "hi".to_string(),
-            }),
+            opens,
+            observation_at(
+                opens.turn,
+                opens.generation,
+                ObservationKind::FinalTranscript {
+                    text: "hi".to_string(),
+                },
+            ),
             vec![
                 Command::StartGeneration {
                     turn: 4,
@@ -317,10 +345,14 @@ fn coverage_table() -> Vec<(&'static str, ArbiterModel, Observation, Vec<Command
         ),
         (
             "first audio from thinking starts synthesis",
-            model_in(TurnState::Thinking, 1, 1, false),
-            observed(ObservationKind::Control {
-                event: TurnEventKind::ReplyStarted,
-            }),
+            synthesis,
+            observation_at(
+                synthesis.turn,
+                synthesis.generation,
+                ObservationKind::Control {
+                    event: TurnEventKind::ReplyStarted,
+                },
+            ),
             vec![
                 Command::StartSynthesis {
                     turn: 1,
@@ -333,8 +365,12 @@ fn coverage_table() -> Vec<(&'static str, ArbiterModel, Observation, Vec<Command
         ),
         (
             "barge-in from speaking cancels and flushes",
-            model_in(TurnState::Speaking, 2, 7, false),
-            observed(ObservationKind::BargeInReported),
+            barge_in,
+            observation_at(
+                barge_in.turn,
+                barge_in.generation,
+                ObservationKind::BargeInReported,
+            ),
             vec![
                 Command::CancelGeneration { generation: 7 },
                 Command::FlushAudioBuffer { turn: 2 },
@@ -348,10 +384,14 @@ fn coverage_table() -> Vec<(&'static str, ArbiterModel, Observation, Vec<Command
         ),
         (
             "speech detection ducks the audio",
-            model_in(TurnState::Speaking, 2, 7, false),
-            observed(ObservationKind::Control {
-                event: TurnEventKind::SpeechDetected,
-            }),
+            ducks,
+            observation_at(
+                ducks.turn,
+                ducks.generation,
+                ObservationKind::Control {
+                    event: TurnEventKind::SpeechDetected,
+                },
+            ),
             vec![
                 Command::DuckAudio { gain: DUCK_GAIN },
                 Command::EmitTurnEvent {
@@ -361,10 +401,14 @@ fn coverage_table() -> Vec<(&'static str, ArbiterModel, Observation, Vec<Command
         ),
         (
             "rejected barge-in restores the audio",
-            model_in(TurnState::EvaluatingBargeIn, 2, 7, true),
-            observed(ObservationKind::Control {
-                event: TurnEventKind::BargeInRejected,
-            }),
+            restores,
+            observation_at(
+                restores.turn,
+                restores.generation,
+                ObservationKind::Control {
+                    event: TurnEventKind::BargeInRejected,
+                },
+            ),
             vec![
                 Command::RestoreAudio,
                 Command::EmitTurnEvent {
@@ -374,32 +418,72 @@ fn coverage_table() -> Vec<(&'static str, ArbiterModel, Observation, Vec<Command
         ),
         (
             "partial transcript is ignored",
-            model_in(TurnState::Listening, 2, 7, false),
-            observed(ObservationKind::PartialTranscript {
-                text: "h".to_string(),
-            }),
+            ignored,
+            observation_at(
+                ignored.turn,
+                ignored.generation,
+                ObservationKind::PartialTranscript {
+                    text: "h".to_string(),
+                },
+            ),
             vec![Command::Record {
                 kind: RecordKind::ObservationIgnored,
             }],
         ),
         (
             "reply started from idle is illegal",
-            model_in(TurnState::Idle, 0, 0, false),
-            observed(ObservationKind::Control {
-                event: TurnEventKind::ReplyStarted,
-            }),
+            illegal,
+            observation_at(
+                illegal.turn,
+                illegal.generation,
+                ObservationKind::Control {
+                    event: TurnEventKind::ReplyStarted,
+                },
+            ),
             vec![Command::Record {
                 kind: RecordKind::IllegalTransition,
             }],
         ),
         (
             "start after close is rejected",
-            model_in(TurnState::Closed, 1, 1, false),
-            observed(ObservationKind::Control {
-                event: TurnEventKind::Start,
-            }),
+            closed,
+            observation_at(
+                closed.turn,
+                closed.generation,
+                ObservationKind::Control {
+                    event: TurnEventKind::Start,
+                },
+            ),
             vec![Command::Record {
                 kind: RecordKind::ObservationAfterClose,
+            }],
+        ),
+        (
+            "superseded observation is dropped",
+            superseded,
+            observation_at(
+                superseded.turn.saturating_sub(1),
+                superseded.generation,
+                ObservationKind::FinalTranscript {
+                    text: "late".to_string(),
+                },
+            ),
+            vec![Command::Record {
+                kind: RecordKind::ObservationDropped,
+            }],
+        ),
+        (
+            "newer observation is recorded as rejected",
+            ahead,
+            observation_at(
+                ahead.turn.saturating_add(1),
+                ahead.generation.saturating_add(2),
+                ObservationKind::FinalTranscript {
+                    text: "future".to_string(),
+                },
+            ),
+            vec![Command::Record {
+                kind: RecordKind::ObservationAhead,
             }],
         ),
     ]
@@ -418,7 +502,8 @@ fn every_command_variant_is_producible_from_a_named_observation() {
         assert_eq!(
             next.accepted
                 .saturating_add(next.ignored)
-                .saturating_add(next.rejected),
+                .saturating_add(next.rejected)
+                .saturating_add(next.dropped),
             1,
             "every step must account for exactly one observation in case: {name}"
         );
@@ -437,9 +522,579 @@ fn every_command_variant_is_producible_from_a_named_observation() {
         "every Command variant must be produced by a named observation"
     );
 
-    let expected_records: BTreeSet<u8> = (0u8..=4).collect();
+    let expected_records: BTreeSet<u8> = (0u8..=6).collect();
     assert_eq!(
         covered_records, expected_records,
         "every RecordKind variant must be produced by a named observation"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fence law: late finals for the previous turn
+// ---------------------------------------------------------------------------
+
+/// A scripted observation: either stamped with whatever `(turn, generation)`
+/// the model holds when it is stepped, or pinned to an explicit pair.
+#[derive(Debug, Clone)]
+struct Scripted {
+    kind: ObservationKind,
+    stamp: Stamp,
+}
+
+/// How a [`Scripted`] observation is stamped.
+#[derive(Debug, Clone, Copy)]
+enum Stamp {
+    /// Use the model's current `(turn, generation)`, so the observation is
+    /// classified as [`FencePosition::Current`].
+    Current,
+    /// Use this explicit pair, which the fence classifies.
+    Pinned { turn: u64, generation: u64 },
+}
+
+/// One stepped observation, the model it was applied to, and its commands.
+struct StepRecord {
+    observation: Observation,
+    before: ArbiterModel,
+    commands: Vec<Command>,
+}
+
+/// The result of replaying a script.
+struct Replay {
+    model: ArbiterModel,
+    steps: Vec<StepRecord>,
+}
+
+fn current(kind: ObservationKind) -> Scripted {
+    Scripted {
+        kind,
+        stamp: Stamp::Current,
+    }
+}
+
+/// An eleven-observation two-turn conversation: start, a voice turn that is
+/// interrupted mid-reply, then a text turn that finishes.
+///
+/// 1. `Start`
+/// 2. `VadStarted`
+/// 3. `VadStopped`
+/// 4. `FinalTranscript` opening turn 1
+/// 5. `ReplyStarted`
+/// 6. `SpeechDetected`
+/// 7. `BargeInConfirmed`
+/// 8. `ResumeListening`
+/// 9. `FinalTranscript` opening turn 2
+/// 10. `ReplyStarted`
+/// 11. `ReplyFinished`
+fn scripted_trace() -> Vec<Scripted> {
+    vec![
+        current(ObservationKind::Control {
+            event: TurnEventKind::Start,
+        }),
+        current(ObservationKind::VadStarted),
+        current(ObservationKind::VadStopped),
+        current(ObservationKind::FinalTranscript {
+            text: "first".to_string(),
+        }),
+        current(ObservationKind::Control {
+            event: TurnEventKind::ReplyStarted,
+        }),
+        current(ObservationKind::Control {
+            event: TurnEventKind::SpeechDetected,
+        }),
+        current(ObservationKind::Control {
+            event: TurnEventKind::BargeInConfirmed,
+        }),
+        current(ObservationKind::Control {
+            event: TurnEventKind::ResumeListening,
+        }),
+        current(ObservationKind::FinalTranscript {
+            text: "second".to_string(),
+        }),
+        current(ObservationKind::Control {
+            event: TurnEventKind::ReplyStarted,
+        }),
+        current(ObservationKind::Control {
+            event: TurnEventKind::ReplyFinished,
+        }),
+    ]
+}
+
+/// Step every scripted observation, stamping current ones from the live model.
+fn replay(script: &[Scripted]) -> Replay {
+    let mut model = ArbiterModel::default();
+    let mut steps = Vec::with_capacity(script.len());
+
+    for (index, item) in script.iter().enumerate() {
+        let event_id = u64::try_from(index).expect("a script index fits in u64");
+        let (turn, generation) = match item.stamp {
+            Stamp::Current => (model.turn, model.generation),
+            Stamp::Pinned { turn, generation } => (turn, generation),
+        };
+        let observation = Observation {
+            t_ms: event_id,
+            event_id,
+            turn,
+            generation,
+            kind: item.kind.clone(),
+        };
+
+        let before = model;
+        let (next, commands) = TurnArbiter::step(&model, observation.clone());
+        steps.push(StepRecord {
+            observation,
+            before,
+            commands,
+        });
+        model = next;
+    }
+
+    Replay { model, steps }
+}
+
+/// Insert one pinned `FinalTranscript` before each `(position, turn,
+/// generation)` entry. Equal positions keep the order they were given in.
+fn inject_late_finals(trace: &[Scripted], injections: &[(usize, u64, u64)]) -> Vec<Scripted> {
+    let mut ordered = injections.to_vec();
+    ordered.sort_by_key(|(position, _, _)| *position);
+
+    let mut script = Vec::with_capacity(trace.len() + ordered.len());
+    let mut pending = ordered.iter().peekable();
+
+    for (index, item) in trace.iter().enumerate() {
+        while let Some((position, turn, generation)) = pending.peek().copied().copied() {
+            if position != index {
+                break;
+            }
+            script.push(Scripted {
+                kind: ObservationKind::FinalTranscript {
+                    text: "late".to_string(),
+                },
+                stamp: Stamp::Pinned { turn, generation },
+            });
+            pending.next();
+        }
+        script.push(item.clone());
+    }
+
+    script
+}
+
+/// Base-step indices whose model has already opened a turn, i.e. the points
+/// where an older `(turn, generation)` pair actually exists to inject.
+fn eligible_injection_positions(run: &Replay) -> Vec<usize> {
+    run.steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| step.before.turn >= 1)
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn flattened_commands(steps: &[StepRecord]) -> Vec<Command> {
+    steps
+        .iter()
+        .flat_map(|step| step.commands.iter().copied())
+        .collect()
+}
+
+fn without_drop_records(commands: &[Command]) -> Vec<Command> {
+    commands
+        .iter()
+        .copied()
+        .filter(|command| {
+            !matches!(
+                command,
+                Command::Record {
+                    kind: RecordKind::ObservationDropped
+                }
+            )
+        })
+        .collect()
+}
+
+fn drop_record_count(steps: &[StepRecord]) -> usize {
+    flattened_commands(steps)
+        .iter()
+        .filter(|command| {
+            matches!(
+                command,
+                Command::Record {
+                    kind: RecordKind::ObservationDropped
+                }
+            )
+        })
+        .count()
+}
+
+/// Whether this step was one of the injected stale observations: the model had
+/// opened a turn and the observation was stamped older.
+fn is_injected_stale(step: &StepRecord) -> bool {
+    step.before.turn >= 1 && step.observation.turn < step.before.turn
+}
+
+#[test]
+fn late_finals_replay_to_the_same_commands_and_count_as_dropped() {
+    // Arrange: the base run, then the same run with three late finals for the
+    // previous turn inserted.
+    let trace = scripted_trace();
+    let base = replay(&trace);
+    let injections = [
+        (4, 0, 0), // before ReplyStarted on turn 1: turn 0 is now superseded
+        (8, 0, 0), // before the second FinalTranscript: turn 0 still superseded
+        (9, 1, 3), // before ReplyStarted on turn 2: turn 1 is now superseded
+    ];
+    let injected = replay(&inject_late_finals(&trace, &injections));
+
+    // Act
+    let base_commands = without_drop_records(&flattened_commands(&base.steps));
+    let injected_commands = without_drop_records(&flattened_commands(&injected.steps));
+    let drops = drop_record_count(&injected.steps);
+
+    // Assert
+    assert_eq!(
+        injected_commands, base_commands,
+        "filtering the drop records must leave the base command sequence intact"
+    );
+    assert_eq!(
+        drops,
+        injections.len(),
+        "each injected late final must contribute exactly one ObservationDropped"
+    );
+    assert_eq!(
+        injected.model.dropped,
+        u64::try_from(injections.len()).expect("the injection count fits in u64"),
+        "the final dropped counter must equal the number of late finals"
+    );
+    assert_eq!(
+        injected.model.state, base.model.state,
+        "state must be unchanged"
+    );
+    assert_eq!(
+        injected.model.turn, base.model.turn,
+        "turn must be unchanged"
+    );
+    assert_eq!(
+        injected.model.generation, base.model.generation,
+        "generation must be unchanged"
+    );
+    assert_eq!(
+        injected.model.accepted, base.model.accepted,
+        "accepted must be unchanged"
+    );
+    assert_eq!(
+        injected.model.ignored, base.model.ignored,
+        "ignored must be unchanged"
+    );
+    assert_eq!(
+        injected.model.rejected, base.model.rejected,
+        "rejected must be unchanged"
+    );
+    assert_eq!(
+        injected.model.ducked, base.model.ducked,
+        "duck flag must be unchanged"
+    );
+
+    // Every injected step is drop-only: no state-transition command escapes it.
+    for step in &injected.steps {
+        if is_injected_stale(step) {
+            assert_eq!(
+                step.commands,
+                vec![Command::Record {
+                    kind: RecordKind::ObservationDropped
+                }],
+                "a late final must yield only its accounting record"
+            );
+        }
+    }
+
+    println!(
+        "replay: 11 base observations, 3 late finals injected, \
+         filtered command sequences identical ({} commands), dropped == {}",
+        base_commands.len(),
+        injected.model.dropped
+    );
+    for (index, step) in base.steps.iter().enumerate() {
+        println!(
+            "base[{index}] {:?} at ({}, {}) -> {:?}",
+            step.observation.kind,
+            step.observation.turn,
+            step.observation.generation,
+            step.commands
+        );
+    }
+}
+
+proptest! {
+    /// K late finals injected at any point where a turn is already open remove
+    /// exactly the K drop records from the command stream and leave every
+    /// other command and every other model field untouched.
+    #[test]
+    fn any_number_of_late_finals_replays_equivalently(
+        raw_positions in prop::collection::vec(any::<u64>(), 0..=8),
+    ) {
+        // Arrange
+        let trace = scripted_trace();
+        let base = replay(&trace);
+        let eligible = eligible_injection_positions(&base);
+        let eligible_len = u64::try_from(eligible.len()).expect("eligible count fits in u64");
+
+        let injections: Vec<(usize, u64, u64)> = raw_positions
+            .iter()
+            .map(|raw| {
+                let offset = usize::try_from(raw % eligible_len)
+                    .expect("an offset below the eligible count fits in usize");
+                let position = eligible[offset];
+                let before = base.steps[position].before;
+                (position, before.turn.saturating_sub(1), 0)
+            })
+            .collect();
+        let k = injections.len();
+
+        // Act
+        let injected = replay(&inject_late_finals(&trace, &injections));
+
+        // Assert
+        prop_assert_eq!(
+            without_drop_records(&flattened_commands(&injected.steps)),
+            without_drop_records(&flattened_commands(&base.steps)),
+            "the filtered command sequence must not depend on how many late finals arrive"
+        );
+        prop_assert_eq!(drop_record_count(&injected.steps), k);
+        prop_assert_eq!(
+            injected.model.dropped,
+            u64::try_from(k).expect("the injection count fits in u64")
+        );
+        prop_assert_eq!(injected.model.state, base.model.state);
+        prop_assert_eq!(injected.model.turn, base.model.turn);
+        prop_assert_eq!(injected.model.generation, base.model.generation);
+        prop_assert_eq!(injected.model.accepted, base.model.accepted);
+        prop_assert_eq!(injected.model.ignored, base.model.ignored);
+        prop_assert_eq!(injected.model.rejected, base.model.rejected);
+    }
+}
+
+#[test]
+fn a_late_final_for_the_previous_turn_is_dropped_without_a_transition() {
+    // Arrange: the model is mid-reply on turn 5, generation 8, when the final
+    // transcript for turn 4 generation 6 arrives.
+    let model = model_in(TurnState::Speaking, 5, 8, false);
+    let observation = observation_at(
+        4,
+        6,
+        ObservationKind::FinalTranscript {
+            text: "late".to_string(),
+        },
+    );
+
+    // Act
+    let (next, commands) = TurnArbiter::step(&model, observation.clone());
+
+    // Assert: the fence classifies it as superseded and only the drop counter
+    // moves; the machine does not leave `Speaking`.
+    assert_eq!(
+        model.fence_position(&observation),
+        FencePosition::Superseded,
+        "an older (turn, generation) pair must be superseded"
+    );
+    assert_eq!(
+        commands,
+        vec![Command::Record {
+            kind: RecordKind::ObservationDropped
+        }],
+        "a superseded observation emits only its accounting record"
+    );
+    assert_eq!(next.state, model.state, "state must not change");
+    assert_eq!(next.turn, model.turn, "turn must not change");
+    assert_eq!(
+        next.generation, model.generation,
+        "generation must not change"
+    );
+    assert_eq!(next.ducked, model.ducked, "duck flag must not change");
+    assert_eq!(next.accepted, model.accepted, "accepted must not change");
+    assert_eq!(next.ignored, model.ignored, "ignored must not change");
+    assert_eq!(next.rejected, model.rejected, "rejected must not change");
+    assert_eq!(
+        next.dropped,
+        model.dropped.saturating_add(1),
+        "only the drop counter moves"
+    );
+}
+
+#[test]
+fn the_fence_not_the_observation_kind_decides_a_drop() {
+    // Arrange: same model, same observation kind twice — once current, once
+    // stale. `FinalTranscript` has no legal row from `Speaking`, so the current
+    // observation reaches the legality branch and the stale one does not.
+    let model = model_in(TurnState::Speaking, 5, 8, false);
+    let kind = ObservationKind::FinalTranscript {
+        text: "transcript".to_string(),
+    };
+    let current = observation_at(model.turn, model.generation, kind.clone());
+    let stale = observation_at(4, 6, kind);
+
+    // Act
+    let (_, current_commands) = TurnArbiter::step(&model, current);
+    let (_, stale_commands) = TurnArbiter::step(&model, stale);
+
+    // Assert
+    assert_eq!(
+        current_commands,
+        vec![Command::Record {
+            kind: RecordKind::IllegalTransition
+        }],
+        "a current transcript in `Speaking` is rejected by the legality branch"
+    );
+    assert_eq!(
+        stale_commands,
+        vec![Command::Record {
+            kind: RecordKind::ObservationDropped
+        }],
+        "the same kind is dropped when the fence says it is stale"
+    );
+}
+
+#[test]
+fn a_current_final_transcript_still_opens_a_turn() {
+    // Arrange: the same `(turn, generation)` fence as the late-final test, but
+    // in a state where `FinalTranscript` is legal, so the observation kind is
+    // what produces `StartGeneration`.
+    let model = model_in(TurnState::Listening, 5, 8, false);
+    let observation = observation_at(
+        5,
+        8,
+        ObservationKind::FinalTranscript {
+            text: "fresh".to_string(),
+        },
+    );
+
+    // Act
+    let (next, commands) = TurnArbiter::step(&model, observation.clone());
+
+    // Assert
+    assert_eq!(
+        model.fence_position(&observation),
+        FencePosition::Current,
+        "an equal (turn, generation) pair is current"
+    );
+    assert_eq!(
+        commands,
+        vec![
+            Command::StartGeneration {
+                turn: 6,
+                generation: 9,
+            },
+            Command::EmitTurnEvent {
+                kind: TurnEventKind::FinalTranscript,
+            },
+            Command::Record {
+                kind: RecordKind::TurnOpened,
+            },
+        ],
+        "a current final transcript opens the next turn"
+    );
+    assert_eq!(next.turn, 6, "the turn must advance");
+    assert_eq!(next.generation, 9, "the generation must advance");
+    assert_eq!(next.dropped, 0, "nothing was dropped");
+}
+
+#[test]
+fn a_newer_observation_is_recorded_and_rejected_without_a_transition() {
+    // Arrange: the model is on turn 2 generation 7; the observation belongs to
+    // turn 3 generation 9.
+    let model = model_in(TurnState::Listening, 2, 7, false);
+    let observation = observation_at(
+        3,
+        9,
+        ObservationKind::FinalTranscript {
+            text: "future".to_string(),
+        },
+    );
+
+    // Act
+    let (next, commands) = TurnArbiter::step(&model, observation.clone());
+
+    // Assert: a newer observation is recorded, never silently dropped, and the
+    // machine stays put.
+    assert_eq!(
+        model.fence_position(&observation),
+        FencePosition::Ahead,
+        "a larger (turn, generation) pair is ahead"
+    );
+    assert_eq!(
+        commands,
+        vec![Command::Record {
+            kind: RecordKind::ObservationAhead
+        }],
+        "a newer observation is recorded as ahead"
+    );
+    assert_eq!(
+        next.rejected,
+        model.rejected.saturating_add(1),
+        "a newer observation counts as rejected"
+    );
+    assert_eq!(
+        next.dropped, model.dropped,
+        "a newer observation is not dropped"
+    );
+    assert_eq!(next.state, model.state, "state must not change");
+    assert_eq!(next.turn, model.turn, "turn must not change");
+    assert_eq!(
+        next.generation, model.generation,
+        "generation must not change"
+    );
+}
+
+#[test]
+fn mixed_current_and_stale_observations_keep_the_counts() {
+    // Arrange: the same deterministic drive, but every observation that can be
+    // made stale is stamped one turn behind.
+    let pool = kind_pool();
+    let pool_len = u64::try_from(pool.len()).expect("kind pool fits in u64");
+    let mut rng = Xorshift64(0x9e37_79b9_7f4a_7c15);
+    let mut model = ArbiterModel::default();
+
+    // Act + Assert
+    for step_number in 0..DRIVE_STEPS {
+        let index = usize::try_from(rng.next_u64() % pool_len).expect("index fits in usize");
+        let stale = rng.next_u64() % 2 == 1 && model.turn >= 1;
+        let (turn, generation) = if stale {
+            (model.turn.saturating_sub(1), 0)
+        } else {
+            (model.turn, model.generation)
+        };
+        let observation = Observation {
+            t_ms: step_number,
+            event_id: step_number,
+            turn,
+            generation,
+            kind: pool[index].clone(),
+        };
+
+        let (next, _commands) = TurnArbiter::step(&model, observation);
+
+        assert!(
+            next.dropped >= model.dropped,
+            "the drop counter must never decrease at step {step_number}"
+        );
+        assert_eq!(
+            next.accepted
+                .saturating_add(next.ignored)
+                .saturating_add(next.rejected)
+                .saturating_add(next.dropped),
+            step_number.saturating_add(1),
+            "every observation must be counted exactly once at step {step_number}"
+        );
+
+        model = next;
+    }
+
+    // Assert
+    assert!(
+        model.dropped > 0,
+        "the mixed drive must exercise the drop path at least once"
+    );
+    println!(
+        "mixed steps={DRIVE_STEPS} accepted={} ignored={} rejected={} dropped={}",
+        model.accepted, model.ignored, model.rejected, model.dropped
     );
 }
