@@ -175,7 +175,7 @@ dimension. This is the honest scorecard against the shipped tree:
 |---|---|---|---|
 | 1 | Transport & audio path | Typed frames over a bounded, lag-counted ring | **Implemented** — `AudioRing`, `RingStats`, `dropped_ms` |
 | 2 | Concurrency & isolation | Supervised plugin processes, multiplexed by `request_id` | **Partial** — supervision + restart backoff + id-multiplexed client exist; an opt-in bounded warm pool reuses a `reset`-capable process across sessions (`demo --sidecar --pool` runs two turns through one process and reports the pool counters on stderr), while the default still spawns one plugin process per session |
-| 3 | Turn-taking | Rust-owned FSM with composable strategies | **Partial** — explicit FSM and barge-in are real, and an opt-in adaptive endpointing decorator (`EndpointingPolicy` + `AdaptiveEndpointingVad`) sits at the VAD boundary and accepts or rejects `SpeechEnd` transitions from the trailing silence of the analysed audio. The session still transcribes the whole utterance per `run_turn`, so the decorator shapes the turn-state events and the endpoint decision at the provider boundary; it does not make STT start earlier. An opt-in false-interruption recovery (`InterruptionRecovery` + `Session::with_interruption_recovery`) retains a complete reply after a user barge-in and replays the *whole* reply when the next final transcript is short enough to be a backchannel; it has no playback cursor and never resumes partial audio. A session-level composable strategy list remains unimplemented |
+| 3 | Turn-taking | Rust-owned FSM with composable strategies | **Partial** — explicit FSM and barge-in are real, and an opt-in adaptive endpointing decorator (`EndpointingPolicy` + `AdaptiveEndpointingVad`) sits at the VAD boundary and accepts or rejects `SpeechEnd` transitions from the trailing silence of the analysed audio. The session still transcribes the whole utterance per `run_turn`, so the decorator shapes the turn-state events and the endpoint decision at the provider boundary; it does not make STT start earlier. An opt-in false-interruption recovery (`InterruptionRecovery` + `Session::with_interruption_recovery`) retains a complete reply after a user barge-in and replays it when the next final transcript is short enough to be a backchannel; the separate `PartialResume` opt-in (`Session::with_partial_audio_resume`) resumes the sequential path from an *estimated* playback position when the produced audio fits a bounded retention cap (a synthesis cut short by the barge resumes only its produced prefix), while recovery without it (and the pipelined path) still replays the whole reply through TTS. The estimate compares wall-clock elapsed time since the first emitted frame with the frames' declared durations, assuming real-time playout; there is no acknowledgement, so a buffering transport under-skips and the cursor never passes the produced frames. Opting in keeps the default emission cadence (no ring-window batching). A session-level composable strategy list remains unimplemented |
 | 4 | Provider abstraction | One small interface per modality + versioned manifest | **Implemented** — traits, `ProviderManifest`, registry lookup |
 | 5 | State & context | Rust-owned `ChatContext`, bounded policy | **Implemented** — `ChatContext`/`ContextStats` bound by message count and character budget; eviction prefers non-system messages and all loss is counted. The char budget is an estimate, not a token count |
 | 6 | Failure handling | Non-fatal/fatal taxonomy, no replay after commit | **Implemented** — `ErrorClass` + `is_recoverable`; all four modalities have fallback chains (`FallbackLlm`/`FallbackTts`/`FallbackStt`/`FallbackVad`) that switch only on a pre-commit `Transient`/`Capacity` failure and never after a provider has committed output; the reply side also has opt-in retry-with-backoff (`RetryPolicy` + `RetryingLlm`) that retries the same `LlmProvider` only on a pre-commit `Transient`/`Capacity` failure and never after a committed delta or a cancellation; and an opt-in reply-side circuit breaker (`BreakerPolicy` + `CircuitBreakingLlm`) opens after N consecutive pre-commit `Transient`/`Capacity` failures, refuses requests while open without calling the provider, and admits one half-open probe after the cool-down (success closes, failure re-opens). Breakers exist for the reply side only; they compose with the fallback chains by wrapping a chain as the inner provider |
@@ -255,11 +255,31 @@ What remains open:
   completely known retains that reply, and the next turn replays it instead of
   calling the LLM when its final transcript is short enough to be a backchannel
   (the test is a trimmed character threshold, not a model, and
-  `Session::recovery_stats` reports retained/resumed/discarded counts). The
-  honest limits are that the **whole** retained reply is replayed — the user may
-  hear a sentence twice — and recovery is impossible when the reply was
-  interrupted during the LLM stream: there is no playback acknowledgement or
-  cursor, so no partial-audio resume. Early-start STT, streaming audio intake,
+  `Session::recovery_stats` reports retained/resumed/discarded counts).
+  Partial-audio resume is a second opt-in on top of it (`PartialResume` +
+  `Session::with_partial_audio_resume`): when the sequential path's *produced*
+  frames fit the bounded retention cap and the estimated playback position had
+  not reached their end, the backchannel turn emits only the produced frames
+  after that position — no LLM call, no TTS call, no duplicate audio and no
+  repeated `ReplyDelta` — while an over-long reply (cap exceeded) or an
+  exhausted position falls back to the text-only whole-reply replay. The
+  position is an estimate, not an acknowledgement: the session compares the
+  wall-clock elapsed time since the first emitted frame with the frames'
+  declared durations, assuming the transport starts playing each frame in real
+  time on receipt. A transport that buffers far ahead of real time makes the
+  estimate late, so it under-skips (the user may hear a frame twice) but the
+  cursor can never pass the produced frames; with no emitted frame it is zero.
+  Emission cadence is unchanged from the policy-off path: every produced frame
+  is pushed to the bounded playout ring and drained immediately, with no
+  ring-window deferral, so both paths emit the same `AudioOut` sequence. Only
+  produced frames can be resumed: when the barge-in cut synthesis short, the
+  unproduced remainder of the reply's audio never exists on either turn, so the
+  resume plays the produced prefix's tail and then ends while
+  `TurnReport.reply` stays the full LLM reply. Recovery without the option, and
+  the pipelined path, still replay text. The remaining honest limits are that a
+  reply longer than the cap replays in full, that a truncated synthesis resumes
+  only its produced prefix, and that recovery is impossible when the reply was
+  interrupted during the LLM stream. Early-start STT, streaming audio intake,
   multi-chunk utterances, and a session-level composable strategy list remain
   unimplemented.
 - Turn spans and turn metrics exist but are opt-in: `cargo build -p
