@@ -14,7 +14,10 @@ use parlevox_core::ParlevoxError;
 /// Opt-in OTLP/HTTP trace export, enabled by the `otlp` cargo feature.
 #[cfg(feature = "otlp")]
 pub mod export;
-use parlevox_providers::{FakeVad, LlmProvider, SttProvider, TtsProvider};
+use parlevox_providers::{
+    default_layers, FakeVad, LlmProvider, ProviderDescriptor,
+    ProviderRegistry as DescriptorRegistry, SttProvider, TtsProvider,
+};
 use parlevox_runtime::{
     demo_utterance, ProviderNames, ProviderRegistry, Providers, Session, SessionConfig,
     SessionEvent, TurnReport,
@@ -189,6 +192,21 @@ pub async fn run_args() -> Result<(), ParlevoxError> {
         }
         [command, flag] if command == "demo" && flag == "--fake" => demo_fake().await,
         [command, flag] if command == "demo" && flag == "--sidecar" => demo_sidecar().await,
+        [command, subcommand] if command == "providers" && subcommand == "list" => providers_list(),
+        [command, subcommand, name] if command == "providers" && subcommand == "describe" => {
+            providers_describe(name)
+        }
+        [command, flag] if command == "providers" && (flag == "--help" || flag == "-h") => {
+            providers_usage();
+            Ok(())
+        }
+        [command, rest @ ..] if command == "providers" => {
+            providers_usage();
+            Err(ParlevoxError::Protocol(format!(
+                "unrecognised providers arguments: {}",
+                rest.join(" ")
+            )))
+        }
         [flag] if flag == "--help" || flag == "-h" => {
             usage();
             Ok(())
@@ -208,6 +226,140 @@ pub fn usage() {
     eprintln!("       parlevox demo --sidecar");
     eprintln!("       parlevox demo --sidecar --pool");
     eprintln!("note: demo --fake --pool is rejected; --pool requires --sidecar");
+}
+
+/// Print usage for the `providers` subcommands.
+pub fn providers_usage() {
+    println!("usage: parlevox providers list");
+    println!("       parlevox providers describe <name>");
+    println!(
+        "note: descriptors come from config/providers, PARLEVOX_PROVIDER_DIRS \
+         and $PARLEVOX_HOME/providers"
+    );
+}
+
+fn providers_list() -> Result<(), ParlevoxError> {
+    let registry = DescriptorRegistry::load(&default_layers())?;
+    print!("{}", render_list(&registry));
+    Ok(())
+}
+
+fn providers_describe(name: &str) -> Result<(), ParlevoxError> {
+    let registry = DescriptorRegistry::load(&default_layers())?;
+    let entry = registry.find(name)?;
+    let api_key_present = entry
+        .descriptor
+        .api_key_env
+        .as_deref()
+        .is_some_and(|variable| std::env::var_os(variable).is_some());
+    print!("{}", render_describe(&entry.descriptor, api_key_present));
+    Ok(())
+}
+
+/// Render one tab-separated row per descriptor: name, modality, tier, adapter
+/// kind and the file it was loaded from, sorted by modality then name.
+#[must_use]
+pub fn render_list(registry: &DescriptorRegistry) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    for entry in registry.all() {
+        let descriptor = &entry.descriptor;
+        let _ = writeln!(
+            out,
+            "{}\t{}\tdescriptor\t{}\t{}",
+            descriptor.name,
+            descriptor.modality.as_str(),
+            adapter_kind(descriptor),
+            entry.source.display()
+        );
+    }
+    out
+}
+
+/// Render a descriptor for humans.
+///
+/// `api_key_present` only says whether the variable named by `api_key_env` is
+/// set; its value is never read into this output.
+#[must_use]
+pub fn render_describe(descriptor: &ProviderDescriptor, api_key_present: bool) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "provider: {}", descriptor.name);
+    let _ = writeln!(out, "modality: {}", descriptor.modality.as_str());
+    let _ = writeln!(out, "tier: descriptor");
+    let _ = writeln!(out, "protocol_version: {}", descriptor.protocol_version);
+    match &descriptor.adapter.endpoint {
+        Some(endpoint) => {
+            let _ = writeln!(
+                out,
+                "adapter: {} endpoint={endpoint}",
+                adapter_kind(descriptor)
+            );
+        }
+        None => {
+            let _ = writeln!(out, "adapter: {}", adapter_kind(descriptor));
+        }
+    }
+    match &descriptor.api_key_env {
+        Some(variable) => {
+            let state = if api_key_present {
+                "<set>"
+            } else {
+                "<missing>"
+            };
+            let _ = writeln!(out, "api_key_env: {variable} {state}");
+        }
+        None => {
+            let _ = writeln!(out, "api_key_env: <none>");
+        }
+    }
+    let _ = writeln!(out, "capabilities: {}", joined(&descriptor.capabilities));
+    let _ = writeln!(
+        out,
+        "provider_limits: max_concurrency={} max_inflight={}",
+        optional(descriptor.provider_limits.max_concurrency),
+        optional(descriptor.provider_limits.max_inflight)
+    );
+    let _ = writeln!(out, "models:");
+    for model in &descriptor.models {
+        let _ = writeln!(out, "  - id: {}", model.id);
+        let _ = writeln!(out, "    display_name: {}", model.display_name);
+        let _ = writeln!(out, "    capabilities: {}", joined(&model.capabilities));
+        let _ = writeln!(
+            out,
+            "    limits: max_input_tokens={} sample_rates={:?} channels={:?}",
+            optional(model.limits.max_input_tokens),
+            model.limits.sample_rates,
+            model.limits.channels
+        );
+    }
+    let _ = writeln!(out, "config_schema:");
+    out.push_str(&descriptor.config_schema_json());
+    out.push('\n');
+    out
+}
+
+fn adapter_kind(descriptor: &ProviderDescriptor) -> &str {
+    let kind = descriptor.adapter.kind.trim();
+    if kind.is_empty() {
+        "<none>"
+    } else {
+        kind
+    }
+}
+
+fn joined(items: &[String]) -> String {
+    if items.is_empty() {
+        "<none>".to_owned()
+    } else {
+        items.join(", ")
+    }
+}
+
+fn optional(value: Option<u32>) -> String {
+    value.map_or_else(|| "<unset>".to_owned(), |value| value.to_string())
 }
 
 /// Run one turn with the in-process fakes and render it.

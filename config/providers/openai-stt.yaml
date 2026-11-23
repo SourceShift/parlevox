@@ -1,0 +1,29 @@
+name: openai-stt
+modality: stt
+protocol_version: 2
+adapter:
+  kind: openai-audio-stt
+  endpoint: https://api.openai.com/v1/audio/transcriptions
+api_key_env: OPENAI_API_KEY
+capabilities:
+  - transcription
+  - language-detection
+models:
+  - id: whisper-1
+    display_name: Whisper v1
+    capabilities:
+      - transcription
+      - language-detection
+    limits:
+      sample_rates: [8000, 16000, 24000]
+      channels: [1]
+provider_limits:
+  max_concurrency: 4
+  max_inflight: 16
+config_schema:
+  type: object
+  properties:
+    language:
+      type: string
+    prompt:
+      type: string

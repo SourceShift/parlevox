@@ -1,0 +1,35 @@
+name: openai-llm
+modality: llm
+protocol_version: 2
+adapter:
+  kind: openai-compatible-chat
+  endpoint: https://api.openai.com/v1/chat/completions
+api_key_env: OPENAI_API_KEY
+capabilities:
+  - streaming
+  - tools
+models:
+  - id: gpt-4o-mini
+    display_name: GPT-4o mini
+    capabilities:
+      - streaming
+      - tools
+      - json-mode
+    limits:
+      max_input_tokens: 128000
+      sample_rates: []
+      channels: []
+provider_limits:
+  max_concurrency: 8
+  max_inflight: 64
+config_schema:
+  type: object
+  properties:
+    model:
+      type: string
+    temperature:
+      type: number
+    max_tokens:
+      type: integer
+  required:
+    - model

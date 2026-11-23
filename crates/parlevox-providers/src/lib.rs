@@ -10,15 +10,18 @@
 //! runtime tests deterministic and Python-free.
 
 pub mod breaker;
+pub mod descriptor;
 pub mod endpointing;
 pub mod fakes;
 pub mod fallback;
 pub mod manifest;
+pub mod registry;
 pub mod retry;
 pub mod stream;
 pub mod traits;
 
 pub use breaker::{BreakerPolicy, BreakerStats, CircuitBreakingLlm};
+pub use descriptor::{load_dir, ProviderDescriptor};
 pub use endpointing::{AdaptiveEndpointingVad, EndpointingPolicy, EndpointingStats};
 pub use fakes::{
     FakeLlm, FakeStt, FakeTts, FakeVad, ProviderCall, ProviderCallLog, FAKE_CHANNELS,
@@ -28,7 +31,12 @@ pub use fakes::{
 pub use fallback::{
     FallbackLlm, FallbackStats, FallbackStatsSnapshot, FallbackStt, FallbackTts, FallbackVad,
 };
-pub use manifest::{Modality, ProviderManifest};
+pub use manifest::{
+    AdapterKind, AdapterRef, Modality, ModelEntry, ModelLimits, ProviderLimits, ProviderManifest,
+};
+pub use registry::{
+    default_layers, meets_requirements, ProviderEntry, ProviderRegistry, Requirements,
+};
 pub use retry::{RetryPolicy, RetryStats, RetryingLlm};
 pub use stream::cancelable_stream;
 pub use traits::{

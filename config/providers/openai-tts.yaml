@@ -1,0 +1,29 @@
+name: openai-tts
+modality: tts
+protocol_version: 2
+adapter:
+  kind: openai-audio-tts
+  endpoint: https://api.openai.com/v1/audio/speech
+api_key_env: OPENAI_API_KEY
+capabilities:
+  - streaming
+  - cancel
+models:
+  - id: gpt-4o-mini-tts
+    display_name: GPT-4o mini TTS
+    capabilities:
+      - streaming
+      - steerable
+    limits:
+      sample_rates: [24000]
+      channels: [1]
+provider_limits:
+  max_concurrency: 8
+  max_inflight: 32
+config_schema:
+  type: object
+  properties:
+    voice:
+      type: string
+    format:
+      type: string
