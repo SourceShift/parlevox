@@ -55,7 +55,7 @@ MAX_CANCELLED = 256
 #: select. ``vad`` has no real adapter in this slice.
 _SUPPORTED_ADAPTERS = {
     "stt": {"fake", "openai", "deepgram", "assemblyai"},
-    "llm": {"fake", "openai"},
+    "llm": {"fake", "openai", "anthropic"},
     "tts": {"fake", "openai", "elevenlabs", "cartesia"},
     "vad": {"fake"},
 }
@@ -264,6 +264,10 @@ class Plugin:
             from .adapters.openai_llm import OpenAILlm
 
             llm = OpenAILlm(environ=env)
+        elif selection.get("llm") == "anthropic":
+            from .adapters.anthropic_llm import AnthropicLlm
+
+            llm = AnthropicLlm(environ=env)
         if selection.get("tts") == "openai":
             from .adapters.openai_tts import OpenAITTS
 

@@ -2,12 +2,14 @@
 
 ``base`` owns errors, credential resolution, cancellation and transports, plus
 the shared ``wav_container`` every speech adapter uploads through. The
-OpenAI-wire family adds the chat, transcription and speech adapters; the vendor
-adapters add Deepgram and AssemblyAI transcription plus ElevenLabs and
-Cartesia speech. Every module here is standard library only and import-safe
-without credentials or a network.
+OpenAI-wire family adds the chat, transcription and speech adapters; the
+Anthropic adapter speaks the Messages wire; the vendor adapters add Deepgram
+and AssemblyAI transcription plus ElevenLabs and Cartesia speech. Every module
+here is standard library only and import-safe without credentials or a
+network.
 """
 
+from .anthropic_llm import AnthropicLlm
 from .assemblyai_stt import AssemblyAISTT
 from .base import (
     DEFAULT_BASE_URL_OPENAI,
@@ -40,6 +42,7 @@ from .openai_tts import OpenAITTS
 __all__ = [
     "AdapterConfigError",
     "AdapterError",
+    "AnthropicLlm",
     "AssemblyAISTT",
     "CancelToken",
     "CartesiaTTS",

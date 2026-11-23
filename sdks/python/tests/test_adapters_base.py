@@ -1,7 +1,6 @@
 """Adapter base invariants: classification, retries, redaction, no sockets."""
 
 import http.client
-import json
 import threading
 import time
 import traceback

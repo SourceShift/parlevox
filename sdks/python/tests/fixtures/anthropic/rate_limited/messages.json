@@ -1,0 +1,14 @@
+{
+  "method": "POST",
+  "path": "/v1/messages",
+  "responses": [
+    {
+      "status": 429,
+      "headers": {
+        "content-type": "application/json",
+        "retry-after": "0"
+      },
+      "chunks": []
+    }
+  ]
+}
