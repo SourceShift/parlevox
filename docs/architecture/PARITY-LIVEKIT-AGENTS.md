@@ -16,7 +16,7 @@ Python SDK, 88 plugin packages). All anchors below are relative to
 |---|---|---|---|
 | `AgentSession` orchestration | `voice/agent_session.py` | `Session` + `run_turn` (Rust) | Python SDK surface (E3) |
 | `Agent` instructions + tools | `voice/agent.py` | prompt in `SessionConfig` | agent object, per-turn overrides (E3) |
-| Turn model: endpointing, barge-in, false interruption | `voice/endpointing.py`, `voice/agent_activity.py` | **implemented** (closed FSM, recovery, partial resume, turn strategies) | none — advantage |
+| Turn model: endpointing, barge-in, false interruption | `voice/endpointing.py`, `voice/agent_activity.py` | **implemented** (closed FSM, recovery, partial resume, turn strategies) | stated contract, conformance and replay (E10) |
 | STT/LLM/TTS contracts + 88 plugins | `plugin.py`, `livekit-plugins/*` | plugin protocol + sidecar process supervision | **zero real adapters** (E1) |
 | Room I/O: participant audio in/out | `voice/room_io/` | none | **no transport at all** (E2) |
 | Function tools, `function_tool`, `ToolContext`, `StopResponse` | `llm/tool_context.py` | none | tool loop + SDK decorator (E4) |
@@ -29,109 +29,37 @@ Python SDK, 88 plugin packages). All anchors below are relative to
 
 ## 2. Epics
 
-**E1 — Real provider adapters** (Python, through the sidecar).
-One streaming-adapter base in `sdks/python` (env-keyed auth, bounded retries
-mapped onto the existing `ErrorClass` taxonomy, fixture-injectable transport),
-then: STT Deepgram / OpenAI / AssemblyAI; TTS ElevenLabs / Cartesia / OpenAI;
-LLM OpenAI-compatible / Anthropic. Each adapter is one module + manifest + a
-fixture test; a live call is opt-in behind the provider's key env var.
+Delivery is tracked in [`EPICS.md`](EPICS.md), which is machine-ingestible by
+`mini-ork epics` (one `##` heading per epic, dependency edges as
+`- depends on:` lines, dependency graph under its `(context)` section). Each
+epic's specification lives in [`epics/`](epics/) and is the source of record;
+this roadmap carries the parity narrative and the sequencing, not the detail.
 
-**E1b — Adapter ecosystem (the distribution asset).**
-E1 produces adapters; E1b makes them a *network* rather than a product.
-LiveKit's adoption advantage is not the plugin count, it is that the provider
-a team already pays for works without leaving the framework. The primitives
-are already in the tree — the four modality traits and a `ProviderManifest`
-with `name`/`modality`/`capabilities`/`config_schema` — so the gap is
-distribution plumbing, not design:
+| Epic | One-line intent | Detail |
+|---|---|---|
+| E1 | Real provider adapters in Python, reached through the sidecar | [e1](epics/e1-real-provider-adapters.md) |
+| E1b | Adapter ecosystem: registry, packaging, conformance, BYO creds | [e1b](epics/e1b-adapter-ecosystem.md) |
+| E2 | Transports: WS PCM, LiveKit-room bridge, Twilio Media Streams | [e2](epics/e2-transports.md) |
+| E3 | Agent SDK ergonomics: `AgentSession`/`Agent`/`RunContext`, console | [e3](epics/e3-agent-sdk.md) |
+| E4 | Tool calling: bounded loop, `@function_tool`, tool events | [e4](epics/e4-tool-calling.md) |
+| E5 | Multi-agent handoff: registry, `Handoff` event, context carry-over | [e5](epics/e5-agent-handoff.md) |
+| E6 | Worker and job model: dispatch, concurrency, warm pool, drain | [e6](epics/e6-worker-job-model.md) |
+| E7 | Public event stream parity and usage API | [e7](epics/e7-event-stream.md) |
+| E8 | Full-duplex / early-start STT — the one architectural gap | [e8](epics/e8-full-duplex.md) |
+| E9 | Proof: benchmark harness, published numbers | [e9](epics/e9-benchmarks.md) |
+| E10 | Turn semantics: stated contract, pure arbiter, conformance, replay | [e10](epics/e10-turn-semantics.md) |
 
-- **Registry**: a name→constructor map plus `parlevox providers list|describe`.
-  `describe` renders the manifest's `config_schema`, so required keys and
-  defaults are discoverable without docs.
-- **Packaging**: one crate (or one sidecar module) per vendor. A third party
-  adds *their* provider without touching the runtime or the turn machine —
-  the manifest doc comment already promises this; the packaging has to make
-  it true.
-- **Conformance kit**: one suite every adapter must pass — partials then one
-  final, cancellation propagates, errors classified into the existing
-  `ErrorClass` taxonomy, dropped-frame accounting, empty-text synthesis
-  refused. This is what lets contributions be self-verifying instead of
-  review-bound.
-- **BYO credentials**: env + config resolution with a preflight that *probes
-  entitlement*, not mere key presence (a lane whose subscription lapsed passes
-  a presence check and 403s at first dispatch).
-- **Manifest protocol version**: so an older plugin fails loudly instead of
-  misbehaving silently.
+Two specifications sit under epics rather than duplicating prose here:
+[`PROVIDER-FOUNDATION-REQUIREMENTS.md`](PROVIDER-FOUNDATION-REQUIREMENTS.md)
+(E1b's three support tiers, requirements and phases — **F0 is the gate**: a
+provider addable with zero Rust code) and
+[`TURN-SEMANTICS-REQUIREMENTS.md`](TURN-SEMANTICS-REQUIREMENTS.md) (E10's
+TS-1…TS-12, metrics M1–M6 and the target state graph).
 
-Priority tiers by "what a team already pays for": STT Deepgram / AssemblyAI /
-OpenAI-Whisper; TTS ElevenLabs / Cartesia / OpenAI / Azure; LLM
-OpenAI-compatible / Anthropic / Bedrock / Vertex; VAD Silero. Roughly eleven
-adapters cover the majority of LiveKit deployments — breadth here is worth
-more than any single transport feature.
-
-The foundation is specified in
-[`PROVIDER-FOUNDATION-REQUIREMENTS.md`](PROVIDER-FOUNDATION-REQUIREMENTS.md):
-three support tiers (descriptor / connector / sidecar), fifteen technical and
-ten product requirements, and four phases. **F0 is the gate**: manifest v2, a
-descriptor loader, an HTTP connector for the OpenAI-compatible family, a
-registry with `providers list|describe`, and a no-patching test — proving a
-provider can be added with zero Rust code before any breadth work starts.
-
-**E2 — Transports.**
-(a) WebSocket PCM transport: binary 24 kHz s16le mono in/out, JSON control,
-one session per connection, bounded ingress with counted drops.
-(b) LiveKit-room bridge (optional cargo feature): join a room, subscribe the
-mic, publish the TTS track. Interop, not replacement.
-(c) Twilio Media Streams over the same WS transport (μ-law 8 kHz resample).
-
-**E3 — Agent SDK ergonomics.**
-Python `AgentSession` / `Agent` / `RunContext` mirroring `livekit.agents`
-naming, plus `parlevox console` and `parlevox run` wiring the WS transport to
-the Rust session. Migration should be a rename, not a rewrite.
-
-**E4 — Tool calling.**
-Tool schemas through the LLM call, a bounded tool-call loop in Rust (max
-rounds, timeout, error → tool output), `@function_tool` in Python, and
-`ToolCallStarted/Updated/Ended`-shaped events on the public stream.
-
-**E5 — Multi-agent handoff.**
-Agent registry in the session, `Handoff` event, context carry-over into the
-next agent's instructions, Python `Agent(handoff=...)` ergonomics.
-
-**E6 — Worker and job model.**
-Single-node `AgentServer` equivalent: job dispatch, `--concurrency`, warm
-plugin pool sized from concurrency and p95 turn latency (closes DESIGN
-dimension 9), drain on SIGTERM, `/healthz`.
-
-**E7 — Public event stream parity.**
-Transport-delivered typed events (`user_input_transcribed`, `speech_created`,
-`agent_state_changed`, `function_tools_executed`, `usage_updated`) and a
-usage/`TurnReport` API; child plugin spans and loop-stall detection
-(dimension 7).
-
-**E8 — Full-duplex / early-start STT.**
-Streaming intake that feeds STT while the user speaks, interim transcripts,
-speculative start on stable prefixes. The one genuinely architectural gap.
-
-**E9 — Proof.**
-Benchmark harness: per-stage latency (VAD-end → STT-final → LLM-first-token →
-TTS-first-byte → first `AudioOut`), p50/p95 at 1/10/50 concurrent sessions,
-RSS per session. Numbers are published, not asserted.
-
-```mermaid
-graph LR
-  E1[E1 adapters] --> E1b[E1b ecosystem]
-  E1b --> E3[E3 agent SDK]
-  E2[E2 transports] --> E3
-  E3 --> E4[E4 tools]
-  E3 --> E5[E5 handoff]
-  E3 --> E6[E6 worker]
-  E2 --> E7[E7 events]
-  E1 --> E9[E9 benchmarks]
-  E2 --> E9
-  E3 --> E8[E8 duplex]
-  E2 --> E8
-  E6 --> E8
-```
+The dependency graph lives in
+[`EPICS.md#dependency-graph-context`](EPICS.md#dependency-graph-context) so it
+is read from the same file the tracker ingests, and cannot drift from the
+edges that gate dispatch.
 
 ## 3. Migration map
 
@@ -152,10 +80,15 @@ worker works.
 
 ## 5. Sequencing and operating model
 
+Dispatch order is read from [`EPICS.md`](EPICS.md), not from this section:
+`mini-ork epics ready` returns the epics whose hard edges are satisfied.
 Deliverables are developed in **separate git worktrees**, one deliverable per
 worktree, so two epics never share a working tree. Land order: E2(a) → E1 → E3, then
-E4/E5/E6 fan out; E9 after E2(a)+E1. Estimates: E2(a) 1–2 runs, E1 4 runs,
-E3 2–3 runs, E4 2–3 runs, E5 1–2, E6 2–3, E7 2, E9 1–2, E8 3–4.
+E4/E5/E6 fan out; E9 after E2(a)+E1. E10 is split: T0–T1 (contract, envelope,
+recorder, pure arbiter, replay) are runtime-local and can start immediately;
+T2–T3 wait for E8 and E1. Estimates: E2(a) 1–2 runs, E1 4 runs,
+E3 2–3 runs, E4 2–3 runs, E5 1–2, E6 2–3, E7 2, E9 1–2, E8 3–4, E10 6–10 runs
+across four phases.
 
 Provider work interleaves rather than waits: **F0** (descriptor + HTTP +
 registry, 1–2 runs) has no dependency on transports and should land alongside

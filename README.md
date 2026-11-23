@@ -115,9 +115,15 @@ Tests are hermetic: no network, no API keys, no installed Python package.
   backpressure, half-duplex v0.
 - [`docs/architecture/PARITY-LIVEKIT-AGENTS.md`](docs/architecture/PARITY-LIVEKIT-AGENTS.md)
   — the LiveKit Agents parity target: surface map, epics, and non-goals.
+- [`docs/architecture/EPICS.md`](docs/architecture/EPICS.md) — the epic index
+  the delivery tracker ingests (`mini-ork epics`), with one file per epic under
+  [`docs/architecture/epics/`](docs/architecture/epics/).
 - [`docs/architecture/PROVIDER-FOUNDATION-REQUIREMENTS.md`](docs/architecture/PROVIDER-FOUNDATION-REQUIREMENTS.md)
   — how a provider is supported with a descriptor, a connector, or a sidecar
   module, and never by patching the framework.
+- [`docs/architecture/TURN-SEMANTICS-REQUIREMENTS.md`](docs/architecture/TURN-SEMANTICS-REQUIREMENTS.md)
+  — the stated turn contract, the pure arbiter, adapter conformance and the
+  replay harness that make turn semantics provable rather than asserted.
 
 ## Roadmap (v0.1+)
 
