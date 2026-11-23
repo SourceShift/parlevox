@@ -154,7 +154,94 @@ If a document is only meaningful to the people operating this machine, it lives
 in one of those directories. If it should be readable by a contributor, it lives
 in `docs/` and is scrubbed to the rules above.
 
-## 8. Before you push
+## 8. Delivery: branch, rebase, merge to `main`, push
+
+`main` is the only long-lived branch and the only line of truth. A change is
+finished when it is **on `main` and pushed**, not when it is committed on a
+side branch. Leaving work on a local branch, or leaving local `main` ahead of
+`origin/main`, strands it exactly where no one looks.
+
+```bash
+git switch -c <type>/<slug>                  # short-lived; a worktree if other sessions are active
+git add <file1> <file2>                      # explicit paths
+git fetch origin main --quiet
+git rebase origin/main                       # a few minutes is enough for another commit to land
+git diff --name-only origin/main             # scope assertion below
+git switch main
+git merge --ff-only <branch>                 # no merge commits on main
+git branch -d <branch>
+git push origin main
+```
+
+- **Finish the loop without being asked.** Commit, rebase, ff-merge, push — for
+  docs exactly as for code. Do not stop at "committed on a branch".
+- **Stage explicit paths, never `git add -A`.** This tree is shared: `-A`
+  sweeps another session's in-flight work into your commit, and mistakes made
+  that way are public once pushed.
+- **Scope assertion.** `git diff --name-only origin/main` must list only files
+  your task touched. A deletion of a file you never authored means a stale
+  base — rebase; do not merge over it.
+- **If `--ff-only` refuses**, the two histories have diverged: either your
+  branch no longer descends from `main` (a commit landed while you worked), or
+  local `main` carries commits `origin/main` does not. Fetch, rebase your branch
+  onto `main`, and retry. A refusal means *investigate*: never "fix" it with
+  `reset --hard`, a plain merge that discards intent, or a force push.
+- **Batch fix-loops.** Every push to `main` is public; land one reviewed unit,
+  not five "wip" commits.
+- **No shadow paths.** Before 1.0 there is no compatibility contract to keep:
+  when a new path replaces an old one, delete the old one in the same commit. A
+  flag that keeps both alive is a second thing to maintain and a second thing
+  to test.
+
+### Banned in this repository
+
+`git reset --hard` · `git clean -fdx` · `git checkout -- .` ·
+`git push --force` (to `main` at all, to any other branch without a stated
+reason) · `git commit --no-verify` as a way past a failing gate.
+
+Each of these either destroys another session's uncommitted work in the shared
+tree or rewrites public history, which §1 says cannot be undone.
+
+## 9. Working in a shared tree
+
+Several sessions may edit this checkout, and one may commit to `main` while you
+work. That is normal — rebase onto it rather than treating it as a conflict.
+
+- **Never** move, stash, rename or delete another session's files, even
+  temporarily into `/tmp`. Report what is in the way; do not clear it.
+- If the gate fails on files **you did not touch**, do not "fix" them. Commit
+  from a clean worktree off `origin/main` (the foreign uncommitted file is not
+  there, so the gate can pass) and say which files are foreign.
+- Before concluding that your own work was lost, look: `git log --all
+  --oneline`, `git status`, `git fsck --lost-found`, and the stashes. An edit
+  that "disappeared" has usually been committed by another branch or reset by
+  another session — recover it from there; do not silently rewrite it.
+
+## 10. Assertions and verification
+
+- **Never assert what a flag, env var, script or target does from its name.**
+  Read the consumer (`grep -rn <NAME>` → open it → trace it) and cite
+  `file:line`. If you have not read it, the honest answer is "let me check".
+- **Never assert a schema, route or contract fact from memory or from these
+  docs** — they drift. Link to the source and re-read it before relying on it;
+  do not paste drifting facts into this file.
+- **No silent degradation.** When a path cannot do what its contract says, it
+  fails loudly or emits a counted, observable degraded event. A documented
+  fallback chain is not silent only if the switch is reported (event, counter,
+  log with the reason).
+- **Run the checks yourself.** `cargo fmt` / `cargo clippy` / `cargo test` from
+  the gate below, plus the relevant fixture test, are the agent's job — do not
+  hand a runnable command back to the user. What stays with the user is what
+  needs their machine or credentials: starting long-lived servers, interactive
+  logins (`! <cmd>`), anything outside the repo.
+- **Fix forward.** A red gate is fixed in a new branch off latest `main`. Never
+  revert `main` to make a check green, and never mark a task done on the
+  strength of a command you have not run.
+- **Keep this file operational.** Style preferences belong in a hook;
+  situational procedures belong in `docs/` or a skill. Add a rule here only
+  when it changes what an agent *does* and no hook can catch it.
+
+### Before you push
 
 ```bash
 cargo fmt --all -- --check
