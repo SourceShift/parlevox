@@ -60,6 +60,64 @@ pub struct SpeculativeStart {
     pub min_partial_chars: usize,
 }
 
+/// Opt-in false-interruption recovery by whole-reply replay.
+///
+/// Installed with [`Session::with_interruption_recovery`]. When a *user*
+/// barge-in interrupts a turn whose reply text was completely known, the reply
+/// is retained; if the next turn's final transcript is short enough to be a
+/// backchannel, that retained reply is replayed instead of calling the LLM.
+///
+/// This is deliberately conservative. There is no playback acknowledgement, so
+/// the *whole* retained reply is replayed and the user may hear a sentence
+/// twice. Recovery happens only when the reply text was fully known; a reply
+/// interrupted during the LLM stream retains nothing. The backchannel test is a
+/// character-length heuristic, not a model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterruptionRecovery {
+    /// Maximum trimmed `chars().count()` of a final transcript that is treated
+    /// as a backchannel.
+    pub max_backchannel_chars: usize,
+}
+
+impl Default for InterruptionRecovery {
+    /// A small threshold (12 characters) intended to catch utterances such as
+    /// "mm-hmm", "okay" or "right". It is a length heuristic, not a model.
+    fn default() -> Self {
+        InterruptionRecovery {
+            max_backchannel_chars: 12,
+        }
+    }
+}
+
+/// Cumulative counters for the opt-in false-interruption recovery.
+///
+/// Obtained from [`Session::recovery_stats`]. The counters are session-wide and
+/// never part of [`TurnReport`], so a report stays constructible by existing
+/// callers. Every counter stays zero while the policy is unset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RecoveryStats {
+    /// Complete replies retained after a user barge-in.
+    pub retained: u64,
+    /// Retained replies replayed because the next transcript was a backchannel.
+    pub resumed: u64,
+    /// Retained replies dropped because the next transcript was not one.
+    pub discarded: u64,
+}
+
+/// The three cumulative recovery counters.
+#[derive(Debug, Clone, Copy, Default)]
+struct RecoveryCounters {
+    retained: u64,
+    resumed: u64,
+    discarded: u64,
+}
+
+/// A fully-known reply retained after a user barge-in, awaiting one turn.
+#[derive(Debug, Clone)]
+struct PendingReply {
+    text: String,
+}
+
 /// Tunables for one session.
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
@@ -313,6 +371,9 @@ struct PhaseInput<'a> {
     /// An already-started LLM stream adopted from a speculative request. When
     /// present the phase uses it instead of calling `generate`.
     adopted: Option<ProviderStream<String>>,
+    /// A retained reply to replay instead of calling the LLM. When present it
+    /// takes precedence over `adopted`.
+    replay: Option<String>,
     token: CancellationToken,
     generation: u64,
     baseline: TurnBaseline,
@@ -325,6 +386,10 @@ struct PhaseOutcome {
     reply: String,
     audio_frames: u64,
     interrupted: bool,
+    /// True when the complete reply text was known before the turn stopped. A
+    /// reply interrupted during the LLM stream is incomplete and cannot be
+    /// retained for replay.
+    reply_complete: bool,
 }
 
 /// Mutable state of the pipelined LLM/TTS phase.
@@ -506,6 +571,14 @@ pub struct Session {
     speculation: SpeculationCounters,
     /// Counters for the most recent turn, reset at turn start.
     speculation_turn: SpeculationCounters,
+    /// Opt-in false-interruption recovery policy. `None` disables the feature
+    /// entirely, so the default path retains and replays nothing.
+    interruption_recovery: Option<InterruptionRecovery>,
+    /// A complete reply retained after a user barge-in, consumed by exactly one
+    /// following turn.
+    pending_recovery: Option<PendingReply>,
+    /// Cumulative recovery counters, exposed through [`Session::recovery_stats`].
+    recovery: RecoveryCounters,
     /// Test-only ordered log of transitions applied through [`Session::apply`].
     /// Absent from production builds, so the default runtime and the pinned
     /// demo output carry no recorder.
@@ -590,6 +663,19 @@ impl Session {
         self
     }
 
+    /// Enable opt-in false-interruption recovery with the given policy.
+    ///
+    /// Recovery stays off by default: without this builder there is no
+    /// retention, no replay, and the turn loop is byte-identical to the one
+    /// that shipped before. The policy is session state, not
+    /// [`SessionConfig`], so `SessionConfig` stays publicly constructible
+    /// without a new field.
+    #[must_use]
+    pub fn with_interruption_recovery(mut self, policy: InterruptionRecovery) -> Self {
+        self.interruption_recovery = Some(policy);
+        self
+    }
+
     fn assemble(
         config: SessionConfig,
         providers: Providers,
@@ -645,6 +731,9 @@ impl Session {
             pipeline,
             speculation: SpeculationCounters::default(),
             speculation_turn: SpeculationCounters::default(),
+            interruption_recovery: None,
+            pending_recovery: None,
+            recovery: RecoveryCounters::default(),
             #[cfg(test)]
             transition_log: Vec::new(),
             #[cfg(feature = "otel")]
@@ -732,6 +821,21 @@ impl Session {
             turn_started: self.speculation_turn.started,
             turn_adopted: self.speculation_turn.adopted,
             turn_abandoned: self.speculation_turn.abandoned,
+        }
+    }
+
+    /// Cumulative counters for opt-in false-interruption recovery.
+    ///
+    /// Every counter stays zero while [`Session::with_interruption_recovery`]
+    /// has not been called. `retained` counts complete replies saved after a
+    /// user barge-in, `resumed` counts those replayed on a backchannel turn,
+    /// and `discarded` counts those dropped because the next transcript was
+    /// not a backchannel.
+    pub fn recovery_stats(&self) -> RecoveryStats {
+        RecoveryStats {
+            retained: self.recovery.retained,
+            resumed: self.recovery.resumed,
+            discarded: self.recovery.discarded,
         }
     }
 
@@ -914,7 +1018,7 @@ impl Session {
         let mut speech_started = false;
         while let Some(item) = vad.next().await {
             if token.is_cancelled() {
-                return self.finish_interrupted(0, 0, "", "", baseline);
+                return self.finish_interrupted(0, 0, "", "", false, baseline);
             }
             match item {
                 Ok(transition) => match transition.event {
@@ -932,7 +1036,7 @@ impl Session {
                     }
                 },
                 Err(ParlevoxError::Cancelled) => {
-                    return self.finish_interrupted(0, 0, "", "", baseline);
+                    return self.finish_interrupted(0, 0, "", "", false, baseline);
                 }
                 Err(err) => return self.fail(err),
             }
@@ -1014,7 +1118,7 @@ impl Session {
                     }
                 }
                 Err(ParlevoxError::Cancelled) => {
-                    return self.finish_interrupted(0, 0, "", "", baseline);
+                    return self.finish_interrupted(0, 0, "", "", false, baseline);
                 }
                 Err(err) => return self.fail(err),
             }
@@ -1053,41 +1157,74 @@ impl Session {
         let history = self.context.messages();
         self.context.push_user(transcript.clone());
 
+        // Resume law: consume the pending recovery exactly once, here at the
+        // commit point and before the phase. A retained reply survives only if
+        // this transcript is a short backchannel; otherwise it is dropped and
+        // counted. Taking it now is what makes a third short turn call the LLM
+        // instead of replaying a second time.
+        let replay = match self.pending_recovery.take() {
+            None => None,
+            Some(pending) => {
+                let is_backchannel = self.interruption_recovery.is_some_and(|policy| {
+                    transcript.trim().chars().count() <= policy.max_backchannel_chars
+                });
+                if is_backchannel {
+                    self.recovery.resumed = self.recovery.resumed.saturating_add(1);
+                    Some(pending.text)
+                } else {
+                    self.recovery.discarded = self.recovery.discarded.saturating_add(1);
+                    None
+                }
+            }
+        };
+
         // Decide the speculative request's fate. Adoption needs the final to
         // extend the exact partial the model saw; anything else lets the final
         // be authoritative. A dropped guard cancels the child token, so the
         // divergent provider call stops without a second unwind site.
-        let adopted = match speculation.take() {
-            None => None,
-            Some(mut spec) => {
-                if compatible(&spec.prompt, &transcript) {
-                    match spec.stream.take() {
-                        Some(stream) => {
-                            // Leave the child token alone: it is still linked
-                            // to the turn's token, so a barge-in reaches the
-                            // adopted provider call through the parent.
-                            spec.adopted = true;
-                            self.speculation.adopted = self.speculation.adopted.saturating_add(1);
-                            self.speculation_turn.adopted =
-                                self.speculation_turn.adopted.saturating_add(1);
-                            Some(stream)
+        //
+        // A replay is authoritative: any speculation started during STT is
+        // genuinely abandoned, and its guard cancels the child token on drop.
+        let adopted = if replay.is_some() {
+            if speculation.take().is_some() {
+                self.speculation.abandoned = self.speculation.abandoned.saturating_add(1);
+                self.speculation_turn.abandoned = self.speculation_turn.abandoned.saturating_add(1);
+            }
+            None
+        } else {
+            match speculation.take() {
+                None => None,
+                Some(mut spec) => {
+                    if compatible(&spec.prompt, &transcript) {
+                        match spec.stream.take() {
+                            Some(stream) => {
+                                // Leave the child token alone: it is still linked
+                                // to the turn's token, so a barge-in reaches the
+                                // adopted provider call through the parent.
+                                spec.adopted = true;
+                                self.speculation.adopted =
+                                    self.speculation.adopted.saturating_add(1);
+                                self.speculation_turn.adopted =
+                                    self.speculation_turn.adopted.saturating_add(1);
+                                Some(stream)
+                            }
+                            // A started speculation always holds its stream; treat
+                            // a missing one as an abandonment instead of panicking.
+                            None => {
+                                self.speculation.abandoned =
+                                    self.speculation.abandoned.saturating_add(1);
+                                self.speculation_turn.abandoned =
+                                    self.speculation_turn.abandoned.saturating_add(1);
+                                None
+                            }
                         }
-                        // A started speculation always holds its stream; treat
-                        // a missing one as an abandonment instead of panicking.
-                        None => {
-                            self.speculation.abandoned =
-                                self.speculation.abandoned.saturating_add(1);
-                            self.speculation_turn.abandoned =
-                                self.speculation_turn.abandoned.saturating_add(1);
-                            None
-                        }
+                    } else {
+                        // `spec` drops here and cancels the child token.
+                        self.speculation.abandoned = self.speculation.abandoned.saturating_add(1);
+                        self.speculation_turn.abandoned =
+                            self.speculation_turn.abandoned.saturating_add(1);
+                        None
                     }
-                } else {
-                    // `spec` drops here and cancels the child token.
-                    self.speculation.abandoned = self.speculation.abandoned.saturating_add(1);
-                    self.speculation_turn.abandoned =
-                        self.speculation_turn.abandoned.saturating_add(1);
-                    None
                 }
             }
         };
@@ -1103,6 +1240,7 @@ impl Session {
                     transcript: &transcript,
                     history,
                     adopted,
+                    replay,
                     token: token.clone(),
                     generation,
                     baseline,
@@ -1118,6 +1256,7 @@ impl Session {
                     transcript: &transcript,
                     history,
                     adopted,
+                    replay,
                     token: token.clone(),
                     generation,
                     baseline,
@@ -1134,6 +1273,7 @@ impl Session {
                 outcome.audio_frames,
                 &transcript,
                 &outcome.reply,
+                outcome.reply_complete,
                 baseline,
             );
         }
@@ -1211,6 +1351,7 @@ impl Session {
             transcript,
             history,
             adopted,
+            replay,
             token,
             generation,
             baseline,
@@ -1224,26 +1365,31 @@ impl Session {
         let llm_started = self.clock.now();
         #[cfg(feature = "otel")]
         let mut llm_span = trace.stage("llm", llm_started);
-        // An adopted speculation already issued the request; only a turn
-        // without one calls `generate` here.
-        let mut llm = match adopted {
-            Some(stream) => stream,
-            None => {
-                let llm_provider = Arc::clone(&self.providers.llm);
-                match llm_provider
-                    .generate(
-                        GenerateRequest {
-                            prompt: transcript.to_string(),
-                            history,
-                        },
-                        token.clone(),
-                    )
-                    .await
-                {
-                    Ok(stream) => stream,
-                    Err(err) => return self.fail(err),
+        // A replay is a fully-known reply supplied from memory, so it bypasses
+        // `generate` entirely and takes precedence over an adopted speculation.
+        // Otherwise an adopted speculation already issued the request and only
+        // a turn without one calls `generate` here.
+        let mut llm = match replay {
+            Some(text) => futures_util::stream::once(async move { Ok(text) }).boxed(),
+            None => match adopted {
+                Some(stream) => stream,
+                None => {
+                    let llm_provider = Arc::clone(&self.providers.llm);
+                    match llm_provider
+                        .generate(
+                            GenerateRequest {
+                                prompt: transcript.to_string(),
+                                history,
+                            },
+                            token.clone(),
+                        )
+                        .await
+                    {
+                        Ok(stream) => stream,
+                        Err(err) => return self.fail(err),
+                    }
                 }
-            }
+            },
         };
         let mut reply = String::new();
         let mut saw_reply_delta = false;
@@ -1297,10 +1443,13 @@ impl Session {
             ));
         }
         if interrupted {
+            // The LLM stream itself was cut short, so the reply text is
+            // partial and must never be retained for replay.
             return Ok(PhaseOutcome {
                 reply,
                 audio_frames: 0,
                 interrupted: true,
+                reply_complete: false,
             });
         }
 
@@ -1384,10 +1533,13 @@ impl Session {
             tts_span.end();
         }
         if interrupted {
+            // The LLM stream ended normally before synthesis was interrupted,
+            // so the complete reply text is known.
             return Ok(PhaseOutcome {
                 reply,
                 audio_frames,
                 interrupted: true,
+                reply_complete: true,
             });
         }
 
@@ -1395,6 +1547,7 @@ impl Session {
             reply,
             audio_frames,
             interrupted: false,
+            reply_complete: true,
         })
     }
 
@@ -1425,6 +1578,7 @@ impl Session {
             transcript,
             history,
             adopted,
+            replay,
             token,
             generation,
             baseline,
@@ -1436,26 +1590,31 @@ impl Session {
         #[cfg(feature = "otel")]
         let phase_started = self.clock.now();
 
-        // An adopted speculation already issued the request; only a turn
-        // without one calls `generate` here.
-        let mut llm = match adopted {
-            Some(stream) => stream,
-            None => {
-                let llm_provider = Arc::clone(&self.providers.llm);
-                match llm_provider
-                    .generate(
-                        GenerateRequest {
-                            prompt: transcript.to_string(),
-                            history,
-                        },
-                        token.clone(),
-                    )
-                    .await
-                {
-                    Ok(stream) => stream,
-                    Err(err) => return self.fail(err),
+        // A replay is a fully-known reply supplied from memory, so it bypasses
+        // `generate` entirely and takes precedence over an adopted speculation.
+        // Otherwise an adopted speculation already issued the request and only
+        // a turn without one calls `generate` here.
+        let mut llm = match replay {
+            Some(text) => futures_util::stream::once(async move { Ok(text) }).boxed(),
+            None => match adopted {
+                Some(stream) => stream,
+                None => {
+                    let llm_provider = Arc::clone(&self.providers.llm);
+                    match llm_provider
+                        .generate(
+                            GenerateRequest {
+                                prompt: transcript.to_string(),
+                                history,
+                            },
+                            token.clone(),
+                        )
+                        .await
+                    {
+                        Ok(stream) => stream,
+                        Err(err) => return self.fail(err),
+                    }
                 }
-            }
+            },
         };
 
         let mut state = PipelinePhaseState {
@@ -1679,6 +1838,9 @@ impl Session {
             reply,
             audio_frames: state.audio_frames,
             interrupted: state.interrupted,
+            // A pipelined reply is complete only when the LLM stream had
+            // already ended before the interrupt, not merely because audio did.
+            reply_complete: state.llm_done,
         })
     }
 
@@ -1971,6 +2133,7 @@ impl Session {
         audio_frames: u64,
         transcript: &str,
         reply: &str,
+        reply_complete: bool,
         baseline: TurnBaseline,
     ) -> Result<TurnReport, ParlevoxError> {
         // Read the cause before the next turn clears the flag: a request means
@@ -1981,6 +2144,20 @@ impl Session {
         } else {
             InterruptCause::Upstream
         };
+        // Retention law: only a user barge-in that stopped a turn whose reply
+        // text was completely known may be retained. An upstream cancellation
+        // is not the user asking to hear the reply again, and a reply cut short
+        // during the LLM stream cannot be replayed honestly.
+        if self.interruption_recovery.is_some()
+            && cause == InterruptCause::User
+            && reply_complete
+            && !reply.is_empty()
+        {
+            self.pending_recovery = Some(PendingReply {
+                text: reply.to_string(),
+            });
+            self.recovery.retained = self.recovery.retained.saturating_add(1);
+        }
         self.ensure_listening_after_interrupt(cause)?;
         // The request belongs to the turn that just unwound. Clearing it here
         // keeps the flag honest for a handle used between turns; `drive_turn`
