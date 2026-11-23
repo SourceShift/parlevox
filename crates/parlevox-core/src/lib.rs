@@ -19,6 +19,6 @@ pub use audio::{
 pub use clock::{DurationMs, MonoClock, Timestamp};
 pub use error::{ErrorClass, ParlevoxError};
 pub use turn::{
-    FloorOwner, TurnEvent, TurnEventKind, TurnMachine, TurnState, ALL_EVENT_KINDS, ALL_STATES,
-    LEGAL_TRANSITIONS,
+    AudioEmission, FloorOwner, TurnEvent, TurnEventKind, TurnMachine, TurnState, ALL_EVENT_KINDS,
+    ALL_STATES, LEGAL_TRANSITIONS,
 };

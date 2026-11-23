@@ -275,6 +275,50 @@ fn floor_ownership_matches_the_documented_contract() {
 }
 
 #[test]
+fn audio_emission_matches_the_documented_contract() {
+    // Arrange
+    let doc = read_contract();
+    let state_names = state_by_name();
+    let rows = table_rows(section(&doc, "Floor ownership"));
+    assert!(
+        !rows.is_empty(),
+        "the `## Floor ownership` table has no rows"
+    );
+
+    // Act
+    let mut documented: BTreeMap<TurnState, String> = BTreeMap::new();
+    for row in &rows {
+        assert!(
+            row.len() >= 3,
+            "a floor-ownership row must have at least three cells: {row:?}"
+        );
+        documented.insert(
+            resolve_state(&state_names, &row[0]),
+            canonical(&row[2]).to_string(),
+        );
+    }
+
+    // Assert
+    for &state in ALL_STATES {
+        let documented_emission = documented
+            .get(&state)
+            .unwrap_or_else(|| panic!("floor-ownership table does not list {state:?}"));
+        assert_eq!(
+            documented_emission,
+            state.audio_emission().label(),
+            "audio emission for {state:?} disagrees with the code"
+        );
+    }
+
+    let coded: BTreeSet<TurnState> = ALL_STATES.iter().copied().collect();
+    let documented_states: BTreeSet<TurnState> = documented.keys().copied().collect();
+    assert_eq!(
+        documented_states, coded,
+        "the floor-ownership table must list every state exactly once"
+    );
+}
+
+#[test]
 fn illegal_transitions_return_the_documented_error_classes() {
     // Arrange
     let paths = reachable_paths();

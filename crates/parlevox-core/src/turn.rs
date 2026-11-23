@@ -16,8 +16,13 @@ use crate::error::ParlevoxError;
 use serde::Serialize;
 
 /// The closed set of turn states.
+///
+/// The enum is `#[non_exhaustive]` so a future additive state does not break
+/// downstream crates; within this crate every `match` stays explicit over all
+/// variants so a new state cannot be silently folded into an old one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum TurnState {
     /// Session created, no user activity yet.
     Idle,
@@ -25,10 +30,19 @@ pub enum TurnState {
     Listening,
     /// User is producing speech right now.
     UserSpeaking,
-    /// A final transcript exists; the reply has not started speaking.
+    /// The endpointing window: a final candidate exists but the turn has not
+    /// been committed yet, so speech may still cancel it.
+    Committing,
+    /// A commit exists; the reply has not started streaming.
     Thinking,
+    /// An LLM stream is producing text but has not queued audio yet. Distinct
+    /// from [`TurnState::Speaking`], whose definition is "first frame queued".
+    AgentGenerating,
     /// The agent's audio is playing.
     Speaking,
+    /// Speech was detected while the agent was speaking; the resolution window
+    /// has not yet decided between a backchannel and a barge-in.
+    EvaluatingBargeIn,
     /// Barge-in happened; the reply is being torn down.
     Interrupted,
     /// Terminal.
@@ -43,8 +57,11 @@ impl TurnState {
             TurnState::Idle => "Idle",
             TurnState::Listening => "Listening",
             TurnState::UserSpeaking => "UserSpeaking",
+            TurnState::Committing => "Committing",
             TurnState::Thinking => "Thinking",
+            TurnState::AgentGenerating => "AgentGenerating",
             TurnState::Speaking => "Speaking",
+            TurnState::EvaluatingBargeIn => "EvaluatingBargeIn",
             TurnState::Interrupted => "Interrupted",
             TurnState::Closed => "Closed",
         }
@@ -59,9 +76,31 @@ impl TurnState {
     pub const fn owns_floor(self) -> FloorOwner {
         match self {
             TurnState::Idle | TurnState::Listening | TurnState::UserSpeaking => FloorOwner::User,
-            TurnState::Thinking => FloorOwner::AgentUnconfirmed,
+            TurnState::Committing => FloorOwner::Nobody,
+            TurnState::Thinking | TurnState::AgentGenerating => FloorOwner::AgentUnconfirmed,
             TurnState::Speaking => FloorOwner::AgentConfirmed,
+            TurnState::EvaluatingBargeIn => FloorOwner::Contested,
             TurnState::Interrupted | TurnState::Closed => FloorOwner::Nobody,
+        }
+    }
+
+    /// What audio the agent may emit in this state.
+    ///
+    /// This is the contract's `May emit audio` column, stated in
+    /// `docs/architecture/TURN-CONTRACT.md` and checked by the contract test.
+    #[must_use]
+    pub const fn audio_emission(self) -> AudioEmission {
+        match self {
+            TurnState::Idle
+            | TurnState::Listening
+            | TurnState::UserSpeaking
+            | TurnState::Committing
+            | TurnState::Thinking
+            | TurnState::AgentGenerating
+            | TurnState::Closed => AudioEmission::Silent,
+            TurnState::Speaking => AudioEmission::Audible,
+            TurnState::EvaluatingBargeIn => AudioEmission::Ducked,
+            TurnState::Interrupted => AudioEmission::DrainOnly,
         }
     }
 }
@@ -75,6 +114,9 @@ pub enum FloorOwner {
     AgentUnconfirmed,
     /// The agent is producing confirmed audio.
     AgentConfirmed,
+    /// Both parties are contending for the floor while a barge-in is being
+    /// evaluated; neither has won it yet.
+    Contested,
     /// Neither party owns the floor.
     Nobody,
 }
@@ -87,7 +129,38 @@ impl FloorOwner {
             FloorOwner::User => "user",
             FloorOwner::AgentUnconfirmed => "agent-unconfirmed",
             FloorOwner::AgentConfirmed => "agent-confirmed",
+            FloorOwner::Contested => "contested",
             FloorOwner::Nobody => "nobody",
+        }
+    }
+}
+
+/// What audio the agent may emit in a state.
+///
+/// This is the contract's `May emit audio` column. The variants distinguish a
+/// hard silence from "nothing new is generated but already-queued frames may
+/// drain", from "output is attenuated while a barge-in is evaluated".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AudioEmission {
+    /// The agent must stay silent.
+    Silent,
+    /// Only audio already queued may drain; nothing new is generated.
+    DrainOnly,
+    /// Output is attenuated while the barge-in resolution window is open.
+    Ducked,
+    /// The agent may emit audio at full level.
+    Audible,
+}
+
+impl AudioEmission {
+    /// Stable, lowercase label used in contracts and diagnostics.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            AudioEmission::Silent => "no",
+            AudioEmission::DrainOnly => "drain only",
+            AudioEmission::Ducked => "ducked",
+            AudioEmission::Audible => "yes",
         }
     }
 }
@@ -101,12 +174,26 @@ pub enum TurnEventKind {
     UserStartedSpeaking,
     /// The user stopped producing speech.
     UserStoppedSpeaking,
+    /// Endpointing accepted a final candidate; the turn may still be rejected.
+    CommitStarted,
     /// A final transcript was committed (either after VAD silence or manually).
     FinalTranscript,
+    /// The endpointing window committed the turn.
+    TurnCommitted,
+    /// The endpointing window rejected the turn; nothing was committed.
+    CommitRejected,
+    /// The reply stream produced its first text without queuing audio yet.
+    ReplyStreamOpened,
     /// The first agent audio frame was queued for playout.
     ReplyStarted,
     /// The last queued frame finished playing.
     ReplyFinished,
+    /// Speech was detected while the agent held the floor.
+    SpeechDetected,
+    /// The resolution window decided the detection was a backchannel.
+    BargeInRejected,
+    /// The resolution window decided the detection was a barge-in.
+    BargeInConfirmed,
     /// The user interrupted an in-flight reply.
     BargeIn,
     /// Cleanup after an interruption is complete.
@@ -123,9 +210,16 @@ impl TurnEventKind {
             TurnEventKind::Start => "Start",
             TurnEventKind::UserStartedSpeaking => "UserStartedSpeaking",
             TurnEventKind::UserStoppedSpeaking => "UserStoppedSpeaking",
+            TurnEventKind::CommitStarted => "CommitStarted",
             TurnEventKind::FinalTranscript => "FinalTranscript",
+            TurnEventKind::TurnCommitted => "TurnCommitted",
+            TurnEventKind::CommitRejected => "CommitRejected",
+            TurnEventKind::ReplyStreamOpened => "ReplyStreamOpened",
             TurnEventKind::ReplyStarted => "ReplyStarted",
             TurnEventKind::ReplyFinished => "ReplyFinished",
+            TurnEventKind::SpeechDetected => "SpeechDetected",
+            TurnEventKind::BargeInRejected => "BargeInRejected",
+            TurnEventKind::BargeInConfirmed => "BargeInConfirmed",
             TurnEventKind::BargeIn => "BargeIn",
             TurnEventKind::ResumeListening => "ResumeListening",
             TurnEventKind::Close => "Close",
@@ -142,11 +236,18 @@ impl TurnEventKind {
             TurnEventKind::Start => TurnEvent::Start,
             TurnEventKind::UserStartedSpeaking => TurnEvent::UserStartedSpeaking,
             TurnEventKind::UserStoppedSpeaking => TurnEvent::UserStoppedSpeaking,
+            TurnEventKind::CommitStarted => TurnEvent::CommitStarted,
             TurnEventKind::FinalTranscript => TurnEvent::FinalTranscript {
                 text: String::from("sample"),
             },
+            TurnEventKind::TurnCommitted => TurnEvent::TurnCommitted,
+            TurnEventKind::CommitRejected => TurnEvent::CommitRejected,
+            TurnEventKind::ReplyStreamOpened => TurnEvent::ReplyStreamOpened,
             TurnEventKind::ReplyStarted => TurnEvent::ReplyStarted,
             TurnEventKind::ReplyFinished => TurnEvent::ReplyFinished,
+            TurnEventKind::SpeechDetected => TurnEvent::SpeechDetected,
+            TurnEventKind::BargeInRejected => TurnEvent::BargeInRejected,
+            TurnEventKind::BargeInConfirmed => TurnEvent::BargeInConfirmed,
             TurnEventKind::BargeIn => TurnEvent::BargeIn,
             TurnEventKind::ResumeListening => TurnEvent::ResumeListening,
             TurnEventKind::Close => TurnEvent::Close,
@@ -168,12 +269,26 @@ pub enum TurnEvent {
     UserStartedSpeaking,
     /// The user stopped producing speech.
     UserStoppedSpeaking,
+    /// Endpointing accepted a final candidate; the turn may still be rejected.
+    CommitStarted,
     /// A final transcript was committed (either after VAD silence or manually).
     FinalTranscript { text: String },
+    /// The endpointing window committed the turn.
+    TurnCommitted,
+    /// The endpointing window rejected the turn; nothing was committed.
+    CommitRejected,
+    /// The reply stream produced its first text without queuing audio yet.
+    ReplyStreamOpened,
     /// The first agent audio frame was queued for playout.
     ReplyStarted,
     /// The last queued frame finished playing.
     ReplyFinished,
+    /// Speech was detected while the agent held the floor.
+    SpeechDetected,
+    /// The resolution window decided the detection was a backchannel.
+    BargeInRejected,
+    /// The resolution window decided the detection was a barge-in.
+    BargeInConfirmed,
     /// The user interrupted an in-flight reply.
     BargeIn,
     /// Cleanup after an interruption is complete.
@@ -190,9 +305,16 @@ impl TurnEvent {
             TurnEvent::Start => TurnEventKind::Start,
             TurnEvent::UserStartedSpeaking => TurnEventKind::UserStartedSpeaking,
             TurnEvent::UserStoppedSpeaking => TurnEventKind::UserStoppedSpeaking,
+            TurnEvent::CommitStarted => TurnEventKind::CommitStarted,
             TurnEvent::FinalTranscript { .. } => TurnEventKind::FinalTranscript,
+            TurnEvent::TurnCommitted => TurnEventKind::TurnCommitted,
+            TurnEvent::CommitRejected => TurnEventKind::CommitRejected,
+            TurnEvent::ReplyStreamOpened => TurnEventKind::ReplyStreamOpened,
             TurnEvent::ReplyStarted => TurnEventKind::ReplyStarted,
             TurnEvent::ReplyFinished => TurnEventKind::ReplyFinished,
+            TurnEvent::SpeechDetected => TurnEventKind::SpeechDetected,
+            TurnEvent::BargeInRejected => TurnEventKind::BargeInRejected,
+            TurnEvent::BargeInConfirmed => TurnEventKind::BargeInConfirmed,
             TurnEvent::BargeIn => TurnEventKind::BargeIn,
             TurnEvent::ResumeListening => TurnEventKind::ResumeListening,
             TurnEvent::Close => TurnEventKind::Close,
@@ -205,8 +327,11 @@ pub const ALL_STATES: &[TurnState] = &[
     TurnState::Idle,
     TurnState::Listening,
     TurnState::UserSpeaking,
+    TurnState::Committing,
     TurnState::Thinking,
+    TurnState::AgentGenerating,
     TurnState::Speaking,
+    TurnState::EvaluatingBargeIn,
     TurnState::Interrupted,
     TurnState::Closed,
 ];
@@ -216,9 +341,16 @@ pub const ALL_EVENT_KINDS: &[TurnEventKind] = &[
     TurnEventKind::Start,
     TurnEventKind::UserStartedSpeaking,
     TurnEventKind::UserStoppedSpeaking,
+    TurnEventKind::CommitStarted,
     TurnEventKind::FinalTranscript,
+    TurnEventKind::TurnCommitted,
+    TurnEventKind::CommitRejected,
+    TurnEventKind::ReplyStreamOpened,
     TurnEventKind::ReplyStarted,
     TurnEventKind::ReplyFinished,
+    TurnEventKind::SpeechDetected,
+    TurnEventKind::BargeInRejected,
+    TurnEventKind::BargeInConfirmed,
     TurnEventKind::BargeIn,
     TurnEventKind::ResumeListening,
     TurnEventKind::Close,
@@ -247,8 +379,23 @@ pub const LEGAL_TRANSITIONS: &[(TurnState, TurnEventKind, TurnState)] = &[
         TurnEventKind::Close,
         TurnState::Closed,
     ),
+    (
+        TurnState::Committing,
+        TurnEventKind::Close,
+        TurnState::Closed,
+    ),
     (TurnState::Thinking, TurnEventKind::Close, TurnState::Closed),
+    (
+        TurnState::AgentGenerating,
+        TurnEventKind::Close,
+        TurnState::Closed,
+    ),
     (TurnState::Speaking, TurnEventKind::Close, TurnState::Closed),
+    (
+        TurnState::EvaluatingBargeIn,
+        TurnEventKind::Close,
+        TurnState::Closed,
+    ),
     (
         TurnState::Interrupted,
         TurnEventKind::Close,
@@ -278,6 +425,67 @@ pub const LEGAL_TRANSITIONS: &[(TurnState, TurnEventKind, TurnState)] = &[
         TurnState::UserSpeaking,
         TurnEventKind::FinalTranscript,
         TurnState::Thinking,
+    ),
+    // Additive endpointing path: a final candidate enters the commit window,
+    // which either commits the turn or rejects it back to Listening.
+    (
+        TurnState::Listening,
+        TurnEventKind::CommitStarted,
+        TurnState::Committing,
+    ),
+    (
+        TurnState::UserSpeaking,
+        TurnEventKind::CommitStarted,
+        TurnState::Committing,
+    ),
+    (
+        TurnState::Committing,
+        TurnEventKind::TurnCommitted,
+        TurnState::Thinking,
+    ),
+    (
+        TurnState::Committing,
+        TurnEventKind::CommitRejected,
+        TurnState::Listening,
+    ),
+    // Additive generation path: a reply stream can open before any audio frame
+    // is queued, and can be interrupted before the agent speaks.
+    (
+        TurnState::Thinking,
+        TurnEventKind::ReplyStreamOpened,
+        TurnState::AgentGenerating,
+    ),
+    (
+        TurnState::AgentGenerating,
+        TurnEventKind::ReplyStarted,
+        TurnState::Speaking,
+    ),
+    (
+        TurnState::AgentGenerating,
+        TurnEventKind::BargeIn,
+        TurnState::Interrupted,
+    ),
+    (
+        TurnState::AgentGenerating,
+        TurnEventKind::UserStartedSpeaking,
+        TurnState::Interrupted,
+    ),
+    // Additive barge-in resolution: detection while the agent speaks opens a
+    // window that either restores Speaking (backchannel) or interrupts.
+    (
+        TurnState::Speaking,
+        TurnEventKind::SpeechDetected,
+        TurnState::EvaluatingBargeIn,
+    ),
+    (
+        TurnState::EvaluatingBargeIn,
+        TurnEventKind::BargeInRejected,
+        TurnState::Speaking,
+    ),
+    (
+        TurnState::EvaluatingBargeIn,
+        TurnEventKind::BargeInConfirmed,
+        TurnState::Interrupted,
     ),
     // A reply starts, can finish without ever emitting audio, or is interrupted.
     (
@@ -433,8 +641,9 @@ impl TurnMachine {
     /// with, so the next committed turn increments it normally.
     ///
     /// `Idle` stays `Idle` (no turn has started), `Listening` stays
-    /// `Listening`, and `UserSpeaking`, `Thinking`, `Speaking`, and
-    /// `Interrupted` all return to `Listening`.
+    /// `Listening`, and `UserSpeaking`, `Committing`, `Thinking`,
+    /// `AgentGenerating`, `Speaking`, `EvaluatingBargeIn`, and `Interrupted`
+    /// all return to `Listening`.
     ///
     /// # Errors
     ///
@@ -446,7 +655,13 @@ impl TurnMachine {
         match self.state {
             S::Idle | S::Listening => Ok(()),
             S::Closed => Err(ParlevoxError::Closed),
-            S::UserSpeaking | S::Thinking | S::Speaking | S::Interrupted => {
+            S::UserSpeaking
+            | S::Committing
+            | S::Thinking
+            | S::AgentGenerating
+            | S::Speaking
+            | S::EvaluatingBargeIn
+            | S::Interrupted => {
                 self.state = S::Listening;
                 Ok(())
             }
@@ -554,6 +769,98 @@ mod tests {
     }
 
     #[test]
+    fn commit_started_reaches_committing_then_thinking() {
+        let mut m = TurnMachine::new();
+        m.apply(TurnEvent::Start).unwrap();
+        assert_eq!(
+            m.apply(TurnEvent::CommitStarted).unwrap().to,
+            TurnState::Committing
+        );
+        let transition = m.apply(TurnEvent::TurnCommitted).unwrap();
+        assert_eq!(transition.from, TurnState::Committing);
+        assert_eq!(transition.to, TurnState::Thinking);
+        // Only `FinalTranscript` opens a turn today; committing does not.
+        assert_eq!(transition.turn, 0);
+    }
+
+    #[test]
+    fn committing_rejection_returns_to_listening() {
+        let mut m = TurnMachine::new();
+        m.apply(TurnEvent::Start).unwrap();
+        m.apply(TurnEvent::CommitStarted).unwrap();
+        assert_eq!(
+            m.apply(TurnEvent::CommitRejected).unwrap().to,
+            TurnState::Listening
+        );
+    }
+
+    #[test]
+    fn agent_generating_barge_in_interrupts() {
+        let mut m = TurnMachine::new();
+        m.apply(TurnEvent::Start).unwrap();
+        m.apply(TurnEvent::FinalTranscript { text: "a".into() })
+            .unwrap();
+        assert_eq!(
+            m.apply(TurnEvent::ReplyStreamOpened).unwrap().to,
+            TurnState::AgentGenerating
+        );
+        assert_eq!(
+            m.apply(TurnEvent::BargeIn).unwrap().to,
+            TurnState::Interrupted
+        );
+    }
+
+    #[test]
+    fn speech_detected_evaluates_then_rejects_barge_in() {
+        let mut m = TurnMachine::new();
+        m.apply(TurnEvent::Start).unwrap();
+        m.apply(TurnEvent::FinalTranscript { text: "a".into() })
+            .unwrap();
+        m.apply(TurnEvent::ReplyStarted).unwrap();
+        assert_eq!(
+            m.apply(TurnEvent::SpeechDetected).unwrap().to,
+            TurnState::EvaluatingBargeIn
+        );
+        assert_eq!(
+            m.apply(TurnEvent::BargeInRejected).unwrap().to,
+            TurnState::Speaking
+        );
+    }
+
+    #[test]
+    fn barge_in_confirmed_from_evaluation_interrupts() {
+        let mut m = TurnMachine::new();
+        m.apply(TurnEvent::Start).unwrap();
+        m.apply(TurnEvent::FinalTranscript { text: "a".into() })
+            .unwrap();
+        m.apply(TurnEvent::ReplyStarted).unwrap();
+        m.apply(TurnEvent::SpeechDetected).unwrap();
+        assert_eq!(
+            m.apply(TurnEvent::BargeInConfirmed).unwrap().to,
+            TurnState::Interrupted
+        );
+    }
+
+    #[test]
+    fn new_states_abort_to_listening() {
+        for state in [
+            TurnState::Committing,
+            TurnState::AgentGenerating,
+            TurnState::EvaluatingBargeIn,
+        ] {
+            let mut machine = machine_in(state);
+            let turn = machine.turn_index();
+            machine.abort().unwrap();
+            assert_eq!(
+                machine.state(),
+                TurnState::Listening,
+                "abort from {state:?}"
+            );
+            assert_eq!(machine.turn_index(), turn, "abort keeps the turn index");
+        }
+    }
+
+    #[test]
     fn abort_rests_open_states_in_listening_and_refuses_closed() {
         let mut idle = TurnMachine::new();
         idle.abort().unwrap();
@@ -562,8 +869,11 @@ mod tests {
         for state in [
             TurnState::Listening,
             TurnState::UserSpeaking,
+            TurnState::Committing,
             TurnState::Thinking,
+            TurnState::AgentGenerating,
             TurnState::Speaking,
+            TurnState::EvaluatingBargeIn,
             TurnState::Interrupted,
         ] {
             let mut machine = machine_in(state);
@@ -608,10 +918,22 @@ mod tests {
                 vec![TurnEvent::Start, TurnEvent::UserStartedSpeaking],
             ),
             (
+                S::Committing,
+                vec![TurnEvent::Start, TurnEvent::CommitStarted],
+            ),
+            (
                 S::Thinking,
                 vec![
                     TurnEvent::Start,
                     TurnEvent::FinalTranscript { text: "a".into() },
+                ],
+            ),
+            (
+                S::AgentGenerating,
+                vec![
+                    TurnEvent::Start,
+                    TurnEvent::FinalTranscript { text: "a".into() },
+                    TurnEvent::ReplyStreamOpened,
                 ],
             ),
             (
@@ -620,6 +942,15 @@ mod tests {
                     TurnEvent::Start,
                     TurnEvent::FinalTranscript { text: "a".into() },
                     TurnEvent::ReplyStarted,
+                ],
+            ),
+            (
+                S::EvaluatingBargeIn,
+                vec![
+                    TurnEvent::Start,
+                    TurnEvent::FinalTranscript { text: "a".into() },
+                    TurnEvent::ReplyStarted,
+                    TurnEvent::SpeechDetected,
                 ],
             ),
             (
