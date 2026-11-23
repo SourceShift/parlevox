@@ -11,14 +11,18 @@
 //! failed export is reported on stderr once and never turns a completed turn
 //! into a failed one.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use opentelemetry::global;
 use opentelemetry::global::BoxedTracer;
 use opentelemetry_otlp::{SpanExporter, WithExportConfig};
-use opentelemetry_sdk::error::OTelSdkError;
-use opentelemetry_sdk::trace::{SdkTracerProvider, SimpleSpanProcessor};
+use opentelemetry_sdk::error::{OTelSdkError, OTelSdkResult};
+use opentelemetry_sdk::trace::SpanExporter as SdkSpanExporter;
+use opentelemetry_sdk::trace::{BatchSpanProcessor, SdkTracerProvider, SpanData};
 use opentelemetry_sdk::Resource;
 use parlevox_core::ParlevoxError;
 
@@ -36,6 +40,13 @@ pub const TRACER_NAME: &str = "parlevox";
 
 /// Upper bound on the shutdown export drain.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Per-request bound on one OTLP export.
+///
+/// Deliberately below [`SHUTDOWN_TIMEOUT`]: a collector that accepts the
+/// connection and never answers must not outlast the drain, so the batch
+/// worker is idle again by the time the process exits.
+const EXPORT_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// The process-global provider installed by [`install`].
 ///
@@ -93,18 +104,21 @@ impl TraceExportConfig {
 
 /// Install the OTLP/HTTP-protobuf trace exporter as the global tracer provider.
 ///
-/// The first call builds a `SimpleSpanProcessor`-backed [`SdkTracerProvider`]
+/// The first call builds a [`BatchSpanProcessor`]-backed [`SdkTracerProvider`]
 /// whose resource carries `service.name`, and publishes it through
-/// `opentelemetry::global::set_tracer_provider`. Every later call is an `Ok`
-/// no-op, so a second demo in the same process cannot install a second
+/// `opentelemetry::global::set_tracer_provider`. Span end only enqueues, so a
+/// turn never performs export work; the batch worker exports on its own
+/// schedule, and [`flush_and_shutdown`] drains it on exit. Every later call is
+/// an `Ok` no-op, so a second demo in the same process cannot install a second
 /// provider or invalidate the first.
 ///
 /// # Errors
 ///
 /// Returns a transport-class error naming the endpoint when the exporter
 /// cannot be built (for example a malformed endpoint), or a protocol-class
-/// error if the installer lock is poisoned or the provider was installed by a
-/// racing caller.
+/// error if the installer lock is poisoned, the process is not inside a tokio
+/// runtime (the batch worker needs a reactor to export), or the provider was
+/// installed by a racing caller.
 pub fn install(config: &TraceExportConfig) -> Result<(), ParlevoxError> {
     if PROVIDER.get().is_some() {
         return Ok(());
@@ -115,9 +129,16 @@ pub fn install(config: &TraceExportConfig) -> Result<(), ParlevoxError> {
     if PROVIDER.get().is_some() {
         return Ok(());
     }
+    // The SDK's batch worker exports on its own std thread with
+    // `futures_executor::block_on`, where no tokio reactor is current. Capture
+    // the demo's runtime handle now and re-enter it around every export poll.
+    let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+        ParlevoxError::Protocol("otlp exporter install needs a tokio runtime context".into())
+    })?;
     let exporter = SpanExporter::builder()
         .with_http()
         .with_endpoint(traces_endpoint(&config.endpoint))
+        .with_timeout(EXPORT_TIMEOUT)
         .build()
         .map_err(|err| {
             ParlevoxError::Transport(format!(
@@ -125,17 +146,73 @@ pub fn install(config: &TraceExportConfig) -> Result<(), ParlevoxError> {
                 config.endpoint
             ))
         })?;
+    let exporter = RuntimeBoundExporter::new(exporter, handle);
     let resource = Resource::builder()
         .with_service_name(config.service_name.clone())
         .build();
     let provider = SdkTracerProvider::builder()
         .with_resource(resource)
-        .with_span_processor(SimpleSpanProcessor::new(exporter))
+        .with_span_processor(BatchSpanProcessor::builder(exporter).build())
         .build();
     global::set_tracer_provider(provider.clone());
     PROVIDER
         .set(provider)
         .map_err(|_| ParlevoxError::Protocol("otlp exporter install raced".into()))
+}
+
+/// A [`SpanExporter`](SdkSpanExporter) bound to the tokio runtime it was
+/// installed from.
+///
+/// `BatchSpanProcessor` drives exports with `futures_executor::block_on` on its
+/// own std thread. The OTLP HTTP client's reqwest/hyper connect path needs a
+/// tokio reactor, so each poll of the inner export future runs with a captured
+/// [`tokio::runtime::Handle`] entered.
+#[derive(Debug)]
+struct RuntimeBoundExporter {
+    inner: SpanExporter,
+    handle: tokio::runtime::Handle,
+}
+
+impl RuntimeBoundExporter {
+    fn new(inner: SpanExporter, handle: tokio::runtime::Handle) -> Self {
+        Self { inner, handle }
+    }
+}
+
+impl SdkSpanExporter for RuntimeBoundExporter {
+    fn export(&self, batch: Vec<SpanData>) -> impl Future<Output = OTelSdkResult> + Send {
+        RuntimeBoundFuture {
+            handle: self.handle.clone(),
+            inner: Box::pin(self.inner.export(batch)),
+        }
+    }
+
+    fn set_resource(&mut self, resource: &Resource) {
+        self.inner.set_resource(resource);
+    }
+
+    fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+        self.inner.shutdown_with_timeout(timeout)
+    }
+}
+
+/// The future returned by [`RuntimeBoundExporter::export`].
+///
+/// Entering the handle on every poll (rather than once around the future) keeps
+/// the reactor available for every await point the inner future reaches.
+struct RuntimeBoundFuture<'a> {
+    handle: tokio::runtime::Handle,
+    inner: Pin<Box<dyn Future<Output = OTelSdkResult> + Send + 'a>>,
+}
+
+impl Future for RuntimeBoundFuture<'_> {
+    type Output = OTelSdkResult;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let _guard = this.handle.enter();
+        this.inner.as_mut().poll(cx)
+    }
 }
 
 /// Append the OTLP/HTTP traces signal path to a base endpoint.
@@ -161,19 +238,23 @@ pub fn tracer() -> Option<BoxedTracer> {
 
 /// Flush and shut the installed exporter down, reporting failures once.
 ///
-/// A no-op when [`install`] never ran. `AlreadyShutdown` is ignored because
-/// shutdown is idempotent. Any other error is printed to stderr as
+/// A no-op when [`install`] never ran. The flush and the shutdown share one
+/// [`SHUTDOWN_TIMEOUT`] budget, so a black-holed collector cannot stretch the
+/// drain to the sum of the two. `AlreadyShutdown` is ignored because shutdown
+/// is idempotent. Any other error is printed to stderr as
 /// `otlp flush failed: <error>` and is deliberately not returned: export is
 /// observability, not turn semantics.
 pub fn flush_and_shutdown() {
     let Some(provider) = PROVIDER.get() else {
         return;
     };
+    let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
     let mut first_error = provider
         .force_flush()
         .err()
         .filter(|err| !matches!(err, OTelSdkError::AlreadyShutdown));
-    if let Err(err) = provider.shutdown_with_timeout(SHUTDOWN_TIMEOUT) {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if let Err(err) = provider.shutdown_with_timeout(remaining) {
         if !matches!(err, OTelSdkError::AlreadyShutdown) && first_error.is_none() {
             first_error = Some(err);
         }
