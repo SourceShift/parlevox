@@ -15,12 +15,32 @@ categories.workspace = true
 name = "parlevox"
 path = "src/main.rs"
 
+[features]
+# Opt-in OTLP/HTTP trace export for the demos. Off by default so the default
+# build carries no OpenTelemetry or HTTP-client dependency edge and its stdout
+# and stderr stay byte-identical.
+otlp = [
+    "parlevox-runtime/otel",
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+]
+
 [dependencies]
 parlevox-core = { version = "0.1.0", path = "../parlevox-core" }
 parlevox-providers = { version = "0.1.0", path = "../parlevox-providers" }
 parlevox-runtime = { version = "0.1.0", path = "../parlevox-runtime" }
 parlevox-sidecar = { version = "0.1.0", path = "../parlevox-sidecar" }
 tokio.workspace = true
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+# HTTP/protobuf export only: no grpc-tonic, no blocking client. The reqwest
+# async client keeps the exporter on the tokio runtime the demos already use.
+opentelemetry-otlp = { version = "0.33", default-features = false, features = [
+    "http-proto",
+    "trace",
+    "reqwest-client",
+], optional = true }
 
 [dev-dependencies]
 async-trait.workspace = true
@@ -28,6 +48,9 @@ futures-util.workspace = true
 serde_json.workspace = true
 tokio-util.workspace = true
 parlevox-ipc = { version = "0.1.0", path = "../parlevox-ipc" }
+# The OTLP integration test binds a localhost listener; `net` stays a test-only
+# feature so the default build compiles no new code.
+tokio = { workspace = true, features = ["net"] }
 
 [lints]
 workspace = true

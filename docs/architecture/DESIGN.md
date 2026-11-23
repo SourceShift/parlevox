@@ -179,7 +179,7 @@ dimension. This is the honest scorecard against the shipped tree:
 | 4 | Provider abstraction | One small interface per modality + versioned manifest | **Implemented** — traits, `ProviderManifest`, registry lookup |
 | 5 | State & context | Rust-owned `ChatContext`, bounded policy | **Implemented** — `ChatContext`/`ContextStats` bound by message count and character budget; eviction prefers non-system messages and all loss is counted. The char budget is an estimate, not a token count |
 | 6 | Failure handling | Non-fatal/fatal taxonomy, no replay after commit | **Implemented** — `ErrorClass` + `is_recoverable`; all four modalities have fallback chains (`FallbackLlm`/`FallbackTts`/`FallbackStt`/`FallbackVad`) that switch only on a pre-commit `Transient`/`Capacity` failure and never after a provider has committed output; the reply side also has opt-in retry-with-backoff (`RetryPolicy` + `RetryingLlm`) that retries the same `LlmProvider` only on a pre-commit `Transient`/`Capacity` failure and never after a committed delta or a cancellation; and an opt-in reply-side circuit breaker (`BreakerPolicy` + `CircuitBreakingLlm`) opens after N consecutive pre-commit `Transient`/`Capacity` failures, refuses requests while open without calling the provider, and admits one half-open probe after the cool-down (success closes, failure re-opens). Breakers exist for the reply side only; they compose with the fallback chains by wrapping a chain as the inner provider |
-| 7 | Observability | OTel turn span + boundary cost meters | **Implemented** — the opt-in `otel` feature emits one MonoClock-timed `turn` span with `vad`, `stt`, `llm`, `tts` and `playout` children and boundary-cost attributes; exporter/collector wiring is caller-supplied |
+| 7 | Observability | OTel turn span + boundary cost meters | **Partial** — the opt-in `otel` feature emits one MonoClock-timed `turn` span with `vad`, `stt`, `llm`, `tts` and `playout` children and boundary-cost attributes, but the runtime installs no exporter: exporter/collector wiring is caller-supplied. The CLI demo adds an opt-in `otlp` feature that builds an OTLP/HTTP-protobuf trace exporter from `OTEL_EXPORTER_OTLP_ENDPOINT`, routes the demo sessions through the runtime's injected tracer, and flushes on exit. Traces only — metric export remains caller-supplied, so the dimension is not fully implemented |
 | 8 | Extensibility cost | New provider = one interface + manifest, no core edits | **Implemented** — register/select by name |
 | 9 | Deployment & scale | Warm pools sized by provider concurrency and p95 latency | **Deferred** |
 | 10 | Language boundary | Rust owns lifecycle; length-prefixed binary frames with explicit cancel | **Implemented** — `parlevox-ipc` + `parlevox-sidecar` |
@@ -267,9 +267,20 @@ What remains open:
   children plus MonoClock-derived boundary-cost attributes, and the default
   build still carries no OpenTelemetry dependency. With `pipelined_tts` on,
   the `llm` and per-sentence `tts` spans honestly overlap; the span timeline is
-  not serialized to preserve the sequential shape. There is no OTLP exporter
-  configuration and no collector wiring: the caller installs a tracer or passes
-  one to `Session::with_tracer`. A fixed six-instrument metric set —
+  not serialized to preserve the sequential shape. The runtime itself still
+  installs no exporter: a library caller installs one or passes a tracer to
+  `Session::with_tracer`. The CLI demo bridges that gap opt-in with
+  `cargo run -p parlevox-cli --features otlp -- demo --fake` (or
+  `demo --sidecar`): it builds an OTLP/HTTP-protobuf `SpanExporter` from
+  `OTEL_EXPORTER_OTLP_ENDPOINT`, uses `OTEL_SERVICE_NAME` (default
+  `parlevox`) as the resource service name, routes the demo session through
+  `Session::with_tracer`, and force-flushes plus shuts the provider down on
+  exit. The honest limits are: traces only (no metric or log export, no
+  exemplars, no views or aggregation tuning), HTTP/protobuf only (no
+  gRPC/tonic, no blocking client), a single process-global exporter, and a
+  failed flush reported once on stderr rather than failing the turn. The
+  default build carries no OpenTelemetry, OTLP or HTTP-client dependency edge
+  and prints nothing new. A fixed six-instrument metric set —
   `parlevox.turns`, `parlevox.turn.duration`, `parlevox.turn.stage.duration`,
   `parlevox.frames.dropped`, `parlevox.sidecar.frames.dropped`, and
   `parlevox.playout.depth` — is emitted only when the caller supplies a `Meter`

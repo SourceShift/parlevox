@@ -10,10 +10,14 @@
 use std::sync::Arc;
 
 use parlevox_core::ParlevoxError;
+
+/// Opt-in OTLP/HTTP trace export, enabled by the `otlp` cargo feature.
+#[cfg(feature = "otlp")]
+pub mod export;
 use parlevox_providers::{FakeVad, LlmProvider, SttProvider, TtsProvider};
 use parlevox_runtime::{
-    demo_utterance, ProviderNames, ProviderRegistry, Session, SessionConfig, SessionEvent,
-    TurnReport,
+    demo_utterance, ProviderNames, ProviderRegistry, Providers, Session, SessionConfig,
+    SessionEvent, TurnReport,
 };
 use parlevox_sidecar::{
     resolve_sdk_path, PoolConfig, SdkSearch, SidecarClient, SidecarConfig, SidecarLlm, SidecarPool,
@@ -65,8 +69,52 @@ fn build_sidecar_session(
         vad: "fake-vad".into(),
     };
     let providers = registry.resolve(&names)?;
-    let session = Session::new(SessionConfig::default(), providers)?;
+    let session = build_session(SessionConfig::default(), providers)?;
     Ok((session, names))
+}
+
+/// Build a session, routing it through the installed OTLP tracer when the
+/// `otlp` feature is on.
+///
+/// Without the feature, or before `export::install` has run, this is exactly
+/// [`Session::new`] and the session owns a no-op global tracer. With an
+/// installed exporter the session records its turn spans through the
+/// process-global provider.
+///
+/// # Errors
+///
+/// Returns the same protocol-class configuration errors as [`Session::new`].
+fn build_session(config: SessionConfig, providers: Providers) -> Result<Session, ParlevoxError> {
+    #[cfg(feature = "otlp")]
+    {
+        if let Some(tracer) = export::tracer() {
+            return Session::with_tracer(config, providers, tracer);
+        }
+    }
+    Session::new(config, providers)
+}
+
+/// Install the OTLP exporter from the environment when the `otlp` feature is
+/// on, printing exactly one status line.
+fn start_trace_export() {
+    #[cfg(feature = "otlp")]
+    match export::TraceExportConfig::from_env() {
+        Some(config) => match export::install(&config) {
+            Ok(()) => eprintln!(
+                "otlp traces -> {} service={}",
+                config.endpoint, config.service_name
+            ),
+            Err(err) => eprintln!("otlp exporter failed: {err}"),
+        },
+        None => eprintln!("otlp exporter disabled: OTEL_EXPORTER_OTLP_ENDPOINT is not set"),
+    }
+}
+
+/// Flush and shut the installed exporter down. A no-op without the `otlp`
+/// feature, and never an error: export failure must not fail a finished turn.
+fn finish_trace_export() {
+    #[cfg(feature = "otlp")]
+    export::flush_and_shutdown();
 }
 
 /// Canonical, timestamp-free projection of an event trace.
@@ -164,9 +212,18 @@ pub fn usage() {
 /// Returns a protocol-class error if a fake manifest or the session
 /// configuration is rejected, and propagates any error from the turn.
 pub async fn demo_fake() -> Result<(), ParlevoxError> {
+    start_trace_export();
+    let result = run_fake_demo().await;
+    finish_trace_export();
+    result
+}
+
+/// The one-turn fake body of [`demo_fake`], split out so the exporter is
+/// flushed on both the success and the error path.
+async fn run_fake_demo() -> Result<(), ParlevoxError> {
     let registry = ProviderRegistry::fakes()?;
     let providers = registry.resolve(&ProviderNames::default())?;
-    let session = Session::new(SessionConfig::default(), providers)?;
+    let session = build_session(SessionConfig::default(), providers)?;
     println!("providers stt=fake-stt llm=fake-llm tts=fake-tts vad=fake-vad");
     run_and_render(session).await
 }
@@ -181,6 +238,15 @@ pub async fn demo_fake() -> Result<(), ParlevoxError> {
 /// spawned or reaped, a protocol-class error for an invalid manifest or session
 /// configuration, and any error raised by the turn.
 pub async fn demo_sidecar() -> Result<(), ParlevoxError> {
+    start_trace_export();
+    let result = run_sidecar_demo().await;
+    finish_trace_export();
+    result
+}
+
+/// The one-turn sidecar body of [`demo_sidecar`], split out so the exporter is
+/// flushed after the turn has rendered and after the child is reaped.
+async fn run_sidecar_demo() -> Result<(), ParlevoxError> {
     let sdk_path = resolve_sdk_path(&SdkSearch::from_process())
         .map_err(|err| ParlevoxError::Transport(err.to_string()))?;
     let client = Arc::new(SidecarClient::spawn(SidecarConfig::python_sdk_at(sdk_path)).await?);
