@@ -5,11 +5,18 @@
 //! they are a closed set of states and a table of legal transitions. An illegal
 //! event returns [`crate::error::ParlevoxError::Protocol`] instead of being
 //! silently absorbed, so a misbehaving plugin fails loudly at the boundary.
+//!
+//! The legal transitions live in [`LEGAL_TRANSITIONS`] as data; [`TurnMachine::apply`]
+//! is a lookup over that table. The checked-in prose contract in
+//! `docs/architecture/TURN-CONTRACT.md` is verified against this table by
+//! `crates/parlevox-core/tests/turn_contract.rs`, so the document and the code
+//! cannot drift apart silently.
 
 use crate::error::ParlevoxError;
 use serde::Serialize;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// The closed set of turn states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnState {
     /// Session created, no user activity yet.
@@ -28,16 +35,74 @@ pub enum TurnState {
     Closed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TurnEvent {
+impl TurnState {
+    /// Canonical name of the state, identical to the Rust variant name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            TurnState::Idle => "Idle",
+            TurnState::Listening => "Listening",
+            TurnState::UserSpeaking => "UserSpeaking",
+            TurnState::Thinking => "Thinking",
+            TurnState::Speaking => "Speaking",
+            TurnState::Interrupted => "Interrupted",
+            TurnState::Closed => "Closed",
+        }
+    }
+
+    /// Who owns the audio floor in this state.
+    ///
+    /// The mapping is stated in `docs/architecture/TURN-CONTRACT.md` and
+    /// checked by the contract test. [`TurnState::Closed`] is a terminal state
+    /// the requirements document does not list; it owns no floor.
+    #[must_use]
+    pub const fn owns_floor(self) -> FloorOwner {
+        match self {
+            TurnState::Idle | TurnState::Listening | TurnState::UserSpeaking => FloorOwner::User,
+            TurnState::Thinking => FloorOwner::AgentUnconfirmed,
+            TurnState::Speaking => FloorOwner::AgentConfirmed,
+            TurnState::Interrupted | TurnState::Closed => FloorOwner::Nobody,
+        }
+    }
+}
+
+/// Who currently owns the audio floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FloorOwner {
+    /// The user owns the floor; the agent must stay silent.
+    User,
+    /// The agent holds the floor but has not confirmed playout yet.
+    AgentUnconfirmed,
+    /// The agent is producing confirmed audio.
+    AgentConfirmed,
+    /// Neither party owns the floor.
+    Nobody,
+}
+
+impl FloorOwner {
+    /// Stable, lowercase label used in contracts and diagnostics.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            FloorOwner::User => "user",
+            FloorOwner::AgentUnconfirmed => "agent-unconfirmed",
+            FloorOwner::AgentConfirmed => "agent-confirmed",
+            FloorOwner::Nobody => "nobody",
+        }
+    }
+}
+
+/// A [`TurnEvent`] with its payload erased, suitable as a transition-table key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TurnEventKind {
     /// Session is ready to take input.
     Start,
+    /// The user started producing speech.
     UserStartedSpeaking,
+    /// The user stopped producing speech.
     UserStoppedSpeaking,
     /// A final transcript was committed (either after VAD silence or manually).
-    FinalTranscript {
-        text: String,
-    },
+    FinalTranscript,
     /// The first agent audio frame was queued for playout.
     ReplyStarted,
     /// The last queued frame finished playing.
@@ -46,18 +111,247 @@ pub enum TurnEvent {
     BargeIn,
     /// Cleanup after an interruption is complete.
     ResumeListening,
+    /// The session is being torn down.
     Close,
 }
 
+impl TurnEventKind {
+    /// Canonical name of the event kind, identical to the Rust variant name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            TurnEventKind::Start => "Start",
+            TurnEventKind::UserStartedSpeaking => "UserStartedSpeaking",
+            TurnEventKind::UserStoppedSpeaking => "UserStoppedSpeaking",
+            TurnEventKind::FinalTranscript => "FinalTranscript",
+            TurnEventKind::ReplyStarted => "ReplyStarted",
+            TurnEventKind::ReplyFinished => "ReplyFinished",
+            TurnEventKind::BargeIn => "BargeIn",
+            TurnEventKind::ResumeListening => "ResumeListening",
+            TurnEventKind::Close => "Close",
+        }
+    }
+
+    /// Build a representative event for this kind.
+    ///
+    /// Payload-carrying variants receive a placeholder payload of the right
+    /// type, so a table-driven driver can enumerate every kind.
+    #[must_use]
+    pub fn sample_event(self) -> TurnEvent {
+        match self {
+            TurnEventKind::Start => TurnEvent::Start,
+            TurnEventKind::UserStartedSpeaking => TurnEvent::UserStartedSpeaking,
+            TurnEventKind::UserStoppedSpeaking => TurnEvent::UserStoppedSpeaking,
+            TurnEventKind::FinalTranscript => TurnEvent::FinalTranscript {
+                text: String::from("sample"),
+            },
+            TurnEventKind::ReplyStarted => TurnEvent::ReplyStarted,
+            TurnEventKind::ReplyFinished => TurnEvent::ReplyFinished,
+            TurnEventKind::BargeIn => TurnEvent::BargeIn,
+            TurnEventKind::ResumeListening => TurnEvent::ResumeListening,
+            TurnEventKind::Close => TurnEvent::Close,
+        }
+    }
+
+    /// Whether accepting this event opens a new user turn.
+    const fn opens_turn(self) -> bool {
+        matches!(self, TurnEventKind::FinalTranscript)
+    }
+}
+
+/// An event the turn machine can consume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnEvent {
+    /// Session is ready to take input.
+    Start,
+    /// The user started producing speech.
+    UserStartedSpeaking,
+    /// The user stopped producing speech.
+    UserStoppedSpeaking,
+    /// A final transcript was committed (either after VAD silence or manually).
+    FinalTranscript { text: String },
+    /// The first agent audio frame was queued for playout.
+    ReplyStarted,
+    /// The last queued frame finished playing.
+    ReplyFinished,
+    /// The user interrupted an in-flight reply.
+    BargeIn,
+    /// Cleanup after an interruption is complete.
+    ResumeListening,
+    /// The session is being torn down.
+    Close,
+}
+
+impl TurnEvent {
+    /// The payload-free kind of this event.
+    #[must_use]
+    pub fn kind(&self) -> TurnEventKind {
+        match self {
+            TurnEvent::Start => TurnEventKind::Start,
+            TurnEvent::UserStartedSpeaking => TurnEventKind::UserStartedSpeaking,
+            TurnEvent::UserStoppedSpeaking => TurnEventKind::UserStoppedSpeaking,
+            TurnEvent::FinalTranscript { .. } => TurnEventKind::FinalTranscript,
+            TurnEvent::ReplyStarted => TurnEventKind::ReplyStarted,
+            TurnEvent::ReplyFinished => TurnEventKind::ReplyFinished,
+            TurnEvent::BargeIn => TurnEventKind::BargeIn,
+            TurnEvent::ResumeListening => TurnEventKind::ResumeListening,
+            TurnEvent::Close => TurnEventKind::Close,
+        }
+    }
+}
+
+/// Every state, in declaration order.
+pub const ALL_STATES: &[TurnState] = &[
+    TurnState::Idle,
+    TurnState::Listening,
+    TurnState::UserSpeaking,
+    TurnState::Thinking,
+    TurnState::Speaking,
+    TurnState::Interrupted,
+    TurnState::Closed,
+];
+
+/// Every event kind, in declaration order.
+pub const ALL_EVENT_KINDS: &[TurnEventKind] = &[
+    TurnEventKind::Start,
+    TurnEventKind::UserStartedSpeaking,
+    TurnEventKind::UserStoppedSpeaking,
+    TurnEventKind::FinalTranscript,
+    TurnEventKind::ReplyStarted,
+    TurnEventKind::ReplyFinished,
+    TurnEventKind::BargeIn,
+    TurnEventKind::ResumeListening,
+    TurnEventKind::Close,
+];
+
+/// The single source of truth for legal turn transitions.
+///
+/// Each row is `(from, event kind, to)`. [`TurnMachine::apply`] accepts an
+/// event only when a row matches the machine's current state and the event's
+/// kind; every other `(state, event)` pair is rejected.
+///
+/// [`TurnState::Closed`] is terminal: [`TurnMachine::apply`] rejects every
+/// event there with [`ParlevoxError::Closed`] before consulting this table,
+/// which is why no row has `Closed` as its `from` state. `Close` is legal from
+/// every non-closed state.
+pub const LEGAL_TRANSITIONS: &[(TurnState, TurnEventKind, TurnState)] = &[
+    // Close is legal from every non-closed state.
+    (TurnState::Idle, TurnEventKind::Close, TurnState::Closed),
+    (
+        TurnState::Listening,
+        TurnEventKind::Close,
+        TurnState::Closed,
+    ),
+    (
+        TurnState::UserSpeaking,
+        TurnEventKind::Close,
+        TurnState::Closed,
+    ),
+    (TurnState::Thinking, TurnEventKind::Close, TurnState::Closed),
+    (TurnState::Speaking, TurnEventKind::Close, TurnState::Closed),
+    (
+        TurnState::Interrupted,
+        TurnEventKind::Close,
+        TurnState::Closed,
+    ),
+    // Start a session.
+    (TurnState::Idle, TurnEventKind::Start, TurnState::Listening),
+    // User speech detection and its no-transcript ending.
+    (
+        TurnState::Listening,
+        TurnEventKind::UserStartedSpeaking,
+        TurnState::UserSpeaking,
+    ),
+    (
+        TurnState::UserSpeaking,
+        TurnEventKind::UserStoppedSpeaking,
+        TurnState::Listening,
+    ),
+    // A final transcript can arrive from Listening (manual turn) or from
+    // UserSpeaking (VAD end). Both open a new turn.
+    (
+        TurnState::Listening,
+        TurnEventKind::FinalTranscript,
+        TurnState::Thinking,
+    ),
+    (
+        TurnState::UserSpeaking,
+        TurnEventKind::FinalTranscript,
+        TurnState::Thinking,
+    ),
+    // A reply starts, can finish without ever emitting audio, or is interrupted.
+    (
+        TurnState::Thinking,
+        TurnEventKind::ReplyStarted,
+        TurnState::Speaking,
+    ),
+    (
+        TurnState::Thinking,
+        TurnEventKind::ReplyFinished,
+        TurnState::Listening,
+    ),
+    (
+        TurnState::Thinking,
+        TurnEventKind::BargeIn,
+        TurnState::Interrupted,
+    ),
+    (
+        TurnState::Thinking,
+        TurnEventKind::UserStartedSpeaking,
+        TurnState::Interrupted,
+    ),
+    (
+        TurnState::Speaking,
+        TurnEventKind::BargeIn,
+        TurnState::Interrupted,
+    ),
+    (
+        TurnState::Speaking,
+        TurnEventKind::UserStartedSpeaking,
+        TurnState::Interrupted,
+    ),
+    (
+        TurnState::Speaking,
+        TurnEventKind::ReplyFinished,
+        TurnState::Listening,
+    ),
+    (
+        TurnState::Interrupted,
+        TurnEventKind::ResumeListening,
+        TurnState::Listening,
+    ),
+    // A reply that finishes while interrupted is already discarded.
+    (
+        TurnState::Interrupted,
+        TurnEventKind::ReplyFinished,
+        TurnState::Interrupted,
+    ),
+    // Duplicate/no-op events that must not disturb the state.
+    (
+        TurnState::Listening,
+        TurnEventKind::UserStoppedSpeaking,
+        TurnState::Listening,
+    ),
+    (
+        TurnState::Listening,
+        TurnEventKind::ReplyFinished,
+        TurnState::Listening,
+    ),
+];
+
+/// A committed state change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Transition {
+    /// State the machine left.
     pub from: TurnState,
+    /// State the machine entered.
     pub to: TurnState,
     /// Index of the user turn this transition belongs to. Increments when a new
     /// user turn is committed.
     pub turn: u64,
 }
 
+/// The turn state machine.
 #[derive(Debug)]
 pub struct TurnMachine {
     state: TurnState,
@@ -71,6 +365,8 @@ impl Default for TurnMachine {
 }
 
 impl TurnMachine {
+    /// Create a machine in [`TurnState::Idle`] with turn index `0`.
+    #[must_use]
     pub fn new() -> Self {
         TurnMachine {
             state: TurnState::Idle,
@@ -78,76 +374,50 @@ impl TurnMachine {
         }
     }
 
+    /// The current state.
+    #[must_use]
     pub fn state(&self) -> TurnState {
         self.state
     }
 
+    /// Index of the current user turn.
+    #[must_use]
     pub fn turn_index(&self) -> u64 {
         self.turn
     }
 
     /// Apply an event. Returns the transition, or an error for an illegal one.
-    /// `Close` is legal from every non-closed state.
+    ///
+    /// The event is accepted only when [`LEGAL_TRANSITIONS`] contains a row for
+    /// the current state and the event's kind. Only
+    /// [`TurnEventKind::FinalTranscript`] increments the turn index.
     ///
     /// # Errors
     ///
-    /// Returns a protocol-class error when the event is not legal from the
-    /// current state, and a closed-class error once the machine is terminal.
+    /// Returns [`ParlevoxError::Closed`] once the machine is terminal, before
+    /// consulting [`LEGAL_TRANSITIONS`], and [`ParlevoxError::Protocol`] when
+    /// the event is not legal from the current state. A rejected event leaves
+    /// the state and turn index unchanged.
     pub fn apply(&mut self, event: TurnEvent) -> Result<Transition, ParlevoxError> {
-        use TurnState as S;
-
-        if self.state == S::Closed {
+        if self.state == TurnState::Closed {
             return Err(ParlevoxError::Closed);
         }
 
         let from = self.state;
-        let mut turn = self.turn;
-
-        let to = match (&self.state, event) {
-            (_, TurnEvent::Close) => S::Closed,
-
-            (S::Idle, TurnEvent::Start) => S::Listening,
-
-            (S::Listening, TurnEvent::UserStartedSpeaking) => S::UserSpeaking,
-
-            // A final transcript can arrive from Listening (manual turn) or
-            // from UserSpeaking (VAD end). Both open a new turn.
-            (S::Listening | S::UserSpeaking, TurnEvent::FinalTranscript { .. }) => {
-                turn += 1;
-                S::Thinking
-            }
-
-            // Speech ends without a transcript → back to listening.
-            (S::UserSpeaking, TurnEvent::UserStoppedSpeaking) => S::Listening,
-
-            (S::Thinking, TurnEvent::ReplyStarted) => S::Speaking,
-
-            // A reply can finish without ever emitting audio (a text-only turn
-            // whose TTS produced no chunks). The machine reports that honestly
-            // by going straight back to listening and never entering
-            // `Speaking`.
-            (S::Thinking, TurnEvent::ReplyFinished) => S::Listening,
-
-            // Barge-in is legal while the agent is thinking or speaking.
-            (S::Thinking | S::Speaking, TurnEvent::BargeIn) => S::Interrupted,
-            (S::Thinking | S::Speaking, TurnEvent::UserStartedSpeaking) => S::Interrupted,
-
-            (S::Speaking, TurnEvent::ReplyFinished) => S::Listening,
-
-            (S::Interrupted, TurnEvent::ResumeListening) => S::Listening,
-            // A reply that finishes while interrupted is already discarded.
-            (S::Interrupted, TurnEvent::ReplyFinished) => S::Interrupted,
-
-            // Duplicate/no-op events that must not disturb the state.
-            (S::Listening, TurnEvent::UserStoppedSpeaking) => S::Listening,
-            (S::Listening, TurnEvent::ReplyFinished) => S::Listening,
-
-            (state, event) => {
-                return Err(ParlevoxError::Protocol(format!(
-                    "illegal turn transition: {state:?} + {event:?}"
-                )))
-            }
+        let kind = event.kind();
+        let Some(&(_, _, to)) = LEGAL_TRANSITIONS
+            .iter()
+            .find(|(state, candidate, _)| *state == from && *candidate == kind)
+        else {
+            return Err(ParlevoxError::Protocol(format!(
+                "illegal turn transition: {from:?} + {event:?}"
+            )));
         };
+
+        let mut turn = self.turn;
+        if kind.opens_turn() {
+            turn += 1;
+        }
 
         self.state = to;
         self.turn = turn;
@@ -317,10 +587,11 @@ mod tests {
     }
 
     /// Number of variants in [`TurnState`], used to size the exhaustive pair
-    /// check. A mismatch with [`all_states`] makes the pair test fail loudly.
-    const STATE_COUNT: usize = 7;
-    /// Number of variants in [`TurnEvent`], used the same way.
-    const EVENT_COUNT: usize = 9;
+    /// check. It is derived from [`ALL_STATES`], so a forgotten variant cannot
+    /// silently shrink the sweep.
+    const STATE_COUNT: usize = ALL_STATES.len();
+    /// Number of variants in [`TurnEvent`], derived from [`ALL_EVENT_KINDS`].
+    const EVENT_COUNT: usize = ALL_EVENT_KINDS.len();
 
     /// Every state plus one legal path that reaches it from `Idle`.
     ///
@@ -363,33 +634,17 @@ mod tests {
         ]
     }
 
-    /// Every distinct state.
+    /// Every distinct state, derived from [`ALL_STATES`].
     fn all_states() -> Vec<TurnState> {
-        use TurnState as S;
-        vec![
-            S::Idle,
-            S::Listening,
-            S::UserSpeaking,
-            S::Thinking,
-            S::Speaking,
-            S::Interrupted,
-            S::Closed,
-        ]
+        ALL_STATES.to_vec()
     }
 
-    /// One instance of every event variant.
+    /// One instance of every event kind, derived from [`ALL_EVENT_KINDS`].
     fn all_events() -> Vec<TurnEvent> {
-        vec![
-            TurnEvent::Start,
-            TurnEvent::UserStartedSpeaking,
-            TurnEvent::UserStoppedSpeaking,
-            TurnEvent::FinalTranscript { text: "x".into() },
-            TurnEvent::ReplyStarted,
-            TurnEvent::ReplyFinished,
-            TurnEvent::BargeIn,
-            TurnEvent::ResumeListening,
-            TurnEvent::Close,
-        ]
+        ALL_EVENT_KINDS
+            .iter()
+            .map(|kind| kind.sample_event())
+            .collect()
     }
 
     /// Replay the legal path to `state` on a fresh machine.
