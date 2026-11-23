@@ -1,9 +1,10 @@
-//! Hermetic wire test for the opt-in OTLP/HTTP trace exporter.
+//! Hermetic wire test for the opt-in OTLP/HTTP trace and metric exporters.
 //!
-//! A localhost listener plays the collector. The test installs the exporter
-//! against that listener, runs one fake-provider turn through
-//! [`Session::with_tracer`], flushes, and asserts the exporter really posted a
-//! protobuf trace batch to `/v1/traces` carrying the configured service name.
+//! A localhost listener plays the collector. The test installs both exporters
+//! against that listener, runs one fake-provider turn through a session that
+//! carries the installed tracer and meter, flushes, and asserts the exporter
+//! really posted a protobuf trace batch to `/v1/traces` and a protobuf metric
+//! batch to `/v1/metrics`, both carrying the configured service name.
 
 #![cfg(feature = "otlp")]
 
@@ -13,9 +14,9 @@ use parlevox_cli::export::{self, TraceExportConfig};
 use parlevox_runtime::{ProviderNames, ProviderRegistry, Session, SessionConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
-/// Ceiling for the collector to observe the export.
+/// Ceiling for the collector to observe both exports.
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Service name the test configures and then looks for on the wire.
@@ -83,13 +84,17 @@ fn header_value(head: &str, wanted: &str) -> Option<String> {
     })
 }
 
-/// Accept requests until the test stops the listener, capturing the first one.
+/// Accept and answer requests until the test stops the listener, forwarding
+/// every captured request so the test can wait for both signal paths.
+///
+/// Each response asks for `connection: close`, so the exporter opens a fresh
+/// connection per signal and a single sequential accept loop sees both.
 async fn serve(
     listener: TcpListener,
-    capture: oneshot::Sender<CapturedRequest>,
+    requests: mpsc::UnboundedSender<CapturedRequest>,
     mut stop: oneshot::Receiver<()>,
 ) {
-    let mut capture = Some(capture);
+    let mut requests = Some(requests);
     loop {
         tokio::select! {
             _ = &mut stop => return,
@@ -104,17 +109,71 @@ async fn serve(
                                 content-length: 2\r\nconnection: close\r\n\r\n{}";
                 let _ = stream.write_all(response.as_bytes()).await;
                 let _ = stream.flush().await;
-                if let Some(sender) = capture.take() {
-                    let _ = sender.send(request);
+                if let Some(sender) = requests.as_ref() {
+                    if sender.send(request).is_err() {
+                        requests = None;
+                    }
                 }
             }
         }
     }
 }
 
+/// Wait until both signal paths have arrived, returning them in
+/// traces-then-metrics order regardless of arrival order.
+async fn collect_signals(
+    requests: &mut mpsc::UnboundedReceiver<CapturedRequest>,
+) -> (CapturedRequest, CapturedRequest) {
+    let mut traces = None;
+    let mut metrics = None;
+    let deadline = tokio::time::Instant::now() + CAPTURE_TIMEOUT;
+    while traces.is_none() || metrics.is_none() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let request = tokio::time::timeout(remaining, requests.recv())
+            .await
+            .expect("both signals must export within the timeout")
+            .expect("the collector request channel stays open");
+        match request.path.as_str() {
+            "/v1/traces" => traces = Some(request),
+            "/v1/metrics" => metrics = Some(request),
+            _ => {}
+        }
+    }
+    (
+        traces.expect("the exporter must post traces"),
+        metrics.expect("the exporter must post metrics"),
+    )
+}
+
+/// Assert one captured request is a protobuf OTLP batch for `signal`, then
+/// print the DoD evidence line.
+fn assert_signal(request: &CapturedRequest, signal: &str, expected_path: &str) {
+    assert_eq!(request.path, expected_path, "{signal} signal path");
+    assert!(
+        request.content_type.starts_with("application/x-protobuf"),
+        "{signal} content-type was {:?}",
+        request.content_type
+    );
+    assert!(
+        !request.body.is_empty(),
+        "the {signal} export body must be non-empty"
+    );
+    let body = String::from_utf8_lossy(&request.body);
+    assert!(
+        body.contains(SERVICE_NAME),
+        "the {signal} body must carry the configured service name"
+    );
+    println!(
+        "signal={signal} path={} content-type={} body_len={} service_name={SERVICE_NAME}",
+        request.path,
+        request.content_type,
+        request.body.len(),
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exports_one_turn_to_the_configured_otlp_endpoint() {
-    // Arrange: a localhost "collector" and an exporter pointed at it.
+    // Arrange: a localhost "collector" and both exporters pointed at it.
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind a localhost collector");
@@ -122,63 +181,41 @@ async fn exports_one_turn_to_the_configured_otlp_endpoint() {
         .local_addr()
         .expect("bound listener has an address")
         .port();
-    let (capture_tx, capture_rx) = oneshot::channel();
+    let (requests_tx, mut requests_rx) = mpsc::unbounded_channel();
     let (stop_tx, stop_rx) = oneshot::channel();
-    let server = tokio::spawn(serve(listener, capture_tx, stop_rx));
+    let server = tokio::spawn(serve(listener, requests_tx, stop_rx));
 
     let config = TraceExportConfig {
         endpoint: format!("http://127.0.0.1:{port}"),
         service_name: SERVICE_NAME.to_owned(),
     };
-    export::install(&config).expect("install the OTLP exporter");
+    export::install(&config).expect("install the OTLP exporters");
 
     let registry = ProviderRegistry::fakes().expect("fake registry builds");
     let providers = registry
         .resolve(&ProviderNames::default())
         .expect("fake providers resolve");
     let tracer = export::tracer().expect("an installed exporter yields a tracer");
+    let meter = export::meter().expect("an installed exporter yields a meter");
     let session = Session::with_tracer(SessionConfig::default(), providers, tracer)
-        .expect("session with the exporter tracer builds");
+        .expect("session with the exporter tracer builds")
+        .with_meter(meter);
 
-    // Act: one deterministic turn, then the documented exit flush.
+    // Act: one deterministic turn, then the documented exit drain.
     let (_report, events) = parlevox_cli::run_turn_events(session)
         .await
         .expect("the fake turn succeeds");
     export::flush_and_shutdown();
-    let captured = tokio::time::timeout(CAPTURE_TIMEOUT, capture_rx)
-        .await
-        .expect("the exporter must post within the timeout")
-        .expect("the collector must capture one request");
+    let (traces, metrics) = collect_signals(&mut requests_rx).await;
 
-    // Assert: HTTP/protobuf on the traces path, carrying the service name.
-    assert_eq!(captured.path, "/v1/traces");
-    assert!(
-        captured.content_type.starts_with("application/x-protobuf"),
-        "content-type was {:?}",
-        captured.content_type
-    );
-    assert!(
-        !captured.body.is_empty(),
-        "the export body must be non-empty"
-    );
-    let body = String::from_utf8_lossy(&captured.body);
-    assert!(
-        body.contains(SERVICE_NAME),
-        "the body must carry the configured service name"
-    );
+    // Assert: both HTTP/protobuf signals, each carrying the service name.
+    assert_signal(&traces, "traces", "/v1/traces");
+    assert_signal(&metrics, "metrics", "/v1/metrics");
     assert!(
         events
             .iter()
             .any(|event| matches!(event, parlevox_runtime::SessionEvent::TurnDone { .. })),
         "the turn must complete before the export is asserted"
-    );
-
-    println!(
-        "otlp evidence path={} content-type={} body_len={} service_name={}",
-        captured.path,
-        captured.content_type,
-        captured.body.len(),
-        SERVICE_NAME
     );
 
     let _ = stop_tx.send(());

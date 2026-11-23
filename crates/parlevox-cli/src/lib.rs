@@ -73,13 +73,14 @@ fn build_sidecar_session(
     Ok((session, names))
 }
 
-/// Build a session, routing it through the installed OTLP tracer when the
-/// `otlp` feature is on.
+/// Build a session, routing it through the installed OTLP tracer and meter
+/// when the `otlp` feature is on.
 ///
 /// Without the feature, or before `export::install` has run, this is exactly
 /// [`Session::new`] and the session owns a no-op global tracer. With an
-/// installed exporter the session records its turn spans through the
-/// process-global provider.
+/// installed exporter the session records its turn spans and the six turn
+/// metrics through the process-global providers; if no meter is available it
+/// falls back to the tracer-only session.
 ///
 /// # Errors
 ///
@@ -88,7 +89,11 @@ fn build_session(config: SessionConfig, providers: Providers) -> Result<Session,
     #[cfg(feature = "otlp")]
     {
         if let Some(tracer) = export::tracer() {
-            return Session::with_tracer(config, providers, tracer);
+            let session = Session::with_tracer(config, providers, tracer)?;
+            return Ok(match export::meter() {
+                Some(meter) => session.with_meter(meter),
+                None => session,
+            });
         }
     }
     Session::new(config, providers)
