@@ -10,6 +10,7 @@
 //! runtime tests deterministic and Python-free.
 
 pub mod breaker;
+pub mod endpointing;
 pub mod fakes;
 pub mod fallback;
 pub mod manifest;
@@ -18,6 +19,7 @@ pub mod stream;
 pub mod traits;
 
 pub use breaker::{BreakerPolicy, BreakerStats, CircuitBreakingLlm};
+pub use endpointing::{AdaptiveEndpointingVad, EndpointingPolicy, EndpointingStats};
 pub use fakes::{
     FakeLlm, FakeStt, FakeTts, FakeVad, ProviderCall, ProviderCallLog, FAKE_CHANNELS,
     FAKE_FRAME_MS, FAKE_FRAME_SAMPLES, FAKE_LLM_DELTAS, FAKE_PARTIAL_TRANSCRIPT, FAKE_REPLY,
