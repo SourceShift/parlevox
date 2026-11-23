@@ -16,13 +16,19 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# Every Rust job pins one toolchain instead of tracking `stable`. A floating
+# stable turned this pipeline red without a source change: the new warn-level
+# clippy lint `clippy::double_must_use` in 1.100 failed `-D warnings`. Bumping
+# the pin is a deliberate act: raise Cargo.toml `rust-version`, update both
+# places here, and run fmt, clippy, doc and test locally first.
+
 jobs:
   fmt:
     name: fmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.89.0
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
@@ -32,21 +38,40 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.89.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
-  msrv:
-    name: msrv (1.85, cargo check)
+  clippy-next:
+    name: clippy (newest stable, advisory)
+    # Canary for lint drift: newest stable may add warn-level lints that would
+    # fail the pinned job above once the pin moves. This job never fails the
+    # pipeline, but when it turns red, fix the lint in its own mini-ork run and
+    # then raise the pins here together with Cargo.toml `rust-version`.
+    continue-on-error: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # `rust-version` promises 1.85 for the libraries and binaries. Dev-only
-      # dependencies (proptest) declare a newer MSRV and are excluded, so the
-      # check runs without dev-deps.
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy-next
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  msrv:
+    name: msrv (1.88, cargo check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # `rust-version` promises 1.88 for the libraries and binaries. 1.85 is no
+      # longer reachable: the reqwest -> url -> icu 2.4 tree requires 1.88 and
+      # idna_adapter 1.2.2 requires 1.86. Dev-only dependencies (proptest) also
+      # declare a newer MSRV and are excluded, so this runs without dev-deps.
+      - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv
@@ -57,7 +82,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.89.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
       # The default turn must run with no Python process and no network.
@@ -68,7 +93,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.89.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --workspace --no-deps
         env:
@@ -97,7 +122,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.89.0
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with:
@@ -110,7 +135,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.89.0
       - uses: Swatinem/rust-cache@v2
       # A crate can test green and still be unpublishable. Only the leaf crate
       # can be packaged before the first release (dependents resolve their
@@ -166,7 +191,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.89.0
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov

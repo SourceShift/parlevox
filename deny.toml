@@ -25,6 +25,10 @@ allow = [
   "MPL-2.0",
   "CC0-1.0",
   "Unlicense",
+  # Mozilla's permissive license for data (not code). Reached through
+  # webpki-roots, which ships the root certificate bundle used by
+  # rustls for reqwest and tokio-tungstenite.
+  "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.93
 

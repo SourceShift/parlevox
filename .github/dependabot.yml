@@ -30,8 +30,9 @@ updates:
       prefix: "chore(ci)"
     ignore:
       # The tag on dtolnay/rust-toolchain IS the toolchain version, not an
-      # action version. Bumping @1.85.0 to @1.120.0 asks rustup for a
+      # action version. Bumping @1.89.0 to @1.120.0 asks rustup for a
       # toolchain that does not exist and fails the MSRV job with a 404.
-      # The MSRV is a deliberate choice; change it in Cargo.toml and here
-      # together, never by an automated bump.
+      # The MSRV and the pinned CI toolchain are deliberate choices; change
+      # them in Cargo.toml and the workflows together, never by an automated
+      # bump.
       - dependency-name: "dtolnay/rust-toolchain"
