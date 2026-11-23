@@ -7,6 +7,7 @@ members = [
     "crates/parlevox-runtime",
     "crates/parlevox-sidecar",
     "crates/parlevox-transport-ws",
+    "crates/parlevox-connectors",
     "crates/parlevox-cli",
 ]
 
@@ -35,6 +36,7 @@ async-trait = "0.1"
 futures-core = "0.3"
 futures-util = "0.3"
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "stream", "json", "multipart"] }
 anyhow = "1"
 proptest = "1"
 opentelemetry = { version = "0.33", default-features = false, features = ["trace", "metrics"] }

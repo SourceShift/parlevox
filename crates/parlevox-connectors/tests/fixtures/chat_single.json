@@ -1,0 +1,1 @@
+{"id":"chatcmpl-single","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"Hello from JSON"},"finish_reason":"stop"}]}

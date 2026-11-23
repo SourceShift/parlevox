@@ -1,0 +1,51 @@
+[package]
+name = "parlevox-connectors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "HTTP/JSON connector toolkit and OpenAI-compatible provider connectors for parlevox."
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = ["http"]
+http = [
+    "dep:async-trait",
+    "dep:bytes",
+    "dep:futures-core",
+    "dep:futures-util",
+    "dep:parlevox-providers",
+    "dep:reqwest",
+    "dep:serde_json",
+    "dep:tokio",
+    "dep:tokio-util",
+    "dep:tracing",
+]
+
+[dependencies]
+parlevox-core = { version = "0.1.0", path = "../parlevox-core" }
+thiserror.workspace = true
+async-trait = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+futures-core = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+parlevox-providers = { version = "0.1.0", path = "../parlevox-providers", optional = true }
+reqwest = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+
+[dev-dependencies]
+futures-util.workspace = true
+proptest.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,3 @@
+{"id":"chatcmpl-ndjson","choices":[{"index":0,"delta":{"content":"Hel"},"finish_reason":null}]}
+{"id":"chatcmpl-ndjson","choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":null}]}
+{"id":"chatcmpl-ndjson","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}

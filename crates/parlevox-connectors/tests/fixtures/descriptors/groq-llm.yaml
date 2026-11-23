@@ -1,0 +1,21 @@
+name: groq-llm
+modality: llm
+protocol_version: 2
+adapter:
+  kind: openai-compatible-chat
+  endpoint: https://api.groq.example/v1/chat/completions
+api_key_env: GROQ_API_KEY
+capabilities:
+  - streaming
+models:
+  - id: llama-3.3-70b-versatile
+    display_name: Llama 3.3 70B Versatile
+    capabilities:
+      - streaming
+config_schema:
+  type: object
+  properties:
+    model:
+      type: string
+  required:
+    - model
