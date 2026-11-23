@@ -123,7 +123,7 @@ impl WsConfig {
                 "ws config: max_message_bytes must be at least two".into(),
             ));
         }
-        if self.max_message_bytes % 2 != 0 {
+        if !self.max_message_bytes.is_multiple_of(2) {
             return Err(ParlevoxError::Protocol(
                 "ws config: max_message_bytes must be even for 16-bit pcm".into(),
             ));

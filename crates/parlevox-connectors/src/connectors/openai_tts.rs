@@ -266,11 +266,8 @@ impl PcmAssembler {
         for _ in 0..complete {
             let frame: Vec<u8> = self.bytes.drain(..self.frame_bytes).collect();
             let mut pcm = Vec::with_capacity(frame.len() / 2);
-            for pair in frame.chunks_exact(2) {
-                let sample: [u8; 2] = pair
-                    .try_into()
-                    .map_err(|_| ConnectorError::Protocol("incomplete PCM sample".to_owned()))?;
-                pcm.push(i16::from_le_bytes(sample));
+            for pair in frame.as_chunks::<2>().0 {
+                pcm.push(i16::from_le_bytes(*pair));
             }
             frames.push(pcm);
         }

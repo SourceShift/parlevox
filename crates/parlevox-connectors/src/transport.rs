@@ -449,7 +449,6 @@ impl fmt::Debug for TransportResponse {
 }
 
 /// Wrap an in-memory byte sequence as a body stream.
-#[must_use]
 pub fn bytes_stream(chunks: impl IntoIterator<Item = Bytes>) -> ByteStream {
     // Materialise the iterator so the stream owns a `Send` collection rather
     // than an arbitrary (possibly non-`Send`) iterator type.

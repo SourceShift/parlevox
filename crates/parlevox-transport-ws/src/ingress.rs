@@ -134,14 +134,14 @@ impl IngressRing {
     /// boundary, and silently discarding the trailing byte would corrupt the
     /// stream. Such a message is not pushed and no counter moves.
     pub fn push_bytes(&mut self, bytes: &[u8]) -> Result<PushOutcome, ParlevoxError> {
-        if bytes.len() % 2 != 0 {
+        if !bytes.len().is_multiple_of(2) {
             return Err(ParlevoxError::Protocol(
                 "pcm payload must have an even byte count".into(),
             ));
         }
         let mut samples = Vec::with_capacity(bytes.len() / 2);
-        for pair in bytes.chunks_exact(2) {
-            samples.push(i16::from_le_bytes([pair[0], pair[1]]));
+        for pair in bytes.as_chunks::<2>().0 {
+            samples.push(i16::from_le_bytes(*pair));
         }
         Ok(self.push_samples(&samples))
     }

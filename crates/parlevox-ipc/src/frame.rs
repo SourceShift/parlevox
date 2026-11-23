@@ -117,10 +117,8 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Frame, FrameE
                 return Err(FrameError::OddPcm(pcm_bytes.len()));
             }
             let header: AudioHeader = serde_json::from_slice(header_bytes)?;
-            let pcm = pcm_bytes
-                .chunks_exact(2)
-                .map(|c| i16::from_le_bytes([c[0], c[1]]))
-                .collect();
+            let (pairs, _) = pcm_bytes.as_chunks::<2>();
+            let pcm = pairs.iter().map(|c| i16::from_le_bytes(*c)).collect();
             Ok(Frame::Audio { header, pcm })
         }
         KIND_CLOSE => Ok(Frame::Close),

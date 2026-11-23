@@ -41,7 +41,7 @@ fn event_for(kind: Kind, idx: usize) -> SessionEvent {
     let id = idx as u64;
     match kind {
         Kind::Control => {
-            if idx % 2 == 0 {
+            if idx.is_multiple_of(2) {
                 SessionEvent::TurnStarted { turn: id }
             } else {
                 SessionEvent::TranscriptFinal {

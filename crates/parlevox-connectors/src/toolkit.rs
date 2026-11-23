@@ -212,7 +212,6 @@ pub struct HttpResponse {
 
 impl HttpResponse {
     /// Take the body stream.
-    #[must_use]
     pub fn into_body(self) -> ByteStream {
         self.body
     }
