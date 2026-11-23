@@ -256,7 +256,7 @@ impl TurnEventKind {
     }
 
     /// Whether accepting this event opens a new user turn.
-    const fn opens_turn(self) -> bool {
+    pub(crate) const fn opens_turn(self) -> bool {
         matches!(self, TurnEventKind::FinalTranscript)
     }
 }

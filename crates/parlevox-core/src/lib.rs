@@ -7,12 +7,14 @@
 //! - a turn is an explicit state machine, not a bag of booleans ([`turn`]);
 //! - errors carry a recoverability class so callers never guess ([`error`]).
 
+pub mod arbiter;
 pub mod audio;
 pub mod clock;
 pub mod error;
 pub mod observation;
 pub mod turn;
 
+pub use arbiter::{ArbiterModel, Command, RecordKind, TurnArbiter, DUCK_GAIN};
 pub use audio::{
     AudioFrame, AudioRing, CreditHandle, CreditSnapshot, CreditStats, CreditWait, OverflowPolicy,
     PushOutcome, RingStats,

@@ -127,3 +127,62 @@ interpretation: the requirements table does not list it, so it is assigned
 | `EvaluatingBargeIn` | contested | ducked | yes (resolution window) |
 | `Interrupted` | nobody | drain only | yes (next turn) |
 | `Closed` | nobody | no | no |
+
+## Arbiter commands
+
+`parlevox_core::TurnArbiter::step` turns one `Observation` plus an
+`ArbiterModel` into the commands the runtime should carry out. The arbiter is
+pure and synchronous: it performs no I/O, takes no lock, reads no clock and
+cannot panic, so the same model and observation always produce the same
+commands in the same order.
+
+The command set is exhaustive:
+
+| Command | Meaning |
+|---|---|
+| `StartGeneration { turn, generation }` | Begin reply generation for a user turn. |
+| `CancelGeneration { generation }` | Tear down a superseded generation. |
+| `StartSynthesis { turn, generation }` | Synthesise the reply for a turn. |
+| `FlushAudioBuffer { turn }` | Drop queued audio for a turn. |
+| `DuckAudio { gain }` | Attenuate agent audio; `gain` is on the `0..=100` scale and `DUCK_GAIN` is `20`. |
+| `RestoreAudio` | Return agent audio to full level. |
+| `EmitTurnEvent { kind }` | Emit the turn event that was accepted. |
+| `Record { kind }` | Account for the step in one of the model's counters. |
+
+Commands for one step are emitted in a fixed order, omitting groups that do not
+apply: generation lifecycle (`CancelGeneration`, then `StartGeneration`),
+`StartSynthesis`, audio (`FlushAudioBuffer`, `DuckAudio`, `RestoreAudio`),
+`EmitTurnEvent`, and finally `Record`. The order is straight-line code; no hash
+map participates.
+
+### Observation-to-event mapping
+
+| Observation | Actionable event |
+|---|---|
+| `FinalTranscript` | `FinalTranscript` |
+| `VadStarted` | `UserStartedSpeaking` |
+| `VadStopped` | `UserStoppedSpeaking` |
+| `ReplyFinished` | `ReplyFinished` |
+| `BargeInReported` | `BargeIn` |
+| `Control { event }` | `event` |
+| `PartialTranscript`, `ReplyDelta`, `AudioFrameQueued`, `CancellationObserved`, `Failure` | none — ignored |
+
+### Counters
+
+Every observation is accounted for exactly once, so `accepted + ignored +
+rejected` always equals the number of observations stepped through the arbiter.
+
+| `Record` kind | Counter | When |
+|---|---|---|
+| `TurnOpened` | `accepted` | A `FinalTranscript` opened a new turn. |
+| `GenerationSuperseded` | `accepted` | An in-flight reply was interrupted. |
+| `ObservationIgnored` | `ignored` | The observation carried no actionable event. |
+| `IllegalTransition` | `rejected` | The event is illegal from the current state. |
+| `ObservationAfterClose` | `rejected` | Any observation after `Closed`; the state never leaves `Closed`. |
+
+An accepted event applies the same transition `TurnMachine::apply` would apply:
+only `FinalTranscript` opens a turn, and it also starts the next generation.
+Entering `Interrupted` from any other state cancels and flushes, restores ducked
+audio, and increments the generation afterwards. Leaving `EvaluatingBargeIn` for
+any other state restores ducked audio, so a model that is not in the contested
+window is never left ducked.
