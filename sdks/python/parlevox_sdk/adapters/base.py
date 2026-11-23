@@ -30,6 +30,7 @@ from __future__ import annotations
 import base64
 import enum
 import http.client
+import io
 import json
 import logging
 import os
@@ -37,6 +38,7 @@ import re
 import threading
 import time
 import urllib.parse
+import wave
 from abc import ABC, abstractmethod
 from pathlib import Path
 
@@ -62,6 +64,7 @@ __all__ = [
     "register_secret",
     "reset_redaction",
     "resolve_key",
+    "wav_container",
 ]
 
 _LOG = logging.getLogger("parlevox.adapters")
@@ -87,8 +90,12 @@ _CREDENTIAL_SHAPES = re.compile(r"sk-[A-Za-z0-9_-]{20,}")
 #: whole instead of stopping at the first escaped control character.
 _BEARER_VALUE = re.compile(r"(?i)(bearer\s+)[^\s'\"]+")
 #: Header-shaped ``Authorization: <token>`` / ``Authorization=<token>`` text.
+#: Both credential schemes used by the adapters are masked together with the
+#: credential: ``Bearer <token>`` (OpenAI) and ``Token <token>`` (Deepgram).
+#: A header with no scheme (AssemblyAI's raw key) is masked by the bare value
+#: class alone.
 _AUTHORIZATION_HEADER = re.compile(
-    r"(?i)(authorization\s*[:=]\s*)(?:bearer\s+)?[^\s'\"]+"
+    r"(?i)(authorization\s*[:=]\s*)(?:(?:bearer|token)\s+)?[^\s'\"]+"
 )
 #: Credential-bearing query/pair parameters such as ``api_key=``/``token=``.
 _QUERY_SECRET = re.compile(
@@ -194,6 +201,26 @@ def resolve_key(env_var, environ=None):
         )
     register_secret(value)
     return value
+
+
+# -- audio container ----------------------------------------------------
+
+
+def wav_container(pcm, sample_rate, channels):
+    """Wrap little-endian i16 PCM in a 16-bit RIFF/WAVE container.
+
+    The format fields always describe the PCM handed in: every adapter threads
+    the caller's ``sample_rate``/``channels`` from the ``Transcribe`` request so
+    a container can never declare a format the audio does not have. Arguments
+    are required — a default would silently mis-declare a non-default rate.
+    """
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as handle:
+        handle.setnchannels(channels)
+        handle.setsampwidth(2)
+        handle.setframerate(sample_rate)
+        handle.writeframes(bytes(pcm))
+    return buffer.getvalue()
 
 
 # -- errors -------------------------------------------------------------
@@ -660,6 +687,11 @@ class FixtureTransport(Transport):
              "chunks": ["data: ...\n\n", ...]}]
         }
 
+    Matching compares path suffixes *after* stripping any query string, so an
+    exchange recorded for ``/v1/listen`` also serves
+    ``/v1/listen?model=nova-2&smart_format=true`` while a different query never
+    makes two distinct endpoints collide.
+
     ``responses`` may also be a single response object. A response carries
     either UTF-8 ``chunks`` or one ``body_base64`` binary body. Successive
     requests to the same exchange consume successive responses; the last
@@ -716,10 +748,16 @@ class FixtureTransport(Transport):
 
     def _match(self, method, path):
         method = str(method).upper()
+        # Compare bare paths: a query string belongs to the request, not to the
+        # endpoint the fixture was recorded for.
+        request_path = urllib.parse.urlsplit(str(path)).path
         for exchange in self._exchanges:
             if exchange["method"] != method:
                 continue
-            if path.endswith(exchange["path"]) or exchange["path"].endswith(path):
+            exchange_path = urllib.parse.urlsplit(exchange["path"]).path
+            if request_path.endswith(exchange_path) or exchange_path.endswith(
+                request_path
+            ):
                 return exchange
         raise AdapterError(
             self.provider,

@@ -1,0 +1,33 @@
+{
+  "method": "GET",
+  "path": "/v2/transcript/job-0001",
+  "responses": [
+    {
+      "status": 200,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "chunks": [
+        "{\"id\": \"job-0001\", \"status\": \"queued\", \"text\": null}"
+      ]
+    },
+    {
+      "status": 200,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "chunks": [
+        "{\"id\": \"job-0001\", \"status\": \"processing\", \"text\": null}"
+      ]
+    },
+    {
+      "status": 200,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "chunks": [
+        "{\"id\": \"job-0001\", \"status\": \"completed\", \"text\": \"hello world\"}"
+      ]
+    }
+  ]
+}

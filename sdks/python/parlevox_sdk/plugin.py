@@ -52,16 +52,29 @@ MAX_CANCELLED = 256
 
 
 #: Supported ``PARLEVOX_ADAPTERS`` modalities and the adapter names each may
-#: select. ``vad`` has no OpenAI-wire adapter in this slice.
+#: select. ``vad`` has no real adapter in this slice.
 _SUPPORTED_ADAPTERS = {
-    "stt": {"fake", "openai"},
+    "stt": {"fake", "openai", "deepgram", "assemblyai"},
     "llm": {"fake", "openai"},
     "tts": {"fake", "openai"},
     "vad": {"fake"},
 }
 
-#: Plugin name used when at least one real adapter is selected.
-_OPENAI_PLUGIN_NAME = "python-openai"
+#: Plugin name prefix when at least one real adapter is selected.
+_REAL_PLUGIN_PREFIX = "python-"
+
+
+def _plugin_name(selection, fallback):
+    """Name the plugin after the real adapters in use, e.g. ``python-openai``.
+
+    The name is sorted and de-duplicated so it is stable regardless of the
+    order the selection was written in, and an all-``fake`` selection keeps the
+    caller's fallback name (the default fake path is byte-identical).
+    """
+    real = sorted({value for value in selection.values() if value != "fake"})
+    if not real:
+        return fallback
+    return _REAL_PLUGIN_PREFIX + "-".join(real)
 
 
 def _redact_tree(value):
@@ -239,6 +252,14 @@ class Plugin:
             from .adapters.openai_stt import OpenAISTT
 
             stt = OpenAISTT(environ=env)
+        elif selection.get("stt") == "deepgram":
+            from .adapters.deepgram_stt import DeepgramSTT
+
+            stt = DeepgramSTT(environ=env)
+        elif selection.get("stt") == "assemblyai":
+            from .adapters.assemblyai_stt import AssemblyAISTT
+
+            stt = AssemblyAISTT(environ=env)
         if selection.get("llm") == "openai":
             from .adapters.openai_llm import OpenAILlm
 
@@ -248,7 +269,9 @@ class Plugin:
 
             tts = OpenAITTS(environ=env)
         # ``vad`` only accepts ``fake``, so it stays at the default FakeVad.
-        return cls(name=_OPENAI_PLUGIN_NAME, stt=stt, llm=llm, tts=tts)
+        return cls(
+            name=_plugin_name(selection, name), stt=stt, llm=llm, tts=tts
+        )
 
     def manifest(self):
         return {

@@ -1,0 +1,15 @@
+{
+  "method": "POST",
+  "path": "/v1/listen",
+  "responses": [
+    {
+      "status": 200,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "chunks": [
+        "{\"metadata\": {\"transaction_key\": \"fixture\"}, \"results\": {\"channels\": [{\"alternatives\": [{\"transcript\": \"hello world\", \"confidence\": 0.99}], \"detected_language\": \"en\"}]}}"
+      ]
+    }
+  ]
+}

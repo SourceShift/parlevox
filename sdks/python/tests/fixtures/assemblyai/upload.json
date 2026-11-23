@@ -1,0 +1,15 @@
+{
+  "method": "POST",
+  "path": "/v2/upload",
+  "responses": [
+    {
+      "status": 200,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "chunks": [
+        "{\"upload_url\": \"https://cdn.example.invalid/uploaded-audio\"}"
+      ]
+    }
+  ]
+}

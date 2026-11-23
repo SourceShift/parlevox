@@ -11,10 +11,8 @@ Configuration: ``PARLEVOX_OPENAI_API_KEY`` (required, first use),
 
 from __future__ import annotations
 
-import io
 import json
 import os
-import wave
 
 from ..fakes import FAKE_CHANNELS, FAKE_SAMPLE_RATE, SttProvider
 from .base import (
@@ -23,6 +21,7 @@ from .base import (
     ErrorClass,
     default_transport,
     resolve_key,
+    wav_container,
 )
 
 __all__ = ["OpenAISTT"]
@@ -68,22 +67,6 @@ def _multipart(fields, filename, payload, *, content_type="application/octet-str
     parts.append(bytes(payload))
     parts.append(f"\r\n--{_BOUNDARY}--\r\n".encode("utf-8"))
     return b"".join(parts)
-
-
-def _wav_container(pcm, sample_rate=FAKE_SAMPLE_RATE, channels=FAKE_CHANNELS):
-    """Wrap little-endian i16 PCM in a 16-bit RIFF/WAVE container.
-
-    ``sample_rate``/``channels`` must describe the PCM being wrapped: the
-    plugin threads them from the ``Transcribe`` request so the container never
-    declares a format the audio does not have.
-    """
-    buffer = io.BytesIO()
-    with wave.open(buffer, "wb") as handle:
-        handle.setnchannels(channels)
-        handle.setsampwidth(2)
-        handle.setframerate(sample_rate)
-        handle.writeframes(bytes(pcm))
-    return buffer.getvalue()
 
 
 class OpenAISTT(SttProvider):
@@ -134,7 +117,7 @@ class OpenAISTT(SttProvider):
         body = _multipart(
             {"model": self.model, "response_format": "json"},
             self.filename,
-            _wav_container(pcm, rate, channel_count),
+            wav_container(pcm, rate, channel_count),
             content_type="audio/wav",
         )
         headers = {
