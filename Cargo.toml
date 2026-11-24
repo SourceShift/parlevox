@@ -35,7 +35,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 async-trait = "0.1"
 futures-core = "0.3"
 futures-util = "0.3"
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "stream", "json", "multipart"] }
 proptest = "1"
 opentelemetry = { version = "0.33", default-features = false, features = ["trace", "metrics"] }
